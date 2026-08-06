@@ -1,0 +1,84 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * HomeSuite — zentraler Klassen-Loader (Store-Muster, KEIN PSR-4).
+ *
+ * Das Verzeichnis libs/ von IP-Symcon kennt kein PSR-4-Autoloading. HomeSuite
+ * laedt daher alle Klassen der gemeinsamen Basis (Namespace-Root
+ * Hoep\HomeSuite\) ueber explizite require_once — genau in Abhaengigkeits-
+ * reihenfolge, damit Interfaces/Basistypen vor ihren Nutzern definiert sind.
+ *
+ * Jedes Modul (Hub, HeatingZone, ...) bindet zu Beginn seiner .php genau dieses
+ * autoload.php ein:
+ *
+ *     require_once __DIR__ . '/../../libs/HomeSuite/autoload.php';
+ *
+ * Der Root ist vendor-eindeutig (Hoep\), damit zwei Libraries mit gleichem
+ * Basis-Root im selben Kernel-Prozess nicht kollidieren.
+ *
+ * HINWEIS (Milestone M0.0 / Skelett):
+ * Die untenstehende Liste nennt VOLLSTAENDIG alle Klassendateien, welche die
+ * nachgelagerten Bau-Agenten anlegen. Solange die Implementierungsphase laeuft,
+ * werden nur bereits vorhandene Dateien geladen (file_exists-Guard), damit das
+ * Skelett nicht mit einem fatalen Fehler bricht. Sobald alle Dateien existieren,
+ * ist der Guard ein reines No-Op — die Reihenfolge bleibt verbindlich.
+ */
+
+$__hs_base = __DIR__;
+
+/**
+ * Verbindliche, abhaengigkeitssortierte Ladeliste (relativ zu libs/HomeSuite/).
+ * Reihenfolge: Basistypen/Constants -> Value Objects -> HAL-Interfaces ->
+ * konkrete HAL-Treiber -> Engines -> Provision -> Migration -> EntityModule.
+ */
+$__hs_files = [
+
+    // --- Contracts: Basistypen & Vertrag 1 (Control-Contract) ---
+    'Contracts/ControlContract.php',   // Type/Role-Konstanten, isValidType/isValidRole, ContractException
+    'Contracts/ActionContext.php',     // Provenienz eines Bedienvorgangs (source/ts/meta)
+    'Contracts/Control.php',           // typisiertes Control (coerce/optimistic/toArray)
+    'Contracts/Store.php',             // JSON-Store auf Attribut "FabricStore" (nur Konfig/Profile)
+    'Contracts/Manifest.php',          // Manifest-JSON v1.0 (Struktur + state-Snapshot)
+
+    // --- HAL: Interfaces (kernel-frei, zustandslos) ---
+    'HAL/IDriver.php',                 // Basis: bind/capabilities/discover/poll/parseEvent
+    'HAL/IThermostat.php',             // Heizungs-HAL
+    'HAL/IShutter.php',                // Beschattungs-HAL
+    'HAL/IValve.php',                  // Bewaesserungs-HAL
+    'HAL/IAudioRenderer.php',          // Audio-HAL (Codec, Vertrag 3)
+
+    // --- HAL: DriverFactory + generische Variablen-Treiber (jedes Haus) ---
+    'HAL/DriverFactory.php',           // waehlt/instanziiert Treiber aus driverCatalog
+    'HAL/GenericVariableThermostat.php',
+    'HAL/GenericVariableShutter.php',
+    'HAL/GenericVariableValve.php',
+
+    // --- Engines ---
+    'Engines/ProfileEngine.php',       // Anlegen/Bearbeiten/Zuweisen von Profilen (getrennt)
+    'Engines/ScheduleEngine.php',      // Slot-/Geo-/Rule-Auswertung, Homematic-Wochenexport
+    'Engines/ShadeKinematics.php',     // Positions-/Lamellen-Kinematik der Beschattung
+
+    // --- Provision ---
+    'Provision/Provisioner.php',       // idempotentes Anlegen von Objekten/Profilen/Instanzen
+
+    // --- Migration (Strangler-Fig, Aktor-Safety) ---
+    'Migration/ActuatorGate.php',      // lokale Safety-Wahrheit je physischem Aktor
+    'Migration/Ledger.php',            // Orchestrierungssicht der Migrationsphasen
+    'Migration/Backup.php',            // kanonische Snapshots + Restore
+    'Migration/MigrateProvider.php',   // plan/apply/verify/cutover/rollback/retire/status
+
+    // --- EntityModule: abstrakte Modulbasis (haengt an allem Vorherigen -> zuletzt) ---
+    'Contracts/EntityModule.php',      // \IPSModule-Basis: RequestAction-Dispatch, RPC, Helfer
+];
+
+foreach ($__hs_files as $__hs_rel) {
+    $__hs_path = $__hs_base . '/' . $__hs_rel;
+    // M0.0-Guard: waehrend der Bauphase nur laden, was schon existiert.
+    if (is_file($__hs_path)) {
+        require_once $__hs_path;
+    }
+}
+
+unset($__hs_base, $__hs_files, $__hs_rel, $__hs_path);

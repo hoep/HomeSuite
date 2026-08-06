@@ -1,0 +1,6 @@
+# HomeSuite
+*.log
+.DS_Store
+Thumbs.db
+scratch/
+*.tmp

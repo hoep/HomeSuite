@@ -1,0 +1,13 @@
+{
+    "id": "{0F66F23F-ED50-4CD5-AB44-5FC961C7733A}",
+    "author": "Hoep",
+    "name": "HomeSuite",
+    "url": "https://github.com/hoep/HomeSuite",
+    "license": "MIT",
+    "compatibility": {
+        "version": "1.0"
+    },
+    "version": "0.1.0",
+    "build": 0,
+    "date": 0
+}
