@@ -275,7 +275,12 @@ class ShadingDevice extends EntityModule
         }
         switch ($c->ident) {
             case 'Position':
-                $drv->moveTo(max((float) self::POS_MIN, min((float) self::POS_MAX, (float) $value)));
+                $p = (int) max(self::POS_MIN, min(self::POS_MAX, (int) round((float) $value)));
+                if ($this->closeBlockedByDoor($drv->readPosition(), $p)) {
+                    $this->SendDebug('HSSH.guard', 'Tuer offen -> manuelles Zufahren auf ' . $p . '% blockiert', 0);
+                    break;
+                }
+                $drv->moveTo((float) $p);
                 break;
             case 'Movement':
                 $drv->move((int) $value === 1 ? 'up' : ((int) $value === 2 ? 'down' : 'stop'));
@@ -341,6 +346,8 @@ class ShadingDevice extends EntityModule
                 return $this->mgmtGetSchedule($args);
             case 'setActivePlan':
                 return $this->mgmtSetActivePlan($args);
+            case 'importLegacy':
+                return $this->mgmtImportLegacy($args, $ctx);
             case 'driverProbe':
                 return $this->mgmtDriverProbe();
             case 'reconcileProbe':
@@ -444,6 +451,12 @@ class ShadingDevice extends EntityModule
         if (array_key_exists('safePos', $args)) {
             $patch['safePos'] = max(0, min(100, (int) $args['safePos']));
         }
+        if (array_key_exists('doorIds', $args)) {
+            if (!is_array($args['doorIds'])) {
+                throw new ContractException('doorIds muss eine Liste sein');
+            }
+            $patch['doorIds'] = array_values(array_map('intval', $args['doorIds']));
+        }
         if ($patch !== []) {
             $this->store()->patch('config', $patch);
             $this->registerWatches($this->driver()); // env koennte Wind/Regen-IDs geaendert haben
@@ -531,6 +544,60 @@ class ShadingDevice extends EntityModule
     }
 
     /**
+     * Adoption EINES IPSShadowing-Geraetes (nicht-destruktiv, wie HeatingZone.ImportLegacy):
+     * bindet den Treiber an dessen Position-Variable, uebernimmt Automatic-VID und
+     * (best effort) das Sonnenprofil als 'zu verifizieren'. Kein Geraeteschreiben,
+     * armed bleibt false (Schatten). dryrun liefert nur die geplante Zuordnung.
+     * args: { deviceId } = IPSShadowing-Geraetecontainer (ident Position/Automatic/ProfileSun).
+     */
+    private function mgmtImportLegacy(array $args, array $ctx): array
+    {
+        $dev = (int) ($args['deviceId'] ?? 0);
+        if ($dev <= 0 || !@\IPS_ObjectExists($dev)) {
+            throw new ContractException('deviceId (IPSShadowing-Geraetecontainer) fehlt/ungueltig');
+        }
+        // Klartextname bevorzugt aus args (IPSShadowing-Container heisst intern
+        // 'DeviceN'; der Klartext liegt in der NAMES-Map des Migrationsskripts).
+        $name    = (string) ($args['name'] ?? '');
+        if ($name === '') { $name = (string) @\IPS_GetName($dev); }
+        $posVid  = (int) (@\IPS_GetObjectIDByIdent('Position', $dev) ?: 0);
+        $autoVid = (int) (@\IPS_GetObjectIDByIdent('Automatic', $dev) ?: 0);
+        if ($posVid <= 0) {
+            throw new ContractException('Geraet #' . $dev . ' hat keine Position-Variable');
+        }
+        // Sonnenprofil aus IPSShadowing ProfileSun (Selektor -> Profil-Kategorie).
+        $geo   = null;
+        $psSel = @\IPS_GetObjectIDByIdent('ProfileSun', $dev);
+        if ($psSel) {
+            $pid = (int) @GetValue($psSel);
+            if ($pid > 0 && @\IPS_ObjectExists($pid)) {
+                $rd  = function ($id) use ($pid) { $v = @\IPS_GetObjectIDByIdent($id, $pid); return $v ? (int) GetValue($v) : null; };
+                $bgn = $rd('AzimuthBgn'); $end = $rd('AzimuthEnd'); $el = $rd('Elevation');
+                if ($bgn !== null || $end !== null || $el !== null) {
+                    $geo = ['azimuthBgn' => (int) $bgn, 'azimuthEnd' => (int) $end, 'elevation' => (int) $el, 'closePct' => 100, 'unverified' => true];
+                }
+            }
+        }
+        $config  = ['driver' => 'generic-shutter', 'positionId' => $posVid, 'automaticId' => $autoVid, 'armed' => false];
+        $summary = ['deviceId' => $dev, 'name' => $name, 'positionId' => $posVid, 'automaticId' => $autoVid, 'geoProfile' => $geo];
+
+        if (!empty($ctx['dryrun'])) {
+            return ['ok' => true, 'dryrun' => true] + $summary;
+        }
+        $this->store()->patch('config', $config);
+        if ($geo !== null) {
+            $this->store()->patch('config', ['geoProfile' => $geo]);
+        }
+        $this->driverResolved = false;
+        $this->driverInstance = null;
+        $this->registerWatches($this->driver());
+        if ($name !== '') {
+            @\IPS_SetName($this->InstanceID, 'Beschattung ' . $name);
+        }
+        return ['ok' => true, 'adopted' => true, 'driverActive' => $this->driver() instanceof IShutter] + $summary;
+    }
+
+    /**
      * Scharfschalten (armed=true -> reconcile faehrt wirklich) bzw. zurueck in den
      * Schatten-Modus (armed=false -> nur berechnen/loggen). M8-Cutover je Geraet.
      */
@@ -562,7 +629,9 @@ class ShadingDevice extends EntityModule
             'armed'        => $armed,
             'current'      => $d['cur'],
             'target'       => $target,
-            'wouldMove'    => ($armed && $target !== null && $drift),
+            'wouldMove'    => ($armed && $target !== null && $drift && !$d['blockedByDoor']),
+            'doorOpen'     => $d['doorOpen'],
+            'blockedByDoor' => $d['blockedByDoor'],
             'mode'         => $d['mode'],
             'variant'      => $d['variant'],
             'held'         => $d['held'],
@@ -644,6 +713,13 @@ class ShadingDevice extends EntityModule
             $this->writeRt($rt);
             return;
         }
+        // Tuer-Guard: Zufahren gegen offene Tuer blocken (Auffahren/Sturm bleibt erlaubt).
+        if ($d['blockedByDoor']) {
+            $this->SendDebug('HSSH.guard', 'Tuer offen -> Zufahren auf ' . $target . '% blockiert', 0);
+            $rt['blockedTs'] = time();
+            $this->writeRt($rt);
+            return;
+        }
         if ($armed) {
             // Self-Write VOR dem Schreiben markieren: auch bei SYNCHRONER VM_UPDATE-
             // Zustellung darf der eigene moveTo nicht als externer Eingriff (-> Hold)
@@ -704,10 +780,14 @@ class ShadingDevice extends EntityModule
         ];
         $target = $this->schedules()->evalRules($rules, ['manualHold' => $held]);
 
+        $doorOpen = $this->anyDoorOpen();
+        $blocked  = $this->closeBlockedByDoor((int) $cur, $target !== null ? (int) $target : null);
+
         return [
             'mode' => $mode, 'cur' => $cur, 'inp' => $inp, 'variant' => $this->activeVariant(),
             'rawSun' => $rawSun, 'sunTarget' => $sunTarget, 'schedTarget' => $schedTarget,
             'storm' => $storm, 'safe' => $safe, 'held' => $held, 'target' => $target,
+            'doorOpen' => $doorOpen, 'blockedByDoor' => $blocked,
         ];
     }
 
@@ -791,6 +871,38 @@ class ShadingDevice extends EntityModule
         $v = @GetValue($id);
         if (is_bool($v)) { return $v; }
         return is_numeric($v) ? ((float) $v > 0) : null;
+    }
+
+    /** Ist eine der ueberwachten Tueren (config.doorIds) offen? (truthy = offen) */
+    private function anyDoorOpen(): bool
+    {
+        $ids = $this->cfgVal('doorIds', []);
+        if (!is_array($ids)) {
+            return false;
+        }
+        foreach ($ids as $id) {
+            $id = (int) $id;
+            if ($id > 0 && function_exists('IPS_VariableExists') && @\IPS_VariableExists($id)) {
+                $v = @GetValue($id);
+                if ((is_bool($v) && $v) || (is_numeric($v) && (float) $v > 0)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Richtungsabhaengiger Tuer-Guard: blockt NUR das Zufahren (Ziel geschlossener
+     * als Ist) bei offener Tuer. Auffahren/Rueckzug (Ziel offener) und der Sturm-
+     * Rueckzug (safePos=offen) bleiben IMMER erlaubt.
+     */
+    private function closeBlockedByDoor(int $cur, ?int $target): bool
+    {
+        if ($target === null || $cur === IShutter::POS_UNKNOWN) {
+            return false;
+        }
+        return $target > $cur && $this->anyDoorOpen();
     }
 
     /** Aktive Kreuzprodukt-Variante (Plan · Season). */
