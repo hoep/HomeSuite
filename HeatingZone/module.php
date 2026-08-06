@@ -303,12 +303,19 @@ class HeatingZone extends EntityModule
             } elseif (strncmp($driverId, 'hm-', 3) === 0) {
                 // hm-*: targetId ist die CCU-Geraeteinstanz; der Treiber loest die
                 // Kanaele (SET_/ACTUAL_TEMPERATURE, HUMIDITY, VALVE) selbst auf.
-                $this->driverInstance = DriverFactory::create($driverId, [
+                // sensorId (optional) = separate Sensor-/Wandgeraet-Instanz fuer
+                // Ist-Temp/Feuchte (HM-CC-TC "Raumklima").
+                $dcfg = [
                     'deviceInstanceId' => $targetId,
                     'min'              => self::SETPOINT_MIN,
                     'max'              => self::SETPOINT_MAX,
                     'step'             => 0.5,
-                ]);
+                ];
+                $sensorId = (int) ($cfg['sensorId'] ?? 0);
+                if ($sensorId > 0) {
+                    $dcfg['sensorInstanceId'] = $sensorId;
+                }
+                $this->driverInstance = DriverFactory::create($driverId, $dcfg);
             }
         } catch (\Throwable $e) {
             $this->SendDebug('HSHT.driver', 'Treiberaufbau fehlgeschlagen: ' . $e->getMessage(), 0);
@@ -919,8 +926,16 @@ class HeatingZone extends EntityModule
                 throw new ContractException('targetId #' . $targetId . ' ist keine Variable');
             }
         }
-        if ($sensorId > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($sensorId)) {
-            throw new ContractException('sensorId #' . $sensorId . ' ist keine Variable');
+        // sensorId: generic = Ist-VARIABLE; hm-* = Sensor-/Wandgeraet-INSTANZ (optional).
+        if ($sensorId > 0) {
+            if ($isHm) {
+                if (function_exists('IPS_InstanceExists') && !\IPS_InstanceExists($sensorId)
+                    && (!function_exists('IPS_VariableExists') || !\IPS_VariableExists($sensorId))) {
+                    throw new ContractException('sensorId #' . $sensorId . ' ist keine Instanz/Variable');
+                }
+            } elseif (function_exists('IPS_VariableExists') && !\IPS_VariableExists($sensorId)) {
+                throw new ContractException('sensorId #' . $sensorId . ' ist keine Variable');
+            }
         }
         if ($targetId <= 0 && $driver !== '') {
             throw new ContractException($driver . ' braucht ein Ziel (targetId): generic=Variable, hm-*=CCU-Instanz');

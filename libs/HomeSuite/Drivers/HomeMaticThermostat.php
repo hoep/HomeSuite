@@ -252,6 +252,31 @@ final class HomeMaticThermostat implements IThermostat
         } else {
             $this->model = 'HM-CC-TC';
         }
+
+        // Ist-Temp/Feuchte koennen an einem SEPARATEN Sensor-/Wandgeraet haengen
+        // (z. B. HM-CC-TC -> "Raumklima": TEMPERATURE/HUMIDITY). Fehlen sie am
+        // Hauptgeraet, von der konfigurierten sensorInstanceId nachziehen.
+        $sensor = (int) ($this->cfg['sensorInstanceId'] ?? 0);
+        if ($sensor > 0) {
+            if ($this->vid['ACTUAL_TEMPERATURE'] === null) {
+                $this->vid['ACTUAL_TEMPERATURE'] = $this->identIn($sensor, ['ACTUAL_TEMPERATURE', 'TEMPERATURE']);
+            }
+            if ($this->vid['ACTUAL_HUMIDITY'] === null) {
+                $this->vid['ACTUAL_HUMIDITY'] = $this->identIn($sensor, ['ACTUAL_HUMIDITY', 'HUMIDITY']);
+            }
+        }
+    }
+
+    /** Erste auffindbare Variable einer Ident-Liste unter einer Instanz (oder null). */
+    private function identIn(int $instance, array $idents): ?int
+    {
+        foreach ($idents as $id) {
+            $vid = @\IPS_GetObjectIDByIdent($id, $instance);
+            if (is_int($vid) && $vid > 0) {
+                return $vid;
+            }
+        }
+        return null;
     }
 
     /** Loest CCU-Host, Basisserial und Profil-Kanal auf. */
