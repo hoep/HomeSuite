@@ -527,7 +527,8 @@ class ShadingDevice extends EntityModule
         for ($d = 0; $d < 7; $d++) {
             $week[$d] = $this->schedules()->getSlots($variant, $d);
         }
-        return ['ok' => true, 'variant' => $variant, 'week' => $week, 'activeVariant' => $this->activeVariant(), 'variants' => $this->scheduleVariants()];
+        return ['ok' => true, 'variant' => $variant, 'week' => $week, 'activeVariant' => $this->activeVariant(),
+            'variants' => $this->scheduleVariants(), 'sunEvents' => $this->sunEvents(time()), 'anchors' => array_keys(SunTimes::ANCHORS)];
     }
 
     /** Setzt Plan (0..2) und/oder Season (0..1) ueber die native RequestAction. */
