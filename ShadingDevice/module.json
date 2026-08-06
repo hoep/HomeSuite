@@ -1,0 +1,12 @@
+{
+    "id": "{A9645ED8-CB55-43B8-869B-BFF6ACFC8DC1}",
+    "name": "ShadingDevice",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["ShadingDevice", "HSSH", "HomeSuite Beschattung"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSSH",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}

@@ -1,0 +1,901 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * ShadingDevice (HSSH) — Domaenen-Modul „Beschattung" (Phase 2, M0/M1-Geruest).
+ *
+ * Eine Instanz = ein Rollo / eine Markise / ein Beschattungs-Element. Erbt
+ * {@see \Hoep\HomeSuite\EntityModule} genau wie HeatingZone: die Basis legt aus
+ * diesem manifest() die Status-Variablen an, aktiviert die native RequestAction
+ * (Vertrag 1) und liefert das RPC-Trio HSSH_GetManifest / HSSH_GetState / HSSH_Manage.
+ *
+ * Leitentscheidungen (mit dem Nutzer abgestimmt, siehe Migrationsplan):
+ *  - scheduleMode ist FEST 'controller': Rollos/IPSShadowing fuehren KEIN
+ *    HomeSuite-Wochenprogramm; die ScheduleEngine im Modul faehrt den
+ *    Positions-Zeitplan (val = Position 0..100 statt Temperatur). Der device-
+ *    Sync-Pfad (syncStatus/loadFromDevice/syncToDevice) ist IThermostat-getypt
+ *    und fuer einen IShutter inert -> die zugehoerigen Managementaktionen werden
+ *    hier BEWUSST weggelassen (keine toten Buttons).
+ *  - Treiber = GenericVariableShutter, gebunden an die BEREITS fahrbare
+ *    IPSShadowing-Position-Variable (positionVarId=feedbackVarId, absolutePosition):
+ *    echtes 0..100-Feedback, kein Roh-Telegramm-Treiber im ersten Wurf (M1/M2).
+ *  - Zeitplan-Achse (statt Praesenz bei der Heizung): umschaltbare Plaene
+ *    Anwesend/Abwesend/Urlaub (scheduleVariants/activeVariantIndex ueber 'Plan').
+ *  - Manuell-Hold laeuft bis zur naechsten Zeitplan-Slot-Grenze (wie Heizung).
+ *  - Sonnenautomatik + reconcile (evalRules-Kaskade Safety>Manuell>Sonne>Zeitplan)
+ *    folgen in M3/M4; hier ist applyControl noch treiber-los (Schatten-Modus:
+ *    kein Geraeteschreiben, solange driver()==null).
+ *
+ * Der Klassenname MUSS == module.json "name" == GUID-Register-Eintrag sein
+ * ({A9645ED8-CB55-43B8-869B-BFF6ACFC8DC1}); der Hub mappt diese GUID bereits auf
+ * die Domaene 'shading' (Hub::GUID_HSSH).
+ */
+
+require_once __DIR__ . '/../libs/HomeSuite/autoload.php';
+
+use Hoep\HomeSuite\ActionContext;
+use Hoep\HomeSuite\ContractException;
+use Hoep\HomeSuite\Control;
+use Hoep\HomeSuite\ControlContract;
+use Hoep\HomeSuite\EntityModule;
+use Hoep\HomeSuite\HAL\DriverFactory;
+use Hoep\HomeSuite\HAL\IDriver;
+use Hoep\HomeSuite\HAL\IShutter;
+
+// Klassenname MUSS = module.json "name" (ohne Leerzeichen) sein.
+class ShadingDevice extends EntityModule
+{
+    /** Positions-Grenzen (%) — IShutter-Konvention 0=offen/oben .. 100=zu/unten. */
+    private const POS_MIN = 0;
+    private const POS_MAX = 100;
+
+    /**
+     * Zeitplan-Achsen (umschaltbare Plaene). Zwei Achsen (Nutzerwunsch „beides
+     * kombiniert"): Praesenz x Saison. Die ScheduleEngine traegt EINE Varianten-
+     * Liste -> wir bilden das KREUZPRODUKT als zusammengesetzte Varianten-Schluessel
+     * (kein Engine-Umbau). Trennzeichen zwischen den Achsen: VARIANT_SEP.
+     */
+    private const PLAN_VARIANTS   = ['Anwesend', 'Abwesend', 'Urlaub'];
+    private const SEASON_VARIANTS = ['Sommer', 'Winter'];
+    private const VARIANT_SEP     = ' · ';
+
+    /** Lazy-Cache des HAL-Treibers (pro Instanz-Prozess). */
+    private ?IDriver $driverInstance = null;
+
+    /** Wurde driver() in diesem Prozess-Stand schon aufgeloest? */
+    private bool $driverResolved = false;
+
+    /** Timer + Reconcile-Parameter. */
+    private const TIMER_REFRESH  = 'Refresh';
+    private const REFRESH_MS      = 30000;   // Reflect + Reconcile
+    private const POS_TOLERANCE   = 3;        // % Drift, bevor gefahren wird
+    private const SAFE_POS        = 0;        // Sturm-/Regen-sichere Position (offen/eingefahren)
+    private const SUN_DWELL       = 300;      // Min-Dwell (s) gegen Sonnen-Flattern
+
+    /** Umgebungs-Sensoren (Standort-Defaults; per config.env ueberschreibbar). */
+    private const SUN_AZ_ID      = 15291;    // Azimut (Location #<ID>)
+    private const SUN_EL_ID      = 45609;    // Elevation
+    private const WIND_ID        = 58381;    // Wind (km/h)
+    private const RAIN_ID        = 19991;    // Regen
+    private const BRIGHT_ID      = 53778;    // Helligkeit
+    private const WIND_STORM_KMH = 45.0;     // Sturm-Schwelle (km/h)
+
+    /**
+     * Vertrag 2 — das Manifest dieser Entitaet. Aus ihm legt die Basis die
+     * Variablen an; der LVB rendert daraus Bedienung UND Verwaltung generisch.
+     *
+     * @return array<string,mixed>
+     */
+    protected function manifest(): array
+    {
+        return [
+            'domain' => 'shading',
+            'title'  => 'Beschattung',
+            'icon'   => 'Window',
+
+            // ---- typisierte Controls (Vertrag 1) ----
+            'controls' => [
+                [
+                    'ident' => 'Position', 'type' => ControlContract::T_LEVEL,
+                    'role' => 'shading:position', 'label' => 'Position',
+                    'varType' => 1, 'profile' => '~Intensity.100', 'unit' => '%',
+                    'min' => self::POS_MIN, 'max' => self::POS_MAX, 'step' => 5,
+                    'actionable' => true,
+                ],
+                [
+                    'ident' => 'Movement', 'type' => ControlContract::T_COMMAND,
+                    'role' => 'shading:move', 'label' => 'Fahrt',
+                    'varType' => 1, 'actionable' => true,
+                    'options' => [
+                        ['value' => 1, 'label' => 'Auf'],
+                        ['value' => 2, 'label' => 'Ab'],
+                        ['value' => 0, 'label' => 'Stop'],
+                    ],
+                ],
+                [
+                    'ident' => 'ActualPosition', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:actual', 'label' => 'Ist-Position',
+                    'varType' => 1, 'profile' => '~Intensity.100', 'unit' => '%',
+                    'actionable' => false,
+                ],
+                [
+                    'ident' => 'Mode', 'type' => ControlContract::T_SELECT,
+                    'role' => 'shading:mode', 'label' => 'Modus',
+                    'varType' => 1, 'actionable' => true,
+                    'options' => [
+                        ['value' => 0, 'label' => 'Auto'],
+                        ['value' => 1, 'label' => 'Manuell'],
+                        ['value' => 2, 'label' => 'Sonne'],
+                    ],
+                ],
+                [
+                    'ident' => 'Plan', 'type' => ControlContract::T_SELECT,
+                    'role' => 'shading:plan', 'label' => 'Plan',
+                    'varType' => 1, 'actionable' => true,
+                    'options' => [
+                        ['value' => 0, 'label' => 'Anwesend'],
+                        ['value' => 1, 'label' => 'Abwesend'],
+                        ['value' => 2, 'label' => 'Urlaub'],
+                    ],
+                ],
+                [
+                    'ident' => 'Season', 'type' => ControlContract::T_SELECT,
+                    'role' => 'shading:season', 'label' => 'Saison',
+                    'varType' => 1, 'actionable' => true,
+                    'options' => [
+                        ['value' => 0, 'label' => 'Sommer'],
+                        ['value' => 1, 'label' => 'Winter'],
+                    ],
+                ],
+                [
+                    'ident' => 'Online', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:online', 'label' => 'Online',
+                    'varType' => 0, 'actionable' => false,
+                ],
+            ],
+
+            // ---- Profil-Typ: Positions-Wochenplan (2 Achsen Plan x Wochentag) ----
+            'profileTypes' => [
+                'roomProfile' => [
+                    'label' => 'Positions-Wochenplan',
+                    'axes'  => [
+                        'plan'    => self::PLAN_VARIANTS,
+                        'season'  => self::SEASON_VARIANTS,
+                        'weekday' => ['MO', 'DI', 'MI', 'DO', 'FR', 'SA', 'SO'],
+                    ],
+                    'slot'   => ['end' => 'HH:MM', 'val' => ['type' => 'int', 'min' => self::POS_MIN, 'max' => self::POS_MAX]],
+                    'rules'  => ['lastSlotEnd' => '24:00', 'ascending' => true],
+                    'editor' => 'weekedit-hm',
+                ],
+            ],
+
+            // ---- Verwaltungs-Aktionen (Whitelist) ----
+            // Bewusst OHNE syncStatus/loadFromDevice/syncToDevice/adoptDevice:
+            // scheduleMode ist fest 'controller', die device-Sync-Ops sind
+            // IThermostat-getypt und fuer einen IShutter tot.
+            'managementActions' => [
+                ['op' => 'createEntity',     'label' => 'Beschattung anlegen'],
+                ['op' => 'renameEntity',     'label' => 'Umbenennen'],
+                ['op' => 'deleteEntity',     'label' => 'Loeschen'],
+                ['op' => 'configureDriver',  'label' => 'Treiber konfigurieren'],
+                ['op' => 'updateProfile',    'label' => 'Positions-Wochenplan bearbeiten'],
+                ['op' => 'getSchedule',      'label' => 'Wochenplan lesen'],
+                ['op' => 'duplicateProfile', 'label' => 'Plan duplizieren'],
+                ['op' => 'assignProfile',    'label' => 'Plan zuweisen'],
+                ['op' => 'setActivePlan',    'label' => 'Plan setzen'],
+                ['op' => 'importLegacy',       'label' => 'Aus IPSShadowing importieren'],
+                ['op' => 'configureAutomation', 'label' => 'Sonne/Sicherheit konfigurieren'],
+                ['op' => 'setArmed',           'label' => 'Scharfschalten / Schatten-Modus'],
+                ['op' => 'driverProbe',        'label' => 'Treiber-Status (Diagnose)'],
+                ['op' => 'reconcileProbe',     'label' => 'Regel-Entscheidung (Trockenlauf)'],
+            ],
+
+            // ---- Konfig-Felder (Treiberwahl; im LVB gesetzt) ----
+            // generic-shutter wird an die IPSShadowing-Position-Variable gebunden;
+            // automaticId = deren Automatic-Bool (fuer Cutover/Rollback, M8).
+            'configFields' => [
+                ['key' => 'driver', 'type' => 'select', 'label' => 'Treiber', 'required' => true,
+                 'options' => [
+                     ['value' => 'generic-shutter', 'label' => 'Generisch (Positions-Variable)'],
+                 ]],
+                ['key' => 'positionId',  'type' => 'objid', 'label' => 'Positions-Variable (IPSShadowing)', 'required' => false],
+                ['key' => 'automaticId', 'type' => 'objid', 'label' => 'Automatik-Bool (Cutover/Rollback)', 'required' => false],
+            ],
+
+            'capabilities' => [
+                'scheduleMode' => 'controller',
+                'hasPlan'      => true,
+                'driver'       => $this->configuredDriverId(),
+            ],
+        ];
+    }
+
+    /** Konfigurierte driverId aus dem Store (ohne den Treiber zu bauen). */
+    private function configuredDriverId(): string
+    {
+        $cfg = $this->store()->get('config', []);
+        return is_array($cfg) ? (string) ($cfg['driver'] ?? '') : '';
+    }
+
+    /**
+     * Zeitplan-Achse: umschaltbare Plaene (statt Praesenz bei der Heizung). Die
+     * ScheduleEngine speichert je Variante einen eigenen Wochenplan.
+     *
+     * @return string[]
+     */
+    protected function scheduleVariants(): array
+    {
+        $out = [];
+        foreach (self::PLAN_VARIANTS as $plan) {
+            foreach (self::SEASON_VARIANTS as $season) {
+                $out[] = $plan . self::VARIANT_SEP . $season;
+            }
+        }
+        return $out; // 6 Varianten: Anwesend·Sommer, Anwesend·Winter, Abwesend·Sommer, …
+    }
+
+    /**
+     * Aktiver Kreuzprodukt-Index aus 'Plan' (0..2) und 'Season' (0..1):
+     * index = plan * |SEASON| + season. Passt auf die Reihenfolge in
+     * scheduleVariants().
+     */
+    protected function activeVariantIndex(): int
+    {
+        $p = $this->intVal('Plan');
+        $s = $this->intVal('Season');
+        $p = ($p >= 0 && $p < count(self::PLAN_VARIANTS)) ? $p : 0;
+        $s = ($s >= 0 && $s < count(self::SEASON_VARIANTS)) ? $s : 0;
+        return $p * count(self::SEASON_VARIANTS) + $s;
+    }
+
+    /**
+     * Automatik-Hoheit: nur Position & Modus oeffnen ein manualHold-Fenster
+     * (Reflect/Plan nicht). Der Hold laeuft bis zur naechsten Slot-Grenze (M3).
+     */
+    protected function isAutomated(Control $c): bool
+    {
+        return in_array($c->ident, ['Position', 'Mode'], true);
+    }
+
+    /**
+     * Vertrag 1 — realer Umsetzungs-Hook. Die Basis hat den Wert optimistisch
+     * bereits in die MODUL-Statusvariable geschrieben; hier wird er an den HAL-
+     * Treiber weitergereicht (Position -> moveTo, Fahrt -> move).
+     *
+     * M0/M1-Geruest: solange kein Treiber konfiguriert ist (driver()==null),
+     * passiert NICHTS am Geraet (Schatten-Modus). Die Bindung an den
+     * GenericVariableShutter + reconcile/Sonnenautomatik folgen in M2/M3/M4.
+     */
+    protected function applyControl(Control $c, $value, ActionContext $ctx): void
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof IShutter) {
+            return; // kein (Shutter-)Treiber gebunden -> Schatten-Modus
+        }
+        switch ($c->ident) {
+            case 'Position':
+                $drv->moveTo(max((float) self::POS_MIN, min((float) self::POS_MAX, (float) $value)));
+                break;
+            case 'Movement':
+                $drv->move((int) $value === 1 ? 'up' : ((int) $value === 2 ? 'down' : 'stop'));
+                break;
+        }
+    }
+
+    /**
+     * HAL-Treiber (M1): GenericVariableShutter, gebunden an die IPSShadowing-
+     * Position-Variable. Diese ist ZIEL und FEEDBACK zugleich (absolutePosition) —
+     * readPosition liefert echte 0..100, moveTo faehrt ueber die getestete
+     * IPSShadowing-Dead-Reckoning-Kette. KEIN Roh-Telegramm-Treiber.
+     */
+    protected function driver(): ?IDriver
+    {
+        if ($this->driverResolved) {
+            return $this->driverInstance;
+        }
+        $this->driverResolved = true;
+        $this->driverInstance = null;
+
+        $cfg        = $this->store()->get('config', []);
+        $cfg        = is_array($cfg) ? $cfg : [];
+        $driverId   = (string) ($cfg['driver'] ?? '');
+        $positionId = (int) ($cfg['positionId'] ?? 0);
+
+        if ($driverId === '' || $positionId <= 0) {
+            return null; // unkonfiguriert -> applyControl bleibt im Schatten-Modus
+        }
+        try {
+            if ($driverId === 'generic-shutter') {
+                $dcfg = [
+                    'positionVarId'    => $positionId,
+                    'feedbackVarId'    => $positionId,
+                    'absolutePosition' => true,
+                    'invert'           => (bool) ($cfg['invert'] ?? false),
+                ];
+                $this->driverInstance = DriverFactory::create('generic-shutter', $dcfg);
+            }
+        } catch (\Throwable $e) {
+            $this->SendDebug('HSSH.driver', 'Treiberaufbau fehlgeschlagen: ' . $e->getMessage(), 0);
+            $this->driverInstance = null;
+        }
+        return $this->driverInstance;
+    }
+
+    /**
+     * Verwaltungs-Hook der Domaene (Manage() hat bereits die Whitelist geprueft).
+     * scheduleMode ist fest 'controller' -> KEINE device-Sync-Ops.
+     */
+    protected function mgmt(string $op, array $args, array $ctx): array
+    {
+        switch ($op) {
+            case 'configureDriver':
+                return $this->mgmtConfigureDriver($args, $ctx);
+            case 'configureAutomation':
+                return $this->mgmtConfigureAutomation($args);
+            case 'setArmed':
+                return $this->mgmtSetArmed($args);
+            case 'updateProfile':
+                return $this->mgmtUpdateProfile($args, $ctx);
+            case 'getSchedule':
+                return $this->mgmtGetSchedule($args);
+            case 'setActivePlan':
+                return $this->mgmtSetActivePlan($args);
+            case 'driverProbe':
+                return $this->mgmtDriverProbe();
+            case 'reconcileProbe':
+                return $this->mgmtReconcileProbe();
+            default:
+                // updateProfile/getSchedule/setActivePlan/importLegacy folgen in M6/M7.
+                return parent::mgmt($op, $args, $ctx);
+        }
+    }
+
+    /**
+     * Bindet den generischen Shutter-Treiber an eine (IPSShadowing-)Positions-
+     * Variable. Schreibt NUR den Store, kein Geraet. automaticId = das
+     * IPSShadowing-Automatic-Bool (fuer Cutover/Rollback, M8).
+     */
+    private function mgmtConfigureDriver(array $args, array $ctx): array
+    {
+        $driver = (string) ($args['driver'] ?? '');
+        if (!in_array($driver, ['', 'generic-shutter'], true)) {
+            throw new ContractException('unbekannter Treiber: ' . $driver);
+        }
+        $positionId  = (int) ($args['positionId'] ?? 0);
+        $automaticId = (int) ($args['automaticId'] ?? 0);
+        $invert      = (bool) ($args['invert'] ?? false);
+
+        if ($positionId > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($positionId)) {
+            throw new ContractException('positionId #' . $positionId . ' ist keine Variable');
+        }
+        if ($automaticId > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($automaticId)) {
+            throw new ContractException('automaticId #' . $automaticId . ' ist keine Variable');
+        }
+        if ($positionId <= 0 && $driver !== '') {
+            throw new ContractException($driver . ' braucht eine Positions-Variable (positionId)');
+        }
+
+        $config = ['driver' => $driver, 'positionId' => $positionId, 'automaticId' => $automaticId, 'invert' => $invert];
+
+        if (!empty($ctx['dryrun'])) {
+            return ['ok' => true, 'dryrun' => true, 'config' => $config, 'scheduleMode' => 'controller'];
+        }
+
+        $this->store()->patch('config', $config);
+        $this->driverResolved = false;
+        $this->driverInstance = null;
+        $active = $this->driver() instanceof IShutter;
+
+        return ['ok' => true, 'config' => $config, 'scheduleMode' => 'controller', 'driverActive' => $active];
+    }
+
+    /**
+     * Read-only-Diagnose (KEIN Geraeteschreiben): aktuelle Ist-Position + Treiber-
+     * Faehigkeiten. Dient dem HAL-Bindungstest (M1) und dem Trockenlauf (M7).
+     */
+    private function mgmtDriverProbe(): array
+    {
+        $vars = $this->scheduleVariants();
+        $idx  = $this->activeVariantIndex();
+        $base = [
+            'ok'            => true,
+            'variants'      => $vars,
+            'activeIndex'   => $idx,
+            'activeVariant' => $vars[$idx] ?? null,
+        ];
+        $drv = $this->driver();
+        if (!$drv instanceof IShutter) {
+            return $base + ['driverActive' => false, 'position' => null, 'capabilities' => null];
+        }
+        $pos = $drv->readPosition();
+        return $base + [
+            'driverActive' => true,
+            'position'     => $pos,
+            'known'        => $pos !== IShutter::POS_UNKNOWN,
+            'capabilities' => $drv->capabilities(),
+        ];
+    }
+
+    /**
+     * Sonnenautomatik + Sicherheit konfigurieren (Store-only, kein Geraet).
+     * geoProfile = Raum-Sonnenprofil {azimuthBgn,azimuthEnd,elevation,brightnessMin?,closePct?};
+     * env = Sensor-Objekt-IDs {sunAzId,sunElId,windId,rainId,brightId}; windStormKmh; safePos.
+     */
+    private function mgmtConfigureAutomation(array $args): array
+    {
+        $patch = [];
+        if (array_key_exists('geoProfile', $args)) {
+            $gp = $args['geoProfile'];
+            if ($gp !== null && !is_array($gp)) {
+                throw new ContractException('geoProfile muss ein Objekt/null sein');
+            }
+            $patch['geoProfile'] = $gp;
+        }
+        if (array_key_exists('env', $args)) {
+            if (!is_array($args['env'])) {
+                throw new ContractException('env muss ein Objekt sein');
+            }
+            $patch['env'] = array_map('intval', $args['env']);
+        }
+        if (array_key_exists('windStormKmh', $args)) {
+            $patch['windStormKmh'] = (float) $args['windStormKmh'];
+        }
+        if (array_key_exists('safePos', $args)) {
+            $patch['safePos'] = max(0, min(100, (int) $args['safePos']));
+        }
+        if ($patch !== []) {
+            $this->store()->patch('config', $patch);
+            $this->registerWatches($this->driver()); // env koennte Wind/Regen-IDs geaendert haben
+        }
+        return ['ok' => true, 'config' => $patch];
+    }
+
+    /**
+     * Positions-Wochenplan einer Variante/eines Tages schreiben (val 0..100).
+     * variant = Kreuzprodukt-Name „Plan · Season" oder Index in scheduleVariants().
+     */
+    private function mgmtUpdateProfile(array $args, array $ctx): array
+    {
+        $variant = $this->normalizeVariant($args['variant'] ?? '');
+        $day     = (int) ($args['day'] ?? -1);
+        if ($day < 0 || $day > 6) {
+            throw new ContractException('day muss 0..6 sein');
+        }
+        $slots = (isset($args['slots']) && is_array($args['slots'])) ? $args['slots'] : [];
+        $clean = [];
+        foreach ($slots as $s) {
+            if (!is_array($s) || !isset($s['end'])) {
+                continue;
+            }
+            $val = (int) round((float) ($s['val'] ?? 0));
+            $val = max(self::POS_MIN, min(self::POS_MAX, $val));
+            $clean[] = ['end' => (int) $s['end'], 'val' => $val];
+        }
+        if (!empty($ctx['dryrun'])) {
+            return ['ok' => true, 'dryrun' => true, 'variant' => $variant, 'day' => $day, 'slots' => $clean];
+        }
+        $this->schedules()->setSlots($variant, $day, $clean);
+
+        $drv = $this->driver();
+        if ($drv instanceof IShutter) {
+            $this->reconcile($drv); // controller: neuen Plan nachfahren (Schatten-Modus bis armed)
+        }
+        return ['ok' => true, 'variant' => $variant, 'day' => $day, 'slots' => $this->schedules()->getSlots($variant, $day)];
+    }
+
+    /** Kompletter Wochenplan einer Variante (fuer Editor/Verify). */
+    private function mgmtGetSchedule(array $args): array
+    {
+        $variant = $this->normalizeVariant($args['variant'] ?? '');
+        $week = [];
+        for ($d = 0; $d < 7; $d++) {
+            $week[$d] = $this->schedules()->getSlots($variant, $d);
+        }
+        return ['ok' => true, 'variant' => $variant, 'week' => $week, 'activeVariant' => $this->activeVariant(), 'variants' => $this->scheduleVariants()];
+    }
+
+    /** Setzt Plan (0..2) und/oder Season (0..1) ueber die native RequestAction. */
+    private function mgmtSetActivePlan(array $args): array
+    {
+        $res = ['ok' => true];
+        if (array_key_exists('plan', $args)) {
+            $p = (int) $args['plan'];
+            if ($p < 0 || $p >= count(self::PLAN_VARIANTS)) {
+                throw new ContractException('plan muss 0..' . (count(self::PLAN_VARIANTS) - 1) . ' sein');
+            }
+            $this->RequestAction('Plan', $p);
+            $res['plan'] = $p;
+        }
+        if (array_key_exists('season', $args)) {
+            $s = (int) $args['season'];
+            if ($s < 0 || $s >= count(self::SEASON_VARIANTS)) {
+                throw new ContractException('season muss 0..' . (count(self::SEASON_VARIANTS) - 1) . ' sein');
+            }
+            $this->RequestAction('Season', $s);
+            $res['season'] = $s;
+        }
+        $res['variant'] = $this->activeVariant();
+        return $res;
+    }
+
+    /** Variantennamen (Kreuzprodukt) normalisieren: Name aus scheduleVariants() oder Index. */
+    private function normalizeVariant($v): string
+    {
+        $vars = $this->scheduleVariants();
+        if (is_numeric($v)) {
+            return $vars[(int) $v] ?? $vars[0];
+        }
+        $v = (string) $v;
+        return in_array($v, $vars, true) ? $v : $vars[0];
+    }
+
+    /**
+     * Scharfschalten (armed=true -> reconcile faehrt wirklich) bzw. zurueck in den
+     * Schatten-Modus (armed=false -> nur berechnen/loggen). M8-Cutover je Geraet.
+     */
+    private function mgmtSetArmed(array $args): array
+    {
+        $armed = (bool) ($args['armed'] ?? false);
+        $this->store()->patch('config', ['armed' => $armed]);
+        return ['ok' => true, 'armed' => $armed];
+    }
+
+    /**
+     * TROCKENLAUF (read-only, kein Geraeteschreiben): liefert die Regel-Entscheidung
+     * inkl. Zwischengroessen, ohne zu fahren und ohne den Debounce-State zu
+     * veraendern. Kern des M7-Vergleichs gegen IPSShadowing.
+     */
+    private function mgmtReconcileProbe(): array
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof IShutter) {
+            return ['ok' => true, 'driverActive' => false];
+        }
+        $d      = $this->computeDecision($drv, false);
+        $armed  = (bool) $this->cfgVal('armed', false);
+        $target = $d['target'];
+        $drift  = ($d['cur'] === IShutter::POS_UNKNOWN) || ($target !== null && abs($d['cur'] - $target) > self::POS_TOLERANCE);
+        return [
+            'ok'           => true,
+            'driverActive' => true,
+            'armed'        => $armed,
+            'current'      => $d['cur'],
+            'target'       => $target,
+            'wouldMove'    => ($armed && $target !== null && $drift),
+            'mode'         => $d['mode'],
+            'variant'      => $d['variant'],
+            'held'         => $d['held'],
+            'storm'        => $d['storm'],
+            'rawSun'       => $d['rawSun'],
+            'sunTarget'    => $d['sunTarget'],
+            'schedTarget'  => $d['schedTarget'],
+            'inputs'       => $d['inp'],
+        ];
+    }
+
+    // ==================================================================
+    // Lebenszyklus: Refresh-Timer + Watches
+    // ==================================================================
+
+    protected function setupTimers(): void
+    {
+        $this->RegisterTimer(self::TIMER_REFRESH, 0, 'HSSH_Refresh($_IPS[\'TARGET\']);');
+    }
+
+    public function ApplyChanges()
+    {
+        parent::ApplyChanges();
+        $this->driverResolved = false;
+        $this->driverInstance = null;
+
+        $drv    = $this->driver();
+        $active = $drv instanceof IShutter;
+        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
+        $this->registerWatches($drv);
+    }
+
+    /** Timer-Callback (prefix HSSH_Refresh): Reflect + Reconcile. Public per SDK. */
+    public function Refresh(): void
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof IShutter) {
+            return;
+        }
+        $this->reflectFromDriver($drv);
+        $this->reconcile($drv);
+    }
+
+    /** Ist-Position/Online aus dem Treiber spiegeln (nur Statusvariablen). */
+    private function reflectFromDriver(IShutter $drv): void
+    {
+        $pos = $drv->readPosition();
+        if ($pos !== IShutter::POS_UNKNOWN) {
+            $this->setReflect('ActualPosition', $pos);
+        }
+        $this->setReflect('Online', $pos !== IShutter::POS_UNKNOWN);
+    }
+
+    // ==================================================================
+    // Reconciler (controller-Modus) — evalRules-Kaskade Safety>Sonne>Zeitplan
+    // ==================================================================
+
+    /**
+     * Treibt die Position nach der getierten Regel-Kaskade. SCHATTEN-MODUS bis
+     * config.armed==true: es wird berechnet und geloggt, aber NICHT gefahren
+     * (M7-Trockenlauf). manualHold (externer/manueller Eingriff) unterdrueckt nur
+     * Komfort-Regeln; Safety (Wind/Regen) ueberfaehrt ihn hart (ScheduleEngine).
+     */
+    private function reconcile(IShutter $drv): void
+    {
+        $d = $this->computeDecision($drv, true);
+        $target = $d['target'];
+        $rt = $this->readRt();
+        if ($target === null) {
+            $this->writeRt($rt); // Debounce-State ggf. schon in computeDecision persistiert
+            return; // nichts erzwingen (keine aktive Regel / Hold ohne Safety)
+        }
+        $cur    = $d['cur'];
+        $armed  = (bool) ($this->cfgVal('armed', false));
+        $drift  = ($cur === IShutter::POS_UNKNOWN) || abs($cur - $target) > self::POS_TOLERANCE;
+
+        if (!$drift) {
+            $rt['lastTarget'] = $target;
+            $this->writeRt($rt);
+            return;
+        }
+        if ($armed) {
+            // Self-Write VOR dem Schreiben markieren: auch bei SYNCHRONER VM_UPDATE-
+            // Zustellung darf der eigene moveTo nicht als externer Eingriff (-> Hold)
+            // missdeutet werden.
+            $rt['selfWriteTs']  = time();
+            $rt['selfWriteVal'] = $target;
+            $this->writeRt($rt);
+            if ($drv->moveTo((float) $target)) {
+                $this->SetValue('Position', $target);
+                $rt['lastSet']      = $target;
+                $rt['lastAssertTs'] = time();
+                $this->writeRt($rt);
+            }
+        } else {
+            // Schatten-Modus: nur protokollieren, kein Geraeteschreiben.
+            $this->SendDebug('HSSH.shadow', 'Ziel ' . $target . '% (ist ' . $cur . '%, '
+                . ($d['storm'] ? 'STURM' : ($d['sunTarget'] !== null ? 'Sonne' : 'Zeitplan')) . ') - nicht scharf', 0);
+            $rt['shadowTarget'] = $target;
+            $rt['shadowTs']     = time();
+            $this->writeRt($rt);
+        }
+    }
+
+    /**
+     * Reine Entscheidungslogik (ohne Fahren): baut das evalRules-Ruleset und
+     * liefert Ziel + Zwischengroessen. $persist=false => Sonnen-Debounce wird NICHT
+     * in den RtState geschrieben (fuer die read-only reconcileProbe/Trockenlauf).
+     */
+    private function computeDecision(IShutter $drv, bool $persist): array
+    {
+        $mode = $this->intVal('Mode');          // 0 Auto, 1 Manuell, 2 Sonne
+        $cur  = $drv->readPosition();
+        $inp  = $this->readInputs();
+
+        // Sonne: Sonnenstandsvergleich gegen das Raum-Sonnenprofil (evalGeo) + Min-Dwell.
+        $geo = $this->cfgVal('geoProfile', null);
+        $rawSun = (is_array($geo) && $inp['el'] !== null)
+            ? $this->schedules()->evalGeo((float) ($inp['az'] ?? 0), (float) $inp['el'], (float) ($inp['bright'] ?? 0), $geo)
+            : null;
+        $sunTarget = $this->debounceSun($rawSun, $persist);
+
+        // Zeitplan: aktive Kreuzprodukt-Variante -> Positions-Sollwert.
+        $schedVal    = $this->schedules()->eval(time(), $this->activeVariant());
+        $schedTarget = is_numeric($schedVal) ? (int) round((float) $schedVal) : null;
+
+        // Safety: Wind/Regen -> sichere Position.
+        $storm = $this->stormActive($inp);
+        $safe  = (int) $this->cfgVal('safePos', self::SAFE_POS);
+
+        $sunOn   = ($mode === 0 || $mode === 2);
+        $schedOn = ($mode === 0);
+        $held    = $this->isManuallyHeld('Position');
+
+        $rules = [
+            ['tier' => 'safety',  'active' => $storm,                              'target' => $safe],
+            ['tier' => 'comfort', 'active' => $sunOn && $sunTarget !== null,       'target' => $sunTarget],
+            ['tier' => 'comfort', 'active' => $schedOn && $schedTarget !== null,   'target' => $schedTarget],
+        ];
+        $target = $this->schedules()->evalRules($rules, ['manualHold' => $held]);
+
+        return [
+            'mode' => $mode, 'cur' => $cur, 'inp' => $inp, 'variant' => $this->activeVariant(),
+            'rawSun' => $rawSun, 'sunTarget' => $sunTarget, 'schedTarget' => $schedTarget,
+            'storm' => $storm, 'safe' => $safe, 'held' => $held, 'target' => $target,
+        ];
+    }
+
+    /**
+     * Min-Dwell-Entprellung der Sonnen-Regel (Blocker: evalGeo ist reiner
+     * Schwellvergleich -> flappt bei Wolken). Ein Zustandswechsel wird erst nach
+     * SUN_DWELL Sekunden anhaltender Bedingung uebernommen. Liefert die effektive
+     * Sonnen-Zielposition oder null.
+     */
+    private function debounceSun(?int $raw, bool $persist): ?int
+    {
+        $rt   = $this->readRt();
+        $now  = time();
+        $act  = $raw !== null;
+        $state = (bool) ($rt['sunOn'] ?? false);
+        $cand  = (bool) ($rt['sunCand'] ?? $state);
+        $candTs = (int) ($rt['sunCandTs'] ?? $now);
+
+        if ($act === $state) {
+            $cand = $act;
+            $candTs = $now;
+        } else {
+            if ($act !== $cand) { $cand = $act; $candTs = $now; }
+            if ($now - $candTs >= self::SUN_DWELL) { $state = $act; }
+        }
+        $lastTarget = $raw !== null ? $raw : (int) ($rt['sunLastTarget'] ?? self::SAFE_POS);
+
+        if ($persist) {
+            $rt['sunOn']     = $state;
+            $rt['sunCand']   = $cand;
+            $rt['sunCandTs'] = $candTs;
+            if ($raw !== null) { $rt['sunLastTarget'] = $raw; }
+            $this->writeRt($rt);
+        }
+        return $state ? $lastTarget : null;
+    }
+
+    /** Sturm-/Regen-Lage aus den Umgebungssensoren. */
+    private function stormActive(array $inp): bool
+    {
+        $windMax = (float) $this->cfgVal('windStormKmh', self::WIND_STORM_KMH);
+        $wind    = $inp['wind'];
+        return (($wind !== null) && $wind >= $windMax) || ($inp['rain'] === true);
+    }
+
+    /** Umgebungswerte lesen (null, wenn Sensor fehlt). */
+    private function readInputs(): array
+    {
+        return [
+            'az'     => $this->envNum('sunAzId', self::SUN_AZ_ID),
+            'el'     => $this->envNum('sunElId', self::SUN_EL_ID),
+            'bright' => $this->envNum('brightId', self::BRIGHT_ID),
+            'wind'   => $this->envNum('windId', self::WIND_ID),
+            'rain'   => $this->envBool('rainId', self::RAIN_ID),
+        ];
+    }
+
+    private function envId(string $key, int $def): int
+    {
+        $env = $this->cfgVal('env', []);
+        $env = is_array($env) ? $env : [];
+        return (int) ($env[$key] ?? $def);
+    }
+
+    private function envNum(string $key, int $def): ?float
+    {
+        $id = $this->envId($key, $def);
+        if ($id <= 0 || !function_exists('IPS_VariableExists') || !@\IPS_VariableExists($id)) {
+            return null;
+        }
+        $v = @GetValue($id);
+        return is_numeric($v) ? (float) $v : null;
+    }
+
+    private function envBool(string $key, int $def): ?bool
+    {
+        $id = $this->envId($key, $def);
+        if ($id <= 0 || !function_exists('IPS_VariableExists') || !@\IPS_VariableExists($id)) {
+            return null;
+        }
+        $v = @GetValue($id);
+        if (is_bool($v)) { return $v; }
+        return is_numeric($v) ? ((float) $v > 0) : null;
+    }
+
+    /** Aktive Kreuzprodukt-Variante (Plan · Season). */
+    private function activeVariant(): string
+    {
+        $vars = $this->scheduleVariants();
+        $idx  = $this->activeVariantIndex();
+        return $vars[$idx] ?? ($vars[0] ?? 'Anwesend' . self::VARIANT_SEP . 'Sommer');
+    }
+
+    /** Config-Wert (aus dem Store) mit Default. */
+    private function cfgVal(string $key, $def)
+    {
+        $cfg = $this->store()->get('config', []);
+        $cfg = is_array($cfg) ? $cfg : [];
+        return $cfg[$key] ?? $def;
+    }
+
+    // ==================================================================
+    // Manual-Override / externe Eingriffe / Sofort-Safety
+    // ==================================================================
+
+    /** Lauscht (idempotent) auf Positions-Variable + Wind + Regen. */
+    private function registerWatches(?IShutter $drv): void
+    {
+        $posVid  = (int) $this->cfgVal('positionId', 0);
+        $windVid = $this->envId('windId', self::WIND_ID);
+        $rainVid = $this->envId('rainId', self::RAIN_ID);
+        $want    = array_values(array_unique(array_filter([$posVid, $windVid, $rainVid], static fn($v) => (int) $v > 0)));
+
+        $rt  = $this->readRt();
+        $old = is_array($rt['watchAll'] ?? null) ? $rt['watchAll'] : [];
+        foreach ($old as $v) {
+            if (!in_array((int) $v, $want, true)) {
+                @$this->UnregisterMessage((int) $v, VM_UPDATE);
+            }
+        }
+        foreach ($want as $v) {
+            $this->RegisterMessage((int) $v, VM_UPDATE); // idempotent, ueberlebt Reload nicht
+        }
+        $rt['watchVid'] = $posVid;
+        $rt['watchAll'] = $want;
+        $this->writeRt($rt);
+    }
+
+    /**
+     * Native Nachrichtensenke: (a) externe Aenderung der Positions-Variable ->
+     * manualHold bis Slot-Grenze; (b) Wind/Regen-Flanke -> SOFORT ein Safety-
+     * reconcile (nicht auf den 30s-Tick warten).
+     */
+    public function MessageSink($Timestamp, $Sender, $Message, $Data)
+    {
+        parent::MessageSink($Timestamp, $Sender, $Message, $Data);
+        if ($Message !== VM_UPDATE) {
+            return;
+        }
+        $rt      = $this->readRt();
+        $posVid  = (int) ($rt['watchVid'] ?? 0);
+        $windVid = $this->envId('windId', self::WIND_ID);
+        $rainVid = $this->envId('rainId', self::RAIN_ID);
+
+        if ($posVid > 0 && (int) $Sender === $posVid) {
+            $newVal = isset($Data[0]) && is_numeric($Data[0]) ? (float) $Data[0] : null;
+            if ($newVal === null) {
+                return;
+            }
+            $selfTs  = (int) ($rt['selfWriteTs'] ?? 0);
+            $selfVal = isset($rt['selfWriteVal']) ? (float) $rt['selfWriteVal'] : null;
+            if ($selfVal !== null && abs($selfVal - $newVal) < 1.0 && (time() - $selfTs) <= 10) {
+                return; // Self-Write (das war das Modul)
+            }
+            $this->manualHold('Position', $this->secondsToNextSlotBoundary());
+            $this->SendDebug('HSSH.override', 'Externe Position ' . $newVal . '% -> Hold bis Slot-Grenze', 0);
+            return;
+        }
+        if (($windVid > 0 && (int) $Sender === $windVid) || ($rainVid > 0 && (int) $Sender === $rainVid)) {
+            $drv = $this->driver();
+            if ($drv instanceof IShutter) {
+                $this->reconcile($drv); // Sofort-Safety (Schatten-Modus bis armed)
+            }
+        }
+    }
+
+    /** Sekunden bis zur naechsten Slot-Grenze der aktiven Variante (min. 60s). */
+    private function secondsToNextSlotBoundary(): int
+    {
+        $now    = time();
+        $day    = (int) date('N', $now) - 1;
+        $minNow = ((int) date('G', $now)) * 60 + (int) date('i', $now);
+        foreach ($this->schedules()->getSlots($this->activeVariant(), $day) as $slot) {
+            $end = (int) $slot['end'];
+            if ($end > $minNow) {
+                return max(60, ($end - $minNow) * 60);
+            }
+        }
+        return max(60, (1440 - $minNow) * 60);
+    }
+
+    /** Integer-Wert einer Status-Variable per Ident (0, wenn nicht vorhanden). */
+    private function intVal(string $ident): int
+    {
+        if ($this->GetIDForIdent($ident) === false) {
+            return 0;
+        }
+        $v = @$this->GetValue($ident);
+        return is_numeric($v) ? (int) $v : 0;
+    }
+}
