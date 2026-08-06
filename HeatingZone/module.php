@@ -44,11 +44,23 @@ class HeatingZone extends EntityModule
     private const SETPOINT_MIN = 5.0;
     private const SETPOINT_MAX = 30.0;
 
-    /** Refresh-Intervall (ms) fuer das Nachziehen der Reflect-Controls. */
+    /** Tick-Intervall (ms): Reflect + Reconcile (Failsafe-Re-Assert). */
     private const REFRESH_MS = 30000;
 
     /** Timer-Ident (RegisterTimer/SetTimerInterval). */
     private const TIMER_REFRESH = 'Refresh';
+
+    /** Volatiler Laufzeit-Status (NICHT im Konfig-Store, Blocker D). */
+    private const ATTR_RT = 'RtState';
+
+    /** Frostschutz-Sollwert (°C), wenn nicht konfiguriert. */
+    private const FROST_DEFAULT = 8.0;
+
+    /** Periodisches Re-Assert des Sollwerts spaetestens alle N Sekunden (Failsafe). */
+    private const REASSERT_SECONDS = 300;
+
+    /** Presence-Control-Wert (0..2) -> Zeitplan-Variante. */
+    private const PRESENCE_VARIANTS = ['Normal', 'Erweitert', 'Abgesenkt'];
 
     /** Lazy-Cache des HAL-Treibers (pro Instanz-Prozess). */
     private ?IDriver $driverInstance = null;
@@ -139,6 +151,7 @@ class HeatingZone extends EntityModule
                 ['op' => 'deleteEntity',      'label' => 'Loeschen'],
                 ['op' => 'configureDriver',   'label' => 'Treiber konfigurieren'],
                 ['op' => 'updateProfile',     'label' => 'Wochenprofil bearbeiten'],
+                ['op' => 'getSchedule',       'label' => 'Wochenplan lesen'],
                 ['op' => 'duplicateProfile',  'label' => 'Profil duplizieren'],
                 ['op' => 'assignProfile',     'label' => 'Profil zuweisen'],
                 ['op' => 'setActivePresence', 'label' => 'Praesenz setzen'],
@@ -235,6 +248,13 @@ class HeatingZone extends EntityModule
 
         // Nach jedem Schreiben die Reflect-Controls frisch nachziehen.
         $this->reflectFromDriver($drv);
+
+        // Praesenz-/Modus-Wechsel: Zeitplan sofort anwenden (device: Push,
+        // controller: Sollwert nachfahren). Bei Setpoint NICHT (dort haelt der
+        // manualHold der Basis den Nutzerwert).
+        if ($c->ident === 'Presence' || $c->ident === 'Mode') {
+            $this->reconcile($drv);
+        }
     }
 
     // ==================================================================
@@ -338,6 +358,13 @@ class HeatingZone extends EntityModule
     // Lebenszyklus: Refresh-Timer scharf/aus je nach Treiber
     // ==================================================================
 
+    public function Create()
+    {
+        parent::Create();
+        // Volatiler Laufzeit-Status (last-commanded/last-push/hold-Herkunft).
+        $this->RegisterAttributeString(self::ATTR_RT, '{}');
+    }
+
     protected function setupTimers(): void
     {
         // Timer anlegen (aus). Interval wird in ApplyChanges gesetzt.
@@ -352,20 +379,259 @@ class HeatingZone extends EntityModule
         $this->driverResolved = false;
         $this->driverInstance = null;
 
-        $active = $this->driver() instanceof IThermostat;
+        $drv    = $this->driver();
+        $active = $drv instanceof IThermostat;
         $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
+
+        // Manual-Override-Erkennung: auf Aenderungen der GERAETE-Sollwertvariable
+        // lauschen (jemand verstellt am Geraet/HM-Oberflaeche).
+        $this->registerSetpointWatch($drv);
     }
 
     /**
-     * Timer-Callback (prefix: HSHT_Refresh). Zieht die Reflect-Controls nach.
-     * Public erzwungen durch SDK; harmlos (nur Lesen + Statusvariablen-Reflect).
+     * Timer-Callback (prefix: HSHT_Refresh). Reflect + Reconcile (Failsafe).
+     * Public erzwungen durch SDK.
      */
     public function Refresh(): void
     {
         $drv = $this->driver();
-        if ($drv instanceof IThermostat) {
-            $this->reflectFromDriver($drv);
+        if (!$drv instanceof IThermostat) {
+            return;
         }
+        $this->reflectFromDriver($drv);
+        $this->reconcile($drv);
+    }
+
+    // ==================================================================
+    // Reconciler (Control-Layer / Failsafe) — Block C
+    // ==================================================================
+
+    /**
+     * Faehrt den Sollwert generisch nach dem aktiven Zeitplan/Modus (controller-
+     * Modus). Im device-Modus fuehrt das GERAET den Plan selbst — dann nur
+     * sicherstellen, dass das aktuelle Wochenprogramm gepusht ist.
+     */
+    private function reconcile(IThermostat $drv): void
+    {
+        $caps = $drv->capabilities();
+
+        if (($caps['scheduleMode'] ?? 'controller') === 'device') {
+            // Geraet fuehrt den Plan; Modul sorgt nur fuer den aktuellen Push.
+            $this->pushWeekIfChanged($drv);
+            return;
+        }
+
+        // --- controller: Modul treibt den Sollwert ---
+        $mode = $this->intVal('Mode');           // 0 Auto,1 Manuell,2 Boost,3 Frost
+        if ($mode === 1) {
+            return; // Manuell: Nutzer besitzt den Sollwert
+        }
+        if ($this->isManuallyHeld('Setpoint')) {
+            return; // manueller Override aktiv (bis naechste Slot-Grenze)
+        }
+
+        $desired = $this->desiredSetpoint($mode);
+        if ($desired === null) {
+            return; // kein Plan fuer diesen Tag/Modus -> nichts erzwingen
+        }
+
+        // Re-Assert-Politik: schreiben, wenn der ISTWERT vom Soll abweicht
+        // (Drift/konkurrierender Regler/abgelaufener Hold) ODER periodisch (Failsafe).
+        // Gegen den Istwert vergleichen, NICHT nur gegen den zuletzt befohlenen.
+        $rt      = $this->readRt();
+        $lastTs  = (int) ($rt['lastAssertTs'] ?? 0);
+        $actual  = $drv->readLive()['setpoint'] ?? null;
+        $drift   = ($actual === null) || abs((float) $actual - $desired) > 0.01;
+        $stale   = (time() - $lastTs) >= self::REASSERT_SECONDS;
+
+        if (!$drift && !$stale) {
+            return;
+        }
+
+        if ($drv->setSetpoint($desired)) {
+            $this->SetValue('Setpoint', $desired);   // Modul-Sollwert spiegeln
+            $rt['lastSet']      = $desired;
+            $rt['lastAssertTs'] = time();
+            $rt['selfWriteTs']  = time();            // fuer Self-Write-Unterdrueckung
+            $rt['selfWriteVal'] = $desired;
+            $this->writeRt($rt);
+        }
+    }
+
+    /** Gewuenschter Sollwert je Modus (Auto/Boost aus Plan, Frost fix). */
+    private function desiredSetpoint(int $mode): ?float
+    {
+        if ($mode === 3) {                            // Frostschutz
+            $v = $this->store()->get('config.frostTemp', self::FROST_DEFAULT);
+            return is_numeric($v) ? (float) $v : self::FROST_DEFAULT;
+        }
+        // Auto (0) und Boost (2, vorerst wie Auto) -> aus dem Wochenplan.
+        $variant = $this->activeVariant();
+        $v = $this->schedules()->eval(time(), $variant);
+        return is_numeric($v) ? (float) $v : null;
+    }
+
+    /** Aktive Zeitplan-Variante aus dem Presence-Control (0..2). */
+    private function activeVariant(): string
+    {
+        $p = $this->intVal('Presence');
+        return self::PRESENCE_VARIANTS[$p] ?? self::PRESENCE_VARIANTS[0];
+    }
+
+    /**
+     * device-Modus: pusht das Wochenprogramm der aktiven Variante ins Geraet,
+     * wenn es sich gegenueber dem zuletzt gepushten Stand geaendert hat.
+     */
+    private function pushWeekIfChanged(IThermostat $drv): void
+    {
+        $variant = $this->activeVariant();
+        $week    = $this->schedules()->toHomematicWeek($variant, 10, 13);
+        if ($this->weekIsEmpty($week)) {
+            return; // kein Plan hinterlegt -> Geraeteprogramm nicht anfassen
+        }
+        $hash = md5($variant . '|' . json_encode($week));
+        $rt   = $this->readRt();
+        if (($rt['pushHash'] ?? '') === $hash) {
+            return; // schon aktuell
+        }
+        if ($drv->writeWeekProfile($week)) {
+            $rt['pushHash'] = $hash;
+            $this->writeRt($rt);
+            $this->SendDebug('HSHT.push', 'Wochenprogramm gepusht (' . $variant . ')', 0);
+        }
+    }
+
+    private function weekIsEmpty(array $week): bool
+    {
+        foreach ($week as $slots) {
+            if (is_array($slots) && $slots !== []) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // ==================================================================
+    // Manual-Override-Erkennung (Block D)
+    // ==================================================================
+
+    /** Registriert (idempotent) das Lauschen auf die GERAETE-Sollwertvariable. */
+    private function registerSetpointWatch(?IThermostat $drv): void
+    {
+        $vid = ($drv instanceof IThermostat) ? $this->deviceSetpointVarId($drv) : 0;
+        $rt  = $this->readRt();
+        $old = (int) ($rt['watchVid'] ?? 0);
+
+        if ($old > 0 && $old !== $vid) {
+            @$this->UnregisterMessage($old, VM_UPDATE);
+        }
+        // RegisterMessage IMMER (idempotent): nach Reload/Restart sind
+        // Registrierungen weg, waehrend rt.watchVid persistiert -> nicht dedupen.
+        if ($vid > 0) {
+            $this->RegisterMessage($vid, VM_UPDATE);
+        }
+        $rt['watchVid'] = $vid;
+        $this->writeRt($rt);
+    }
+
+    /**
+     * Native Nachrichtensenke. Faengt zusaetzlich VM_UPDATE der GERAETE-Sollwert-
+     * variable ab: aendert sich der Wert, OHNE dass das Modul ihn geschrieben hat
+     * -> manueller Override -> manualHold bis zur naechsten Slot-Grenze.
+     */
+    public function MessageSink($Timestamp, $Sender, $Message, $Data)
+    {
+        parent::MessageSink($Timestamp, $Sender, $Message, $Data);
+
+        if ($Message !== VM_UPDATE) {
+            return;
+        }
+        $rt = $this->readRt();
+        if ((int) ($rt['watchVid'] ?? 0) !== (int) $Sender) {
+            return;
+        }
+        $newVal = isset($Data[0]) && is_numeric($Data[0]) ? (float) $Data[0] : null;
+        if ($newVal === null) {
+            return;
+        }
+        // Self-Write-Unterdrueckung: kurz nach eigenem setSetpoint denselben Wert
+        // ignorieren (das war das Modul, kein Mensch).
+        $selfTs  = (int) ($rt['selfWriteTs'] ?? 0);
+        $selfVal = isset($rt['selfWriteVal']) ? (float) $rt['selfWriteVal'] : null;
+        if ($selfVal !== null && abs($selfVal - $newVal) < 0.01 && (time() - $selfTs) <= 10) {
+            return;
+        }
+        // Externer Eingriff -> Override bis zur naechsten Slot-Grenze halten.
+        $this->manualHold('Setpoint', $this->secondsToNextSlotBoundary());
+        $this->SendDebug('HSHT.override', 'Externer Sollwert ' . $newVal . ' erkannt -> Hold bis Slot-Grenze', 0);
+    }
+
+    /** Sekunden bis zur naechsten Slot-Grenze der aktiven Variante (Default 1 h). */
+    private function secondsToNextSlotBoundary(): int
+    {
+        $variant = $this->activeVariant();
+        $now     = time();
+        $day     = (int) date('N', $now) - 1;            // 0..6
+        $minNow  = ((int) date('G', $now)) * 60 + (int) date('i', $now);
+
+        $slots = $this->schedules()->getSlots($variant, $day);
+        foreach ($slots as $slot) {
+            $end = (int) $slot['end'];
+            if ($end > $minNow) {
+                return max(60, ($end - $minNow) * 60);
+            }
+        }
+        // Keine spaetere Grenze heute -> bis Mitternacht.
+        return max(60, (1440 - $minNow) * 60);
+    }
+
+    // ==================================================================
+    // Laufzeit-Status (volatil) & kleine Helfer
+    // ==================================================================
+
+    private function readRt(): array
+    {
+        try {
+            $raw = (string) $this->ReadAttributeString(self::ATTR_RT);
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $d = json_decode($raw, true);
+        return is_array($d) ? $d : [];
+    }
+
+    private function writeRt(array $rt): void
+    {
+        $j = json_encode($rt);
+        $this->WriteAttributeString(self::ATTR_RT, $j === false ? '{}' : $j);
+    }
+
+    private function intVal(string $ident): int
+    {
+        if ($this->GetIDForIdent($ident) === false) {
+            return 0;
+        }
+        $v = @$this->GetValue($ident);
+        return is_numeric($v) ? (int) $v : 0;
+    }
+
+    /** Objekt-ID der geraeteseitigen Sollwertvariable (fuer den Watch). */
+    private function deviceSetpointVarId(IThermostat $drv): int
+    {
+        // Generisch: config.targetId ist bei generic die Sollwert-Variable,
+        // bei hm-* die Instanz -> dort die SET_TEMPERATURE-Variable aufloesen.
+        $cfg    = $this->store()->get('config', []);
+        $cfg    = is_array($cfg) ? $cfg : [];
+        $target = (int) ($cfg['targetId'] ?? 0);
+        $driver = (string) ($cfg['driver'] ?? '');
+        if ($target <= 0) {
+            return 0;
+        }
+        if (strncmp($driver, 'hm-', 3) === 0) {
+            $sp = @\IPS_GetObjectIDByIdent('SET_TEMPERATURE', $target);
+            return (is_int($sp) && $sp > 0) ? $sp : 0;
+        }
+        return $target; // generic: targetId ist die Sollwert-Variable
     }
 
     // ==================================================================
@@ -377,9 +643,95 @@ class HeatingZone extends EntityModule
         switch ($op) {
             case 'configureDriver':
                 return $this->mgmtConfigureDriver($args, $ctx);
+            case 'updateProfile':
+                return $this->mgmtUpdateProfile($args, $ctx);
+            case 'getSchedule':
+                return $this->mgmtGetSchedule($args);
+            case 'setActivePresence':
+                return $this->mgmtSetActivePresence($args);
             default:
                 return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
         }
+    }
+
+    /**
+     * Schreibt die Slots eines Tages einer Praesenz-Variante (Wochenplan-Editor).
+     * args: { variant|presence, day(0..6), slots:[{end:int,val:float}, ...] }.
+     * Nach dem Speichern wird der Reconciler angestossen (device: Push; controller:
+     * naechster Tick faehrt den Wert).
+     */
+    private function mgmtUpdateProfile(array $args, array $ctx): array
+    {
+        $variant = $this->normalizeVariant($args['variant'] ?? ($args['presence'] ?? 'Normal'));
+        $day     = (int) ($args['day'] ?? -1);
+        if ($day < 0 || $day > 6) {
+            throw new ContractException('day muss 0..6 sein');
+        }
+        $slots = (isset($args['slots']) && is_array($args['slots'])) ? $args['slots'] : [];
+        // Slots haerten: end 1..1440, val auf Bereich klemmen.
+        $clean = [];
+        foreach ($slots as $s) {
+            if (!is_array($s) || !isset($s['end'])) {
+                continue;
+            }
+            $end = (int) $s['end'];
+            $val = (float) ($s['val'] ?? 0);
+            $val = max(self::SETPOINT_MIN, min(self::SETPOINT_MAX, $val));
+            $clean[] = ['end' => $end, 'val' => $val];
+        }
+
+        if (!empty($ctx['dryrun'])) {
+            return ['ok' => true, 'dryrun' => true, 'variant' => $variant, 'day' => $day, 'slots' => $clean];
+        }
+
+        $this->schedules()->setSlots($variant, $day, $clean);
+
+        // Reconciler anstossen (Push bei device / Nachfahren bei controller).
+        $drv = $this->driver();
+        if ($drv instanceof IThermostat) {
+            // Push-Hash invalidieren, damit device den neuen Plan sicher uebernimmt.
+            $rt = $this->readRt();
+            unset($rt['pushHash']);
+            $this->writeRt($rt);
+            $this->reconcile($drv);
+        }
+
+        return ['ok' => true, 'variant' => $variant, 'day' => $day, 'slots' => $this->schedules()->getSlots($variant, $day)];
+    }
+
+    /**
+     * Liefert den kompletten Wochenplan einer Variante (fuer Editor/Verify).
+     * args: { variant|presence }.
+     */
+    private function mgmtGetSchedule(array $args): array
+    {
+        $variant = $this->normalizeVariant($args['variant'] ?? ($args['presence'] ?? 'Normal'));
+        $week = [];
+        for ($d = 0; $d < 7; $d++) {
+            $week[$d] = $this->schedules()->getSlots($variant, $d);
+        }
+        return ['ok' => true, 'variant' => $variant, 'week' => $week, 'activeVariant' => $this->activeVariant()];
+    }
+
+    /** Setzt die aktive Praesenz (0..2) ueber die native RequestAction. */
+    private function mgmtSetActivePresence(array $args): array
+    {
+        $p = (int) ($args['presence'] ?? $args['value'] ?? -1);
+        if ($p < 0 || $p > 2) {
+            throw new ContractException('presence muss 0..2 sein');
+        }
+        $this->RequestAction('Presence', $p);
+        return ['ok' => true, 'presence' => $p, 'variant' => $this->activeVariant()];
+    }
+
+    /** Variantennamen auf die erlaubten Presence-Varianten normalisieren. */
+    private function normalizeVariant($v): string
+    {
+        if (is_numeric($v)) {
+            return self::PRESENCE_VARIANTS[(int) $v] ?? self::PRESENCE_VARIANTS[0];
+        }
+        $v = (string) $v;
+        return in_array($v, self::PRESENCE_VARIANTS, true) ? $v : self::PRESENCE_VARIANTS[0];
     }
 
     /**
