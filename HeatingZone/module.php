@@ -631,6 +631,9 @@ class HeatingZone extends EntityModule
         }
         if (strncmp($driver, 'hm-', 3) === 0) {
             $sp = @\IPS_GetObjectIDByIdent('SET_TEMPERATURE', $target);
+            if (!is_int($sp) || $sp <= 0) {
+                $sp = @\IPS_GetObjectIDByIdent('SETPOINT', $target); // HM-CC-TC
+            }
             return (is_int($sp) && $sp > 0) ? $sp : 0;
         }
         return $target; // generic: targetId ist die Sollwert-Variable
@@ -905,10 +908,12 @@ class HeatingZone extends EntityModule
                 if (function_exists('IPS_InstanceExists') && !\IPS_InstanceExists($targetId)) {
                     throw new ContractException('targetId #' . $targetId . ' ist keine Instanz (HM-Geraet erwartet)');
                 }
-                // Plausibilitaet: hat die Instanz einen SET_TEMPERATURE-Kanal?
+                // Plausibilitaet: hat die Instanz einen Sollwert-Kanal
+                // (SET_TEMPERATURE bei RT-DN/TC-IT, SETPOINT bei CC-TC)?
                 if (function_exists('IPS_GetObjectIDByIdent')
-                    && @\IPS_GetObjectIDByIdent('SET_TEMPERATURE', $targetId) === false) {
-                    throw new ContractException('Instanz #' . $targetId . ' hat keinen SET_TEMPERATURE-Kanal');
+                    && @\IPS_GetObjectIDByIdent('SET_TEMPERATURE', $targetId) === false
+                    && @\IPS_GetObjectIDByIdent('SETPOINT', $targetId) === false) {
+                    throw new ContractException('Instanz #' . $targetId . ' hat keinen Sollwert-Kanal (SET_TEMPERATURE/SETPOINT)');
                 }
             } elseif (function_exists('IPS_VariableExists') && !\IPS_VariableExists($targetId)) {
                 throw new ContractException('targetId #' . $targetId . ' ist keine Variable');

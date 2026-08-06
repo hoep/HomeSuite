@@ -46,6 +46,7 @@ final class HomeMaticThermostat implements IThermostat
     /** Aufgeloeste Kanal-Variablen (ident => objectId | null). */
     private array $vid = [
         'SET_TEMPERATURE'    => null,
+        'SETPOINT'           => null,   // HM-CC-TC nutzt SETPOINT statt SET_TEMPERATURE
         'ACTUAL_TEMPERATURE' => null,
         'ACTUAL_HUMIDITY'    => null,
         'VALVE_STATE'        => null,
@@ -119,12 +120,18 @@ final class HomeMaticThermostat implements IThermostat
         return null;
     }
 
+    /** Sollwert-Variable: SET_TEMPERATURE (RT-DN/TC-IT) oder SETPOINT (CC-TC). */
+    private function setpointVid(): int
+    {
+        return (int) ($this->vid['SET_TEMPERATURE'] ?? $this->vid['SETPOINT'] ?? 0);
+    }
+
     /** @return array{actual: ?float, setpoint: ?float, humidity: ?int, valve: ?int} */
     public function readLive(): array
     {
         return [
             'actual'   => $this->readFloat($this->vid['ACTUAL_TEMPERATURE']),
-            'setpoint' => $this->readFloat($this->vid['SET_TEMPERATURE']),
+            'setpoint' => $this->readFloat($this->setpointVid()),
             'humidity' => $this->readInt($this->vid['ACTUAL_HUMIDITY']),
             'valve'    => $this->readInt($this->vid['VALVE_STATE']),
         ];
@@ -132,9 +139,9 @@ final class HomeMaticThermostat implements IThermostat
 
     public function setSetpoint(float $c): bool
     {
-        $vid = (int) ($this->vid['SET_TEMPERATURE'] ?? 0);
+        $vid = $this->setpointVid();
         if ($vid <= 0) {
-            $this->log('setSetpoint: SET_TEMPERATURE nicht aufgeloest (Device #' . $this->device . ')');
+            $this->log('setSetpoint: Sollwert-Variable nicht aufgeloest (Device #' . $this->device . ')');
             return false;
         }
         $c = $this->clampRaster($c);
