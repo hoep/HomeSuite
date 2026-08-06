@@ -156,6 +156,7 @@ class HeatingZone extends EntityModule
                 ['op' => 'assignProfile',     'label' => 'Profil zuweisen'],
                 ['op' => 'setActivePresence', 'label' => 'Praesenz setzen'],
                 ['op' => 'importLegacy',      'label' => 'Aus Altsteuerung importieren'],
+                ['op' => 'adoptDevice',       'label' => 'Geraeteprogramm uebernehmen'],
             ],
 
             // ---- Konfig-Felder (Treiberwahl; im LVB gesetzt) ----
@@ -652,6 +653,8 @@ class HeatingZone extends EntityModule
                 return $this->mgmtSetActivePresence($args);
             case 'importLegacy':
                 return $this->ImportLegacy($args);
+            case 'adoptDevice':
+                return $this->mgmtAdoptDevice();
             default:
                 return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
         }
@@ -741,6 +744,48 @@ class HeatingZone extends EntityModule
         }
 
         return ['ok' => true, 'dryrun' => $dryrun, 'imported' => $imported];
+    }
+
+    /**
+     * Adoptiert das AKTUELLE Geraeteprogramm (device-Modus) in die HeatingZone-
+     * Zeitplaene — die Migrations-Wahrheit ist das GERAET (G1), nicht die evtl.
+     * veraltete Legacy-Variable. SCHREIBT NICHT ins Geraet; seedet den pushHash,
+     * damit der Reconciler das (identische) Programm nicht zurueckschreibt.
+     *
+     * @return array<string,mixed>
+     */
+    private function mgmtAdoptDevice(): array
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof IThermostat) {
+            return ['ok' => false, 'error' => 'kein Treiber konfiguriert'];
+        }
+        $caps = $drv->capabilities();
+        if (($caps['scheduleMode'] ?? '') !== 'device') {
+            return ['ok' => false, 'error' => 'adoptDevice nur im device-Modus sinnvoll'];
+        }
+
+        $eng     = $this->schedules();
+        $adopted = [];
+        foreach (self::PRESENCE_VARIANTS as $pi => $variant) {
+            $week = $drv->readWeekProfile($pi);
+            $days = 0;
+            foreach ($week as $di => $slots) {
+                if (is_array($slots) && $slots !== []) {
+                    $eng->setSlots($variant, $di, $slots);
+                    $days++;
+                }
+            }
+            $adopted[$variant] = $days;
+        }
+
+        // pushHash der aktiven Variante seeden -> kein Ruecklschreiben ins Geraet.
+        $variant = $this->activeVariant();
+        $rt = $this->readRt();
+        $rt['pushHash'] = md5($variant . '|' . json_encode($eng->toHomematicWeek($variant, 10, 13)));
+        $this->writeRt($rt);
+
+        return ['ok' => true, 'adopted' => $adopted, 'source' => 'device'];
     }
 
     /** "HH:MM" -> Minuten seit Mitternacht (24:00 -> 1440). */
