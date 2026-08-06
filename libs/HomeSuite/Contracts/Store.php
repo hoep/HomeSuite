@@ -24,16 +24,63 @@ namespace Hoep\HomeSuite;
  */
 final class Store
 {
-    private \IPSModule $module;
     private string $attr;
 
     /** In-Memory-Cache des zuletzt gelesenen Baums (Lesekosten senken). */
     private ?array $cache = null;
 
+    /**
+     * Attribut-Zugriffe laufen ueber an das Modul GEBUNDENE Closures. Grund:
+     * IPSModule::ReadAttributeString()/WriteAttributeString() sind PROTECTED — ein
+     * fremdes Objekt (Store) darf sie nicht direkt aufrufen. Eine im Modul-Scope
+     * gebundene Closure erhaelt legitimen Zugriff auf die protected-Methoden der
+     * Instanz, ohne dem Modul oeffentliche Attribut-Setter aufzuzwingen (die sonst
+     * als Prefix-Funktionen die API verschmutzen wuerden).
+     *
+     * @var \Closure(string):string       liest das Roh-Attribut
+     * @var \Closure(string,string):void  schreibt das Roh-Attribut
+     */
+    private \Closure $reader;
+    private \Closure $writer;
+
+    /** Instanz-ID des Moduls (fuer den instanz-eindeutigen Semaphor-Namen). */
+    private int $instanceId;
+
     public function __construct(\IPSModule $module, string $attr = 'FabricStore')
     {
-        $this->module = $module;
-        $this->attr   = $attr;
+        $this->attr = $attr;
+
+        $scope = get_class($module); // Subklassen-Scope: Zugriff auf geerbte protected-Methoden
+        $this->reader = \Closure::bind(
+            function (string $attr) {
+                /** @var \IPSModule $this */
+                return (string) $this->ReadAttributeString($attr);
+            },
+            $module,
+            $scope
+        );
+        $this->writer = \Closure::bind(
+            function (string $attr, string $val): void {
+                /** @var \IPSModule $this */
+                $this->WriteAttributeString($attr, $val);
+            },
+            $module,
+            $scope
+        );
+
+        $idProbe = \Closure::bind(
+            function (): int {
+                /** @var \IPSModule $this */
+                return (int) $this->InstanceID;
+            },
+            $module,
+            $scope
+        );
+        try {
+            $this->instanceId = $idProbe();
+        } catch (\Throwable $e) {
+            $this->instanceId = 0;
+        }
     }
 
     /**
@@ -167,7 +214,7 @@ final class Store
     {
         $raw = '';
         try {
-            $raw = (string) $this->module->ReadAttributeString($this->attr);
+            $raw = (string) ($this->reader)($this->attr);
         } catch (\Throwable $e) {
             // Attribut (noch) nicht registriert o. ae. -> leerer Baum.
             return [];
@@ -191,7 +238,7 @@ final class Store
         if ($json === false) {
             $json = '{}';
         }
-        $this->module->WriteAttributeString($this->attr, $json);
+        ($this->writer)($this->attr, $json);
     }
 
     /**
@@ -223,14 +270,7 @@ final class Store
      */
     private function semaphoreName(): string
     {
-        $id = 0;
-        // InstanceID ist am IPSModule verfuegbar; defensiv gekapselt.
-        try {
-            $id = (int) $this->module->InstanceID;
-        } catch (\Throwable $e) {
-            $id = 0;
-        }
-        return 'HS.Store.' . $id . '.' . $this->attr;
+        return 'HS.Store.' . $this->instanceId . '.' . $this->attr;
     }
 
     /**
