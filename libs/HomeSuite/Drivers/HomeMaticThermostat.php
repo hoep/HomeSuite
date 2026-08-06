@@ -6,40 +6,36 @@ namespace Hoep\HomeSuite\HAL;
 
 /**
  * HomeMaticThermostat — Vendor-Treiber fuer klassische HomeMatic-Heizthermostate
- * am CCU/BidCos (Symcon-Modul "HomeMatic CCU Device").
+ * am CCU (Symcon-Modul "HomeMatic CCU Device").
  *
- * scheduleMode == 'device' (Leitprinzip 7): das GERAET fuehrt das Wochenprofil
- * selbst. Dieser Treiber
- *   - liest Live-Werte aus den Status-Variablen des CCU-Geraets
- *     (SET_TEMPERATURE / ACTUAL_TEMPERATURE / ACTUAL_HUMIDITY / VALVE_STATE),
- *   - schreibt den Sollwert ueber die native, actionable Variable SET_TEMPERATURE
- *     (RequestAction -> Symcon HomeMatic-Modul -> CCU); das ist ein temporaeres
- *     Override-Fenster, KEINE Profilaenderung (Entscheidung A),
- *   - liest/schreibt das Geraete-Wochenprofil ueber die BEWAEHRTE Bibliothek
- *     HMXML_getTempProfile()/HMXML_setTempProfile() (CCU-XML-RPC putParamset auf
- *     <Address>:2/MASTER), sofern diese im Kernel geladen ist. Ist sie es nicht,
- *     bleiben die Profil-Methoden INERT ([] / false) — der Sollwert-/Live-Pfad
- *     funktioniert unabhaengig davon.
+ * BETRIEBSART: scheduleMode == 'device' — das Geraet FUEHRT sein Wochenprogramm
+ * selbst (Failsafe: laeuft weiter, auch wenn Symcon aus ist). Das Modul
+ *   - schreibt das ganze Wochenprogramm ins Geraet, wenn sich der Plan aendert
+ *     (writeWeekProfile -> CCU putParamset MASTER, mit Backup/Verify),
+ *   - liest das Geraeteprogramm zurueck (readWeekProfile -> CCU getParamset),
+ *   - setzt temporaere Sollwert-Overrides GENERISCH via RequestAction(SET_TEMPERATURE)
+ *     (Boost/Manuell), OHNE das Profil zu aendern (Entscheidung A),
+ *   - liest Live-Werte aus den Status-Variablen.
  *
- * VENDOR-Varianten (per Kanal-Idents erkannt, nicht geraten):
- *   - VALVE_STATE vorhanden  -> Heizkoerperthermostat (HM-CC-RT-DN): 1 Profil,
- *                               bis 13 Slots/Tag.
- *   - ACTUAL_HUMIDITY, kein VALVE_STATE -> Wandthermostat (HM-TC-IT-WM-W-EU):
- *                               3 Praesenzprofile (P1_/P2_/P3_).
- *   - sonst                   -> HM-CC-TC (aelter): 1 Profil.
+ * "Dumme" Geraete ohne eigenes Programm laufen stattdessen ueber den
+ * GenericVariableThermostat (scheduleMode 'controller', ScheduleEngine im Modul).
  *
- * ZUSTANDSLOS bis auf die aufgeloeste Kanal-Zuordnung (reine Lookups, kein Socket).
+ * Der CCU-Zugriff ist SELBST-ENTHALTEN ({@see CcuXmlRpc}) — kein ext-xmlrpc, keine
+ * Legacy-Bibliothek. Host/Serial werden aus der Symcon-IO-Kette aufgeloest.
  *
- * Konfiguration (bind):
- *   deviceInstanceId int   Instanz-ID des "HomeMatic CCU Device"
- *   min,max,step     float Klemm-/Rasterparameter (Default 5..30 / 0.5)
+ * VENDOR-Varianten (per Kanal-Idents erkannt):
+ *   - VALVE_STATE               -> HM-CC-RT-DN (1 Profil, 13 Slots, Keys TEMPERATURE_/ENDTIME_)
+ *   - ACTUAL_HUMIDITY o. Valve  -> HM-TC-IT-WM-W-EU (3 Praesenzprofile P1_/P2_/P3_, 13 Slots)
+ *   - sonst                     -> HM-CC-TC (1 Profil, 24 Slots, Keys TEMPERATUR_/TIMEOUT_)
  */
 final class HomeMaticThermostat implements IThermostat
 {
+    private const DAYS = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'];
+
     /** @var array Konfiguration. */
     private array $cfg = [];
 
-    /** @var callable Sende-Callback (bei diesem Treiber ungenutzt — Schreiben geht via RequestAction/HMXML). */
+    /** @var callable Sende-Callback (ungenutzt). */
     private $send;
 
     private int $device = 0;
@@ -49,15 +45,20 @@ final class HomeMaticThermostat implements IThermostat
 
     /** Aufgeloeste Kanal-Variablen (ident => objectId | null). */
     private array $vid = [
-        'SET_TEMPERATURE'  => null,
+        'SET_TEMPERATURE'    => null,
         'ACTUAL_TEMPERATURE' => null,
-        'ACTUAL_HUMIDITY'  => null,
-        'VALVE_STATE'      => null,
-        'CONTROL_MODE'     => null,
+        'ACTUAL_HUMIDITY'    => null,
+        'VALVE_STATE'        => null,
+        'CONTROL_MODE'       => null,
     ];
 
-    /** Erkannter Geraetetyp (siehe Klassen-Doc). */
     private string $model = 'HM-CC-TC';
+
+    /** CCU-Transport (aufgeloest aus der Symcon-IO-Kette). */
+    private string $ccuHost = '';
+    private int $ccuPort = 2001;      // BidCos (klassisch); HmIP waere 2010
+    private string $baseSerial = '';  // z.B. "ABC1234567" (substr(Address,0,10))
+    private string $devChannel = '';  // Kanal-Arg fuer getParamset: "" ausser CC-TC
 
     public function __construct()
     {
@@ -80,41 +81,37 @@ final class HomeMaticThermostat implements IThermostat
             [$this->min, $this->max] = [$this->max, $this->min];
         }
         $this->resolveChannels();
+        $this->resolveCcu();
     }
 
     public function capabilities(): array
     {
-        $hasValve = $this->vid['VALVE_STATE'] !== null;
-        $hasHum   = $this->vid['ACTUAL_HUMIDITY'] !== null;
-
-        // Profilkapazitaet je erkanntem Modell.
         $deviceProfiles = ($this->model === 'HM-TC-IT-WM-W-EU') ? 3 : 1;
-        $maxSlots       = ($this->model === 'HM-CC-RT-DN') ? 13 : 24;
+        $maxSlots       = ($this->model === 'HM-CC-TC') ? 24 : 13;
 
         return [
             'scheduleMode'   => 'device',
             'model'          => $this->model,
             'maxSlots'       => $maxSlots,
-            'rasterMinutes'  => 10,                 // HM speichert in 10-Min-Schritten
+            'rasterMinutes'  => 10,               // HM speichert in 10-Min-Schritten
             'deviceProfiles' => $deviceProfiles,
-            'separateSensor' => true,
+            'separateSensor' => $this->vid['ACTUAL_TEMPERATURE'] !== null,
             'p1Prefix'       => ($this->model === 'HM-TC-IT-WM-W-EU'),
-            'hasMode'        => false,              // CONTROL_MODE-Schreiben bewusst (noch) nicht
-            'hasHumidity'    => $hasHum,
-            'hasValve'       => $hasValve,
+            'hasMode'        => false,            // CONTROL_MODE-Schreiben erst nach Freigabe
+            'hasHumidity'    => $this->vid['ACTUAL_HUMIDITY'] !== null,
+            'hasValve'       => $this->vid['VALVE_STATE'] !== null,
             'profileApi'     => $this->hasProfileApi(),
         ];
     }
 
     public static function discover(int $timeoutMs = 2000): array
     {
-        // CCU-Geraete werden im LVB manuell zugeordnet (Instanz-Auswahl).
         return [];
     }
 
     public function poll(): array
     {
-        return []; // Wahrheit liegt in den Symcon-Statusvariablen des CCU-Geraets.
+        return [];
     }
 
     public function parseEvent(string $raw): ?AudioState
@@ -143,7 +140,7 @@ final class HomeMaticThermostat implements IThermostat
         $c = $this->clampRaster($c);
         try {
             if (function_exists('RequestAction')) {
-                @\RequestAction($vid, $c);   // -> HomeMatic-Modul -> CCU (temporaeres Override)
+                @\RequestAction($vid, $c);   // temporaerer Override -> HM-Modul -> CCU
                 return true;
             }
         } catch (\Throwable $e) {
@@ -154,39 +151,77 @@ final class HomeMaticThermostat implements IThermostat
 
     public function setMode(string $mode): void
     {
-        // CONTROL_MODE/MANU_MODE-Schreiben ist bei HM aktor-heikel und wird erst
-        // nach expliziter Freigabe verdrahtet. hasMode=false -> das Modul ruft
-        // setMode() ohnehin nicht.
         $this->log('setMode(' . $mode . ') ignoriert (hasMode=false, Device #' . $this->device . ')');
     }
 
-    // --- scheduleMode 'device': Geraete-Wochenprofil via bewaehrte HMXML-Bibliothek ---
+    // ---------------- scheduleMode 'device': Wochenprofil ----------------
 
+    /**
+     * Liest das Geraete-Wochenprofil (Migrations-Wahrheit G1).
+     * @return array<int,array<int,array{end:int,val:float}>> dayIndex(0..6) => Slots
+     */
     public function readWeekProfile(?int $presenceIndex = null): array
     {
         if (!$this->hasProfileApi()) {
             return [];
         }
-        $wt = $this->presenceToWtProfil($presenceIndex);
-        try {
-            $raw = @\HMXML_getTempProfile($this->device, false, false, $wt);
-            return $this->normalizeProfile($raw, $presenceIndex);
-        } catch (\Throwable $e) {
-            $this->log('readWeekProfile: ' . $e->getMessage());
+        $params = CcuXmlRpc::getParamset($this->ccuHost, $this->ccuPort, $this->profileAddress());
+        if (!is_array($params)) {
+            $this->log('readWeekProfile: getParamset leer (Host ' . $this->ccuHost . ', Addr ' . $this->profileAddress() . ')');
             return [];
         }
+        return $this->parseWeek($params, $presenceIndex);
     }
 
+    /**
+     * Schreibt ein Wochenprofil INS GERAET — mit Backup/Verify:
+     * bestehendes Paramset sichern -> schreiben -> zuruecklesen -> verifizieren;
+     * bei Abweichung Restore des Backups und false.
+     *
+     * @param array<int,array<int,array{end:int,val:float}>> $week
+     */
     public function writeWeekProfile(array $week, ?int $presenceIndex = null): bool
     {
         if (!$this->hasProfileApi()) {
-            $this->log('writeWeekProfile: HMXML nicht geladen -> inert');
+            $this->log('writeWeekProfile: kein CCU-Zugriff -> inert');
             return false;
         }
-        // BEWUSST noch nicht scharf: das Ueberschreiben eines Geraeteprofils ist
-        // destruktiv und wird erst im Migrationsschritt (mit Backup/Verify je Raum)
-        // freigegeben. Bis dahin meldet der Treiber ehrlich false.
-        $this->log('writeWeekProfile: im Aktor-Safety-Gate (Migrationsschritt) — noch nicht scharf');
+        $addr = $this->profileAddress();
+
+        // 1) BACKUP (nur die profilrelevanten Keys).
+        $before = CcuXmlRpc::getParamset($this->ccuHost, $this->ccuPort, $addr);
+        if (!is_array($before)) {
+            $this->log('writeWeekProfile: Backup fehlgeschlagen -> Abbruch');
+            return false;
+        }
+
+        // 2) Ziel-Params bauen und schreiben.
+        $target = $this->buildParams($week, $presenceIndex);
+        if ($target === []) {
+            return false;
+        }
+        if (!CcuXmlRpc::putParamset($this->ccuHost, $this->ccuPort, $addr, $target)) {
+            $this->log('writeWeekProfile: putParamset meldete Fehler');
+            return false;
+        }
+
+        // 3) VERIFY: zuruecklesen und Soll-Keys vergleichen.
+        $after = CcuXmlRpc::getParamset($this->ccuHost, $this->ccuPort, $addr);
+        if (is_array($after) && $this->verify($target, $after)) {
+            return true;
+        }
+
+        // 4) RESTORE bei Abweichung: die zuvor gesicherten Werte zurueckschreiben.
+        $this->log('writeWeekProfile: Verify fehlgeschlagen -> Restore des Backups');
+        $restore = [];
+        foreach (array_keys($target) as $k) {
+            if (array_key_exists($k, $before)) {
+                $restore[$k] = $this->typedFromKey($k, $before[$k]);
+            }
+        }
+        if ($restore !== []) {
+            CcuXmlRpc::putParamset($this->ccuHost, $this->ccuPort, $addr, $restore);
+        }
         return false;
     }
 
@@ -194,7 +229,6 @@ final class HomeMaticThermostat implements IThermostat
     // Interne Helfer
     // ----------------------------------------------------------------------
 
-    /** Loest die Kanal-Variablen am CCU-Geraet auf und erkennt das Modell. */
     private function resolveChannels(): void
     {
         if ($this->device <= 0 || !function_exists('IPS_GetObjectIDByIdent')) {
@@ -204,7 +238,6 @@ final class HomeMaticThermostat implements IThermostat
             $id = @\IPS_GetObjectIDByIdent($ident, $this->device);
             $this->vid[$ident] = (is_int($id) && $id > 0) ? $id : null;
         }
-        // Modellheuristik aus den vorhandenen Kanaelen.
         if ($this->vid['VALVE_STATE'] !== null) {
             $this->model = 'HM-CC-RT-DN';
         } elseif ($this->vid['ACTUAL_HUMIDITY'] !== null) {
@@ -214,50 +247,105 @@ final class HomeMaticThermostat implements IThermostat
         }
     }
 
-    /** Ist die bewaehrte HMXML-Profil-Bibliothek im Kernel geladen? */
-    private function hasProfileApi(): bool
+    /** Loest CCU-Host, Basisserial und Profil-Kanal auf. */
+    private function resolveCcu(): void
     {
-        return function_exists('HMXML_getTempProfile') && function_exists('HMXML_setTempProfile');
+        if (!function_exists('IPS_GetProperty')) {
+            return;
+        }
+        $addr = @\IPS_GetProperty($this->device, 'Address');
+        if (is_string($addr) && $addr !== '') {
+            $this->baseSerial = substr($addr, 0, 10);
+        }
+        // Kanal-Arg: "" fuer RT-DN/TC-IT (Geraeteebene), Geraetekanal fuer CC-TC.
+        $this->devChannel = ($this->model === 'HM-CC-TC' && is_string($addr) && strlen($addr) > 11)
+            ? substr($addr, 11, 1)
+            : '';
+
+        $this->ccuHost = (string) ($this->cfg['ccuHost'] ?? '');
+        $this->ccuPort = (int) ($this->cfg['ccuPort'] ?? 2001);
+        if ($this->ccuHost === '' && function_exists('IPS_GetInstance')) {
+            $cur = $this->device;
+            for ($i = 0; $i < 8 && $cur > 0; $i++) {
+                $host = @\IPS_GetProperty($cur, 'Host');
+                if (is_string($host) && $host !== '') {
+                    $this->ccuHost = $host;
+                    break;
+                }
+                $inst = @\IPS_GetInstance($cur);
+                $cur  = (int) ($inst['ConnectionID'] ?? 0);
+            }
+        }
     }
 
-    /** Praesenz-Index (0..2) -> HMXML $WT_Profil (1..3); sonst 0 (aktiv/einfach). */
-    private function presenceToWtProfil(?int $presenceIndex): int
+    private function hasProfileApi(): bool
     {
-        if ($this->model !== 'HM-TC-IT-WM-W-EU' || $presenceIndex === null) {
+        return $this->ccuHost !== '' && $this->baseSerial !== '';
+    }
+
+    private function profileAddress(): string
+    {
+        return $this->baseSerial . ':' . $this->devChannel;
+    }
+
+    /** Praesenz-Index (0..2) -> P-Nummer (1..3) fuer TC-IT; sonst 0. */
+    private function presenceP(?int $presenceIndex): int
+    {
+        if ($this->model !== 'HM-TC-IT-WM-W-EU') {
             return 0;
         }
-        $p = $presenceIndex + 1;
+        $p = ($presenceIndex ?? 0) + 1;
         return ($p >= 1 && $p <= 3) ? $p : 1;
     }
 
-    /**
-     * Bringt die HMXML-Rueckgabe in die HAL-Form
-     * [ dayIndex(0..6) => [ ['end'=>minuten,'val'=>float], ... ] ].
-     */
-    private function normalizeProfile($raw, ?int $presenceIndex): array
+    /** Key-Bausteine je Modell: [tempPrefix, endPrefix]. */
+    private function keyStyle(?int $presenceIndex): array
     {
-        if (!is_array($raw)) {
-            return [];
+        if ($this->model === 'HM-CC-TC') {
+            return ['TEMPERATUR_', 'TIMEOUT_'];
         }
-        $days = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'];
-
-        // Bei P-Profilen liegt die Tagesebene ggf. unter "P<n>".
-        $node = $raw;
         if ($this->model === 'HM-TC-IT-WM-W-EU') {
-            $p = 'P' . $this->presenceToWtProfil($presenceIndex);
-            if (isset($raw[$p]) && is_array($raw[$p])) {
-                $node = $raw[$p];
-            }
+            $p = 'P' . $this->presenceP($presenceIndex) . '_';
+            return [$p . 'TEMPERATURE_', $p . 'ENDTIME_'];
         }
+        return ['TEMPERATURE_', 'ENDTIME_']; // RT-DN
+    }
 
+    private function maxSlots(): int
+    {
+        return ($this->model === 'HM-CC-TC') ? 24 : 13;
+    }
+
+    /**
+     * Roh-Paramset -> HAL-Wochenstruktur. Beruecksichtigt die TC-IT-Firmware-
+     * Eigenheit (P1_ kann fehlen -> Fallback auf praefixlose Keys).
+     *
+     * @return array<int,array<int,array{end:int,val:float}>>
+     */
+    private function parseWeek(array $params, ?int $presenceIndex): array
+    {
+        [$tp, $ep] = $this->keyStyle($presenceIndex);
         $out = [];
-        foreach ($days as $di => $dname) {
+        foreach (self::DAYS as $di => $day) {
             $slots = [];
-            if (isset($node[$dname]['EndTimes']) && is_array($node[$dname]['EndTimes'])) {
-                $ends = $node[$dname]['EndTimes'];
-                $vals = $node[$dname]['Values'] ?? [];
-                foreach ($ends as $i => $hhmm) {
-                    $slots[] = ['end' => $this->hhmmToMin((string) $hhmm), 'val' => (float) ($vals[$i] ?? 0)];
+            for ($i = 1; $i <= $this->maxSlots(); $i++) {
+                $kt = $tp . $day . '_' . $i;
+                $ke = $ep . $day . '_' . $i;
+                if (!array_key_exists($kt, $params) && $this->model === 'HM-TC-IT-WM-W-EU') {
+                    // Firmware-Fallback: praefixloser Key (LAN-Adapter, Profil 1).
+                    $kt = 'TEMPERATURE_' . $day . '_' . $i;
+                    $ke = 'ENDTIME_' . $day . '_' . $i;
+                }
+                if (!array_key_exists($kt, $params) || !array_key_exists($ke, $params)) {
+                    break;
+                }
+                $end = (int) round((float) $params[$ke]);
+                if ($end > 1440) {
+                    $end = 1440;
+                }
+                $slots[] = ['end' => $end, 'val' => (float) $params[$kt]];
+                if ($end >= 1440) {
+                    break;
                 }
             }
             $out[$di] = $slots;
@@ -265,13 +353,72 @@ final class HomeMaticThermostat implements IThermostat
         return $out;
     }
 
-    private function hhmmToMin(string $hhmm): int
+    /**
+     * HAL-Wochenstruktur -> Roh-Params fuer putParamset. Fuellt jeden Tag bis
+     * maxSlots mit dem letzten Wert bei Endzeit 1440 auf (HM-Konvention).
+     *
+     * @param array<int,array<int,array{end:int,val:float}>> $week
+     * @return array<string,array{type:string,value:mixed}>
+     */
+    private function buildParams(array $week, ?int $presenceIndex): array
     {
-        $p = explode(':', $hhmm);
-        if (count($p) !== 2) {
-            return 0;
+        [$tp, $ep] = $this->keyStyle($presenceIndex);
+        $max = $this->maxSlots();
+        $params = [];
+        foreach (self::DAYS as $di => $day) {
+            $slots = $week[$di] ?? [];
+            if ($slots === []) {
+                continue; // kein Tagesprofil -> nicht anfassen
+            }
+            $lastVal = (float) ($slots[count($slots) - 1]['val'] ?? $this->min);
+            for ($i = 1; $i <= $max; $i++) {
+                if (isset($slots[$i - 1])) {
+                    $end = (int) $slots[$i - 1]['end'];
+                    $val = $this->clampRaster((float) $slots[$i - 1]['val']);
+                } else {
+                    $end = 1440;         // Rest des Tages auffuellen
+                    $val = $this->clampRaster($lastVal);
+                }
+                if ($end > 1440) {
+                    $end = 1440;
+                }
+                $params[$tp . $day . '_' . $i] = ['type' => 'double', 'value' => $val];
+                $params[$ep . $day . '_' . $i] = ['type' => 'int', 'value' => $end];
+                if ($end >= 1440 && !isset($slots[$i])) {
+                    // trailing Slots weiter auffuellen (HM erwartet i.d.R. volle Zahl)
+                }
+            }
         }
-        return ((int) $p[0]) * 60 + (int) $p[1];
+        return $params;
+    }
+
+    /** Vergleicht geschriebene Soll-Params gegen das Rueckgelesene (Toleranz). */
+    private function verify(array $target, array $after): bool
+    {
+        foreach ($target as $k => $spec) {
+            if (!array_key_exists($k, $after)) {
+                return false;
+            }
+            $want = $spec['value'];
+            $got  = $after[$k];
+            if (($spec['type'] ?? 'string') === 'double') {
+                if (abs((float) $want - (float) $got) > 0.05) {
+                    return false;
+                }
+            } elseif ((int) round((float) $want) !== (int) round((float) $got)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Baut aus einem Backup-Rohwert die typisierte put-Spezifikation je Key. */
+    private function typedFromKey(string $key, $value): array
+    {
+        $isEnd = (strpos($key, 'ENDTIME_') !== false) || (strpos($key, 'TIMEOUT_') !== false);
+        return $isEnd
+            ? ['type' => 'int', 'value' => (int) round((float) $value)]
+            : ['type' => 'double', 'value' => (float) $value];
     }
 
     private function clampRaster(float $c): float
@@ -314,8 +461,7 @@ final class HomeMaticThermostat implements IThermostat
     }
 }
 
-// Vendor-Selbstregistrierung bei der DriverFactory (§2.2.5): alle klassischen
-// HM-Heiztreiber-Ids zeigen auf diese eine, kanal-erkennende Klasse.
+// Vendor-Selbstregistrierung bei der DriverFactory (§2.2.5).
 DriverFactory::register('hm-HM-CC-RT-DN', HomeMaticThermostat::class);
 DriverFactory::register('hm-HM-TC-IT-WM-W-EU', HomeMaticThermostat::class);
 DriverFactory::register('hm-HM-CC-TC', HomeMaticThermostat::class);

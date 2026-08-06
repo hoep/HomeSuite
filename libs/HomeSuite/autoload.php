@@ -49,6 +49,9 @@ $__hs_files = [
     'HAL/IValve.php',                  // Bewaesserungs-HAL
     'HAL/IAudioRenderer.php',          // Audio-HAL (Codec, Vertrag 3)
 
+    // --- HAL: selbst-enthaltener CCU-Transport (kein ext-xmlrpc/Legacy) ---
+    'HAL/CcuXmlRpc.php',               // XML-RPC-Client fuer BidCos/HmIP (Wochenprofil-Paramset)
+
     // --- HAL: DriverFactory + generische Variablen-Treiber (jedes Haus) ---
     'HAL/DriverFactory.php',           // waehlt/instanziiert Treiber aus driverCatalog
     'HAL/GenericVariableThermostat.php',
