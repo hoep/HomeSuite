@@ -155,6 +155,7 @@ class HeatingZone extends EntityModule
                 ['op' => 'duplicateProfile',  'label' => 'Profil duplizieren'],
                 ['op' => 'assignProfile',     'label' => 'Profil zuweisen'],
                 ['op' => 'setActivePresence', 'label' => 'Praesenz setzen'],
+                ['op' => 'importLegacy',      'label' => 'Aus Altsteuerung importieren'],
             ],
 
             // ---- Konfig-Felder (Treiberwahl; im LVB gesetzt) ----
@@ -649,9 +650,107 @@ class HeatingZone extends EntityModule
                 return $this->mgmtGetSchedule($args);
             case 'setActivePresence':
                 return $this->mgmtSetActivePresence($args);
+            case 'importLegacy':
+                return $this->ImportLegacy($args);
             default:
                 return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
         }
+    }
+
+    /**
+     * Migrations-Import (Strangler-Fig, Block F): liest das serialisierte
+     * HomeMatic-Wochenprofil der Altsteuerung (Variable HMWochenprofilDaten) und
+     * schreibt es in die HeatingZone-Zeitplaene. Idempotent, KEIN Geraeteschreiben,
+     * KEIN Legacy-Abschalten (das ist der separate, explizite Cutover).
+     *
+     * @param array<string,mixed> $spec { legacyVarId:int } oder { data: serialized|array }
+     * @return array<string,mixed>
+     */
+    public function ImportLegacy(array $spec): array
+    {
+        // Quelle bestimmen: Variable oder direkt uebergebene Daten.
+        $data = null;
+        if (isset($spec['legacyVarId'])) {
+            $vid = (int) $spec['legacyVarId'];
+            if ($vid <= 0 || !function_exists('IPS_VariableExists') || !\IPS_VariableExists($vid)) {
+                return ['ok' => false, 'error' => 'legacyVarId ist keine Variable'];
+            }
+            $raw  = @\GetValue($vid);
+            $data = is_string($raw) ? @unserialize($raw) : null;
+        } elseif (isset($spec['data'])) {
+            $data = is_string($spec['data']) ? @unserialize($spec['data']) : $spec['data'];
+        }
+        if (!is_array($data)) {
+            return ['ok' => false, 'error' => 'Legacy-Daten nicht lesbar/serialisiert'];
+        }
+
+        // Praesenz-Aliase der Altsteuerung -> HeatingZone-Varianten.
+        $aliases = [
+            'Normal'    => ['Normal', 'Normaler Betrieb'],
+            'Erweitert' => ['Erweitert', 'Erweiterter Betrieb'],
+            'Abgesenkt' => ['Abgesenkt', 'Abwesenheitsmodus', 'Abwesend'],
+        ];
+        $days = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'];
+
+        $dryrun   = !empty($spec['dryrun']);
+        $imported = [];
+        $eng      = $this->schedules();
+
+        foreach ($aliases as $variant => $keys) {
+            $src = null;
+            foreach ($keys as $k) {
+                if (isset($data[$k]) && is_array($data[$k])) {
+                    $src = $data[$k];
+                    break;
+                }
+            }
+            if ($src === null) {
+                continue; // diese Praesenz fehlt in der Altquelle
+            }
+            $dayCount = 0;
+            foreach ($days as $di => $dname) {
+                if (!isset($src[$dname]['EndTimes']) || !is_array($src[$dname]['EndTimes'])) {
+                    continue;
+                }
+                $ends = $src[$dname]['EndTimes'];
+                $vals = $src[$dname]['Values'] ?? [];
+                $slots = [];
+                foreach ($ends as $i => $hhmm) {
+                    $slots[] = ['end' => $this->hhmmToMin((string) $hhmm), 'val' => (float) ($vals[$i] ?? 0)];
+                }
+                if ($slots === []) {
+                    continue;
+                }
+                if (!$dryrun) {
+                    $eng->setSlots($variant, $di, $slots);
+                }
+                $dayCount++;
+            }
+            $imported[$variant] = $dayCount;
+        }
+
+        if (!$dryrun && !empty($imported)) {
+            // Neuer Plan -> Reconciler anstossen (device: Push, controller: Nachfahren).
+            $rt = $this->readRt();
+            unset($rt['pushHash']);
+            $this->writeRt($rt);
+            $drv = $this->driver();
+            if ($drv instanceof IThermostat) {
+                $this->reconcile($drv);
+            }
+        }
+
+        return ['ok' => true, 'dryrun' => $dryrun, 'imported' => $imported];
+    }
+
+    /** "HH:MM" -> Minuten seit Mitternacht (24:00 -> 1440). */
+    private function hhmmToMin(string $hhmm): int
+    {
+        $p = explode(':', trim($hhmm));
+        if (count($p) !== 2) {
+            return 0;
+        }
+        return ((int) $p[0]) * 60 + (int) $p[1];
     }
 
     /**
