@@ -348,11 +348,36 @@ class HomeSuiteHub extends EntityModule
         $unassigned = [];
         foreach ($this->discoverEntities() as $e) {
             $room = $this->nearestRoom((int) $e['instanceID'], $spaces);
-            $ent  = ['iid' => $e['instanceID'], 'domain' => $e['domain'], 'name' => $e['name'], 'prefix' => $e['prefix']];
+            $ent  = ['iid' => $e['instanceID'], 'kind' => 'entity', 'domain' => $e['domain'],
+                     'name' => $e['name'], 'prefix' => $e['prefix']];
             if ($room !== null) {
                 $spaces[$room]['entities'][] = $ent;
             } else {
                 $unassigned[] = $ent;
+            }
+        }
+
+        // Verlinkte ROHGERAETE (Verknuepfungen unter einem Raum): zerstoerungsfrei
+        // (das Original bleibt in seinem Vendor-Baum) mit AUTOMATISCH bestimmter
+        // Domaene/Gewerk aus den Variablen/Profilen/Modul des Ziels.
+        if (function_exists('IPS_GetLinkList')) {
+            foreach ((array) @\IPS_GetLinkList() as $lid) {
+                $lid  = (int) $lid;
+                $room = $this->nearestRoom($lid, $spaces);
+                if ($room === null) {
+                    continue;
+                }
+                $target = (int) (@\IPS_GetLink($lid)['TargetID'] ?? 0);
+                if ($target <= 0) {
+                    continue;
+                }
+                $spaces[$room]['entities'][] = [
+                    'iid'    => $target,
+                    'linkId' => $lid,
+                    'kind'   => 'link',
+                    'domain' => $this->classifyDomain($target),
+                    'name'   => $this->nameOf($lid),   // im Raum vergebener Link-Name
+                ];
             }
         }
 
@@ -381,6 +406,97 @@ class HomeSuiteHub extends EntityModule
         $tree = array_map($build, $roots);
 
         return $this->json(['ok' => true, 'tree' => $tree, 'unassigned' => $unassigned]);
+    }
+
+    /**
+     * AUTOMATISCHE Domaenen-/Gewerk-Klassifikation eines (verlinkten) Rohobjekts
+     * anhand seiner Variablen-Idents, Profile und des Moduls. Liefert die
+     * HomeSuite-Domaene (heating/shading/audio/irrigation) bzw. 'lighting' (noch
+     * ohne Modul, aber erkennbar) oder '' wenn unklar. Loest Links auf.
+     */
+    private function classifyDomain(int $objId): string
+    {
+        if ($objId <= 0 || !function_exists('IPS_GetObject') || !@\IPS_ObjectExists($objId)) {
+            return '';
+        }
+        $obj  = @\IPS_GetObject($objId);
+        $type = (int) ($obj['ObjectType'] ?? -1);
+        if ($type === 6) { // Link -> Ziel aufloesen
+            $t = (int) (@\IPS_GetLink($objId)['TargetID'] ?? 0);
+            return $t > 0 ? $this->classifyDomain($t) : '';
+        }
+
+        $idents   = [];
+        $profiles = [];
+        $module   = '';
+        $addVar   = function (int $vid) use (&$idents, &$profiles): void {
+            $o = @\IPS_GetObject($vid);
+            if (($o['ObjectType'] ?? -1) !== 2) {
+                return;
+            }
+            $id = strtoupper((string) ($o['ObjectIdent'] ?? ''));
+            if ($id !== '') {
+                $idents[$id] = 1;
+            }
+            $v = @\IPS_GetVariable($vid);
+            if (is_array($v)) {
+                $p = (string) ($v['VariableCustomProfile'] ?? '');
+                if ($p === '') {
+                    $p = (string) ($v['VariableProfile'] ?? '');
+                }
+                if ($p !== '') {
+                    $profiles[strtolower($p)] = 1;
+                }
+            }
+        };
+
+        if ($type === 1) { // Instanz -> Kind-Variablen scannen
+            $module = (string) (@\IPS_GetInstance($objId)['ModuleInfo']['ModuleName'] ?? '');
+            foreach ((array) @\IPS_GetChildrenIDs($objId) as $c) {
+                $addVar((int) $c);
+            }
+        } elseif ($type === 2) { // einzelne Variable
+            $addVar($objId);
+        } else {
+            return '';
+        }
+
+        $has  = static fn(string $k): bool => isset($idents[$k]);
+        $prof = static function (string $needle) use ($profiles): bool {
+            foreach (array_keys($profiles) as $p) {
+                if (strpos($p, $needle) !== false) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // Audio ueber das Modul (Sonos/HEOS/MusicCast/Denon).
+        foreach (['sonos', 'heos', 'musiccast', 'denon', 'airplay', 'cast'] as $needle) {
+            if (stripos($module, $needle) !== false) {
+                return 'audio';
+            }
+        }
+        // Heizung: Sollwert-/Ist-Temperatur-Datenpunkte oder Temperatur-Profil.
+        if ($has('SET_TEMPERATURE') || $has('SETPOINT') || $has('SET_POINT_TEMPERATURE')
+            || $has('ACTUAL_TEMPERATURE') || $prof('temperatur')) {
+            return 'heating';
+        }
+        // Beschattung: Level + Stop/Richtung, oder Rollo-/Shutter-Profil.
+        if (($has('LEVEL') && ($has('STOP') || $has('DIRECTION') || $has('SHUTTER')))
+            || $prof('shutter') || $prof('blind') || $prof('rollo') || $prof('shading') || $prof('jalous')) {
+            return 'shading';
+        }
+        // Bewaesserung.
+        if ($has('WATERING') || $has('IRRIGATION') || $has('VALVE_OPEN') || $prof('irrigation') || $prof('bewaess')) {
+            return 'irrigation';
+        }
+        // Licht (noch kein HomeSuite-Modul, aber erkennbar -> spaeter nutzbar).
+        if ($prof('intensity') || $prof('dimmer') || $prof('brightness')
+            || ($has('STATE') && ($prof('switch') || $prof('~switch')))) {
+            return 'lighting';
+        }
+        return '';
     }
 
     /** Naechster Raum-Vorfahre einer Instanz im Objektbaum (oder null). */
