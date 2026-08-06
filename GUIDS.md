@@ -29,6 +29,7 @@ ModuleType-Angabe (sie ist Container, kein Modul).
 | `HSAU`  | AudioZone parentless (eigener In-Process-Socket) | `{C4F2639D-2A87-453D-8175-B586BF605A38}` | 3          |
 | `HSAUX` | AudioZone bridged (Kind einer Bridge-Splitter)   | `{053E7017-584E-4F62-A246-EBA6CE3DE034}` | 3          |
 | `HSIR`  | IrrigationCircuit (Bewaesserung)              | `{D264A82B-DE31-45CC-8AF2-8F4C5D076508}` | 3          |
+| `HSSP`  | Bereich (Struktur: Haus/Bereich/Raum)         | `{5598F752-886D-475F-91CE-5813A3C581E5}` | 3          |
 
 ## Audio-Bridges (Splitter, type 2)
 

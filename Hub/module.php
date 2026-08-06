@@ -57,6 +57,7 @@ class HomeSuiteHub extends EntityModule
     private const GUID_HSAU  = '{C4F2639D-2A87-453D-8175-B586BF605A38}'; // AudioZone parentless
     private const GUID_HSAUX = '{053E7017-584E-4F62-A246-EBA6CE3DE034}'; // AudioZone bridged
     private const GUID_HSIR  = '{D264A82B-DE31-45CC-8AF2-8F4C5D076508}'; // IrrigationCircuit
+    private const GUID_HSSP  = '{5598F752-886D-475F-91CE-5813A3C581E5}'; // HomeSuite Bereich (Struktur)
 
     /** Audio-Bridges (Splitter, type 2) — provisionierbar, aber keine Entitaeten. */
     private const GUID_HSBH = '{BCDCA10C-BDFD-4270-8D28-1CC690A130DB}'; // HeosBridge
@@ -316,6 +317,83 @@ class HomeSuiteHub extends EntityModule
     {
         $out = ['ok' => true, 'entities' => $this->discoverEntities()];
         return $this->json($out);
+    }
+
+    /**
+     * HSH_GetTopology — liest die Raumstruktur aus dem OBJEKTBAUM: alle
+     * "HomeSuite Bereich"-Instanzen (Haus/Bereich/Raum) plus die Entitaeten, die
+     * (irgendwo) unter einem Raum haengen. Liefert den verschachtelten Baum
+     * Haus -> Bereich -> Raum -> [Entitaeten je Domaene] fuer Navigation/Widgets.
+     * Nicht zugeordnete Entitaeten landen in "unassigned".
+     */
+    public function GetTopology(): string
+    {
+        $spaces = [];
+        if (function_exists('IPS_GetInstanceListByModuleID')) {
+            foreach ((array) @\IPS_GetInstanceListByModuleID(self::GUID_HSSP) as $iid) {
+                $iid = (int) $iid;
+                $spaces[$iid] = [
+                    'iid'      => $iid,
+                    'name'     => $this->nameOf($iid),
+                    'kind'     => (string) (@\IPS_GetProperty($iid, 'Kind') ?: 'Raum'),
+                    'abbr'     => (string) (@\IPS_GetProperty($iid, 'Abbr') ?: ''),
+                    'parent'   => (int) @\IPS_GetParent($iid),
+                    'children' => [],
+                    'entities' => [],
+                ];
+            }
+        }
+
+        // Entitaeten dem naechsten Raum-Vorfahren im Baum zuordnen.
+        $unassigned = [];
+        foreach ($this->discoverEntities() as $e) {
+            $room = $this->nearestRoom((int) $e['instanceID'], $spaces);
+            $ent  = ['iid' => $e['instanceID'], 'domain' => $e['domain'], 'name' => $e['name'], 'prefix' => $e['prefix']];
+            if ($room !== null) {
+                $spaces[$room]['entities'][] = $ent;
+            } else {
+                $unassigned[] = $ent;
+            }
+        }
+
+        // Kinder verlinken; Wurzeln = Spaces, deren Elternteil kein Space ist.
+        foreach ($spaces as $iid => $s) {
+            if (isset($spaces[$s['parent']])) {
+                $spaces[$s['parent']]['children'][] = $iid;
+            }
+        }
+        $roots = [];
+        foreach ($spaces as $iid => $s) {
+            if (!isset($spaces[$s['parent']])) {
+                $roots[] = $iid;
+            }
+        }
+
+        $build = function (int $iid) use (&$build, $spaces) {
+            $s    = $spaces[$iid];
+            $node = ['iid' => $iid, 'name' => $s['name'], 'kind' => $s['kind'], 'abbr' => $s['abbr'],
+                     'entities' => $s['entities'], 'children' => []];
+            foreach ($s['children'] as $c) {
+                $node['children'][] = $build($c);
+            }
+            return $node;
+        };
+        $tree = array_map($build, $roots);
+
+        return $this->json(['ok' => true, 'tree' => $tree, 'unassigned' => $unassigned]);
+    }
+
+    /** Naechster Raum-Vorfahre einer Instanz im Objektbaum (oder null). */
+    private function nearestRoom(int $iid, array $spaces): ?int
+    {
+        $cur = (int) @\IPS_GetParent($iid);
+        for ($i = 0; $i < 12 && $cur > 0; $i++) {
+            if (isset($spaces[$cur]) && (($spaces[$cur]['kind'] ?? '') === 'Raum')) {
+                return $cur;
+            }
+            $cur = (int) @\IPS_GetParent($cur);
+        }
+        return null;
     }
 
     /**

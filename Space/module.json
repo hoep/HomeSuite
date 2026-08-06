@@ -1,0 +1,12 @@
+{
+    "id": "{5598F752-886D-475F-91CE-5813A3C581E5}",
+    "name": "HomeSuite Bereich",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["HomeSuite Bereich", "HSSP", "Haus", "Raum", "Ebene"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSSP",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}
