@@ -1,0 +1,12 @@
+{
+    "id": "{AC059357-088A-4DF8-ABBC-F8724BC78769}",
+    "name": "HeatingZone",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["HeatingZone", "HSHT", "HomeSuite Heizung"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSHT",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}

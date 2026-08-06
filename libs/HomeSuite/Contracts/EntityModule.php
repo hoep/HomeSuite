@@ -164,7 +164,8 @@ abstract class EntityModule extends \IPSModule
 
             // 4) Reflect-Politik (F4): optimistisch nur bei Nicht-Push-Treibern.
             if ($c->optimistic() && $c->varId !== null) {
-                $this->SetValue($c->varId, $v);
+                // IPSModule::SetValue erwartet den IDENT der eigenen Variable, NICHT die Objekt-ID.
+                $this->SetValue($c->ident, $v);
             }
 
             // 5) Domaenen-Hook: realer Aktor-/Berechnungsbefehl.
@@ -315,9 +316,8 @@ abstract class EntityModule extends \IPSModule
      */
     protected function setReflect(string $ident, $value): void
     {
-        $vid = $this->varIdOf($ident);
-        if ($vid !== null) {
-            $this->SetValue($vid, $value);
+        if ($this->varIdOf($ident) !== null) {
+            $this->SetValue($ident, $value);   // per IDENT, nicht Objekt-ID
         }
     }
 
@@ -577,10 +577,9 @@ abstract class EntityModule extends \IPSModule
         $this->buildControls();
         $state = [];
         foreach ($this->controlCache as $ident => $c) {
-            $vid = $c->varId ?? $this->varIdOf($ident);
-            if ($vid !== null) {
+            if (($c->varId ?? $this->varIdOf($ident)) !== null) {
                 try {
-                    $state[$ident] = $this->GetValue($vid);
+                    $state[$ident] = $this->GetValue($ident);   // per IDENT, nicht Objekt-ID
                 } catch (\Throwable $e) {
                     // Variable ohne Wert -> auslassen.
                 }
@@ -594,10 +593,9 @@ abstract class EntityModule extends \IPSModule
      */
     private function resetCommand(Control $c): void
     {
-        $vid = $c->varId ?? $this->varIdOf($c->ident);
-        if ($vid !== null) {
+        if (($c->varId ?? $this->varIdOf($c->ident)) !== null) {
             try {
-                $this->SetValue($vid, ControlContract::CMD_IDLE);
+                $this->SetValue($c->ident, ControlContract::CMD_IDLE);   // per IDENT, nicht Objekt-ID
             } catch (\Throwable $e) {
                 // Idle-Reset ist best-effort; Fehler nicht eskalieren.
             }
