@@ -41,6 +41,9 @@ abstract class EntityModule extends \IPSModule
     /** Attribut fuer FLUECHTIGEN manualHold-Zustand (nicht im Store! Blocker D). */
     protected const ATTR_HOLD = 'HoldState';
 
+    /** Attribut fuer volatilen Laufzeit-Status (last-commanded, pushHash, watchVid). */
+    protected const ATTR_RT = 'RtState';
+
     /** Default-Hold-Fenster (Sekunden), wenn keine Konfig gesetzt ist. */
     protected const DEFAULT_HOLD_SECONDS = 300;
 
@@ -62,6 +65,8 @@ abstract class EntityModule extends \IPSModule
         $this->RegisterAttributeString(self::ATTR_STORE, '{}');
         // Fluechtiger manualHold-Zustand (Blocker D: NICHT in den Store).
         $this->RegisterAttributeString(self::ATTR_HOLD, '{}');
+        // Volatiler Laufzeit-Status (last-commanded/pushHash/watchVid).
+        $this->RegisterAttributeString(self::ATTR_RT, '{}');
 
         // KR_READY abfangen (WebHook/Provision erst nach Kernel-Ready — F3).
         $this->RegisterMessage(0, IPS_KERNELMESSAGE);
@@ -447,7 +452,155 @@ abstract class EntityModule extends \IPSModule
      */
     protected function mgmt(string $op, array $args, array $ctx): array
     {
+        switch ($op) {
+            case 'syncStatus':
+                return $this->opSyncStatus();
+            case 'loadFromDevice':
+                return $this->opLoadFromDevice();
+            case 'syncToDevice':
+                return $this->opSyncToDevice();
+        }
         return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
+    }
+
+    // ==================================================================
+    // Generischer Geraete-Zeitplan-Sync (device-Modus) — von ALLEN Domaenen
+    // geerbt. Delegiert an den Treiber (readWeekProfile/writeWeekProfile) und
+    // die ScheduleEngine. Bei controller-Modus/keinem Treiber: applicable=false.
+    // ==================================================================
+
+    /** Zeitplan-Varianten der Domaene (z. B. Heizung: Praesenzen). Default: eine. */
+    protected function scheduleVariants(): array
+    {
+        return ['Standard'];
+    }
+
+    /** Index der aktiven Variante (Domaene ueberschreibt, z. B. Presence). */
+    protected function activeVariantIndex(): int
+    {
+        return 0;
+    }
+
+    /** syncStatus — vergleicht Modul-Wochenplan (aktive Variante) mit dem Geraet. */
+    protected function opSyncStatus(): array
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof HAL\IThermostat) {
+            return ['ok' => true, 'applicable' => false, 'mode' => 'none'];
+        }
+        $caps = $drv->capabilities();
+        if (($caps['scheduleMode'] ?? '') !== 'device') {
+            return ['ok' => true, 'applicable' => false, 'mode' => (string) ($caps['scheduleMode'] ?? 'controller')];
+        }
+        $pi      = $this->activeVariantIndex();
+        $variant = $this->scheduleVariants()[$pi] ?? 'Standard';
+        $mod     = $this->schedules()->toHomematicWeek($variant, (int) ($caps['rasterMinutes'] ?? 10), (int) ($caps['maxSlots'] ?? 13));
+        $dev     = $drv->readWeekProfile($pi);
+        $synced  = $this->weeksEqual($mod, $dev);
+        return ['ok' => true, 'applicable' => true, 'mode' => 'device', 'synced' => $synced, 'variant' => $variant];
+    }
+
+    /** loadFromDevice — liest das Geraeteprogramm je Variante in den Modul-Store (kein Geraetewrite). */
+    protected function opLoadFromDevice(): array
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof HAL\IThermostat) {
+            return ['ok' => false, 'error' => 'kein Treiber'];
+        }
+        if (($drv->capabilities()['scheduleMode'] ?? '') !== 'device') {
+            return ['ok' => false, 'error' => 'nur im device-Modus'];
+        }
+        $eng     = $this->schedules();
+        $adopted = [];
+        foreach ($this->scheduleVariants() as $pi => $variant) {
+            $week = $drv->readWeekProfile((int) $pi);
+            $days = 0;
+            foreach ($week as $di => $slots) {
+                if (is_array($slots) && $slots !== []) {
+                    $eng->setSlots($variant, (int) $di, $slots);
+                    $days++;
+                }
+            }
+            $adopted[$variant] = $days;
+        }
+        $this->seedPushHash($drv);
+        return ['ok' => true, 'source' => 'device', 'adopted' => $adopted];
+    }
+
+    /** syncToDevice — schreibt den Modul-Wochenplan (aktive Variante) ins Geraet (Backup/Verify im Treiber). */
+    protected function opSyncToDevice(): array
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof HAL\IThermostat) {
+            return ['ok' => false, 'error' => 'kein Treiber'];
+        }
+        $caps = $drv->capabilities();
+        if (($caps['scheduleMode'] ?? '') !== 'device') {
+            return ['ok' => false, 'error' => 'nur im device-Modus'];
+        }
+        $pi      = $this->activeVariantIndex();
+        $variant = $this->scheduleVariants()[$pi] ?? 'Standard';
+        $week    = $this->schedules()->toHomematicWeek($variant, (int) ($caps['rasterMinutes'] ?? 10), (int) ($caps['maxSlots'] ?? 13));
+        $wrote   = $drv->writeWeekProfile($week, $pi);
+        if ($wrote) {
+            $this->seedPushHash($drv);
+        }
+        return ['ok' => (bool) $wrote, 'wrote' => (bool) $wrote, 'variant' => $variant];
+    }
+
+    /** Setzt den pushHash der aktiven Variante -> Reconciler schreibt das identische Programm nicht erneut. */
+    protected function seedPushHash(HAL\IThermostat $drv): void
+    {
+        $caps    = $drv->capabilities();
+        $pi      = $this->activeVariantIndex();
+        $variant = $this->scheduleVariants()[$pi] ?? 'Standard';
+        $week    = $this->schedules()->toHomematicWeek($variant, (int) ($caps['rasterMinutes'] ?? 10), (int) ($caps['maxSlots'] ?? 13));
+        $rt      = $this->readRt();
+        $rt['pushHash'] = md5($variant . '|' . json_encode($week));
+        $this->writeRt($rt);
+    }
+
+    /** Vergleicht zwei Wochenstrukturen [day => [{end,val}]] mit Toleranz. */
+    protected function weeksEqual(array $a, array $b): bool
+    {
+        for ($d = 0; $d < 7; $d++) {
+            $sa = $a[$d] ?? [];
+            $sb = $b[$d] ?? [];
+            if (count($sa) !== count($sb)) {
+                return false;
+            }
+            foreach ($sa as $i => $slot) {
+                $eb = $sb[$i] ?? null;
+                if (!is_array($eb)) {
+                    return false;
+                }
+                if ((int) ($slot['end'] ?? -1) !== (int) ($eb['end'] ?? -2)) {
+                    return false;
+                }
+                if (abs((float) ($slot['val'] ?? 0) - (float) ($eb['val'] ?? 0)) > 0.05) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /** Volatiler Laufzeit-Status (eigenes Attribut, Blocker D). */
+    protected function readRt(): array
+    {
+        try {
+            $raw = (string) $this->ReadAttributeString(self::ATTR_RT);
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $d = json_decode($raw, true);
+        return is_array($d) ? $d : [];
+    }
+
+    protected function writeRt(array $rt): void
+    {
+        $j = json_encode($rt);
+        $this->WriteAttributeString(self::ATTR_RT, $j === false ? '{}' : $j);
     }
 
     /**

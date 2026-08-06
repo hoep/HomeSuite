@@ -50,9 +50,6 @@ class HeatingZone extends EntityModule
     /** Timer-Ident (RegisterTimer/SetTimerInterval). */
     private const TIMER_REFRESH = 'Refresh';
 
-    /** Volatiler Laufzeit-Status (NICHT im Konfig-Store, Blocker D). */
-    private const ATTR_RT = 'RtState';
-
     /** Frostschutz-Sollwert (°C), wenn nicht konfiguriert. */
     private const FROST_DEFAULT = 8.0;
 
@@ -157,6 +154,9 @@ class HeatingZone extends EntityModule
                 ['op' => 'setActivePresence', 'label' => 'Praesenz setzen'],
                 ['op' => 'importLegacy',      'label' => 'Aus Altsteuerung importieren'],
                 ['op' => 'adoptDevice',       'label' => 'Geraeteprogramm uebernehmen'],
+                ['op' => 'syncStatus',        'label' => 'Sync-Status'],
+                ['op' => 'loadFromDevice',    'label' => 'Vom Geraet laden'],
+                ['op' => 'syncToDevice',      'label' => 'Ans Geraet schreiben'],
             ],
 
             // ---- Konfig-Felder (Treiberwahl; im LVB gesetzt) ----
@@ -367,12 +367,6 @@ class HeatingZone extends EntityModule
     // Lebenszyklus: Refresh-Timer scharf/aus je nach Treiber
     // ==================================================================
 
-    public function Create()
-    {
-        parent::Create();
-        // Volatiler Laufzeit-Status (last-commanded/last-push/hold-Herkunft).
-        $this->RegisterAttributeString(self::ATTR_RT, '{}');
-    }
 
     protected function setupTimers(): void
     {
@@ -598,23 +592,6 @@ class HeatingZone extends EntityModule
     // Laufzeit-Status (volatil) & kleine Helfer
     // ==================================================================
 
-    private function readRt(): array
-    {
-        try {
-            $raw = (string) $this->ReadAttributeString(self::ATTR_RT);
-        } catch (\Throwable $e) {
-            return [];
-        }
-        $d = json_decode($raw, true);
-        return is_array($d) ? $d : [];
-    }
-
-    private function writeRt(array $rt): void
-    {
-        $j = json_encode($rt);
-        $this->WriteAttributeString(self::ATTR_RT, $j === false ? '{}' : $j);
-    }
-
     private function intVal(string $ident): int
     {
         if ($this->GetIDForIdent($ident) === false) {
@@ -663,11 +640,24 @@ class HeatingZone extends EntityModule
                 return $this->mgmtSetActivePresence($args);
             case 'importLegacy':
                 return $this->ImportLegacy($args);
-            case 'adoptDevice':
-                return $this->mgmtAdoptDevice();
+            case 'adoptDevice':          // Alias der generischen Basis-Op
+                return $this->opLoadFromDevice();
             default:
-                return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
+                // syncStatus/loadFromDevice/syncToDevice u.a. behandelt die Basis generisch.
+                return parent::mgmt($op, $args, $ctx);
         }
+    }
+
+    // Zeitplan-Varianten fuer den generischen Geraete-Sync (Basis): HM-Praesenzen.
+    protected function scheduleVariants(): array
+    {
+        return self::PRESENCE_VARIANTS;
+    }
+
+    protected function activeVariantIndex(): int
+    {
+        $p = $this->intVal('Presence');
+        return ($p >= 0 && $p < count(self::PRESENCE_VARIANTS)) ? $p : 0;
     }
 
     /**
@@ -764,40 +754,6 @@ class HeatingZone extends EntityModule
      *
      * @return array<string,mixed>
      */
-    private function mgmtAdoptDevice(): array
-    {
-        $drv = $this->driver();
-        if (!$drv instanceof IThermostat) {
-            return ['ok' => false, 'error' => 'kein Treiber konfiguriert'];
-        }
-        $caps = $drv->capabilities();
-        if (($caps['scheduleMode'] ?? '') !== 'device') {
-            return ['ok' => false, 'error' => 'adoptDevice nur im device-Modus sinnvoll'];
-        }
-
-        $eng     = $this->schedules();
-        $adopted = [];
-        foreach (self::PRESENCE_VARIANTS as $pi => $variant) {
-            $week = $drv->readWeekProfile($pi);
-            $days = 0;
-            foreach ($week as $di => $slots) {
-                if (is_array($slots) && $slots !== []) {
-                    $eng->setSlots($variant, $di, $slots);
-                    $days++;
-                }
-            }
-            $adopted[$variant] = $days;
-        }
-
-        // pushHash der aktiven Variante seeden -> kein Ruecklschreiben ins Geraet.
-        $variant = $this->activeVariant();
-        $rt = $this->readRt();
-        $rt['pushHash'] = md5($variant . '|' . json_encode($eng->toHomematicWeek($variant, 10, 13)));
-        $this->writeRt($rt);
-
-        return ['ok' => true, 'adopted' => $adopted, 'source' => 'device'];
-    }
-
     /** "HH:MM" -> Minuten seit Mitternacht (24:00 -> 1440). */
     private function hhmmToMin(string $hhmm): int
     {
