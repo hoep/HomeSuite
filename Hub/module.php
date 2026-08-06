@@ -40,7 +40,9 @@ use Hoep\HomeSuite\Manifest;
 use Hoep\HomeSuite\Migration\Backup;
 use Hoep\HomeSuite\Provisioner;
 
-class Hub extends EntityModule
+// Klassenname MUSS = module.json "name" ohne Leerzeichen ("HomeSuite Hub" -> HomeSuiteHub),
+// sonst findet Symcon die Modulklasse nicht (IPS_CreateInstance liefert false).
+class HomeSuiteHub extends EntityModule
 {
     // ==================================================================
     // Konstanten
