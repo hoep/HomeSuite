@@ -42,6 +42,7 @@ use Hoep\HomeSuite\EntityModule;
 use Hoep\HomeSuite\HAL\DriverFactory;
 use Hoep\HomeSuite\HAL\IDriver;
 use Hoep\HomeSuite\HAL\IShutter;
+use Hoep\HomeSuite\SunTimes;
 
 // Klassenname MUSS = module.json "name" (ohne Leerzeichen) sein.
 class ShadingDevice extends EntityModule
@@ -189,6 +190,7 @@ class ShadingDevice extends EntityModule
                 ['op' => 'setArmed',           'label' => 'Scharfschalten / Schatten-Modus'],
                 ['op' => 'driverProbe',        'label' => 'Treiber-Status (Diagnose)'],
                 ['op' => 'reconcileProbe',     'label' => 'Regel-Entscheidung (Trockenlauf)'],
+                ['op' => 'command',            'label' => 'Bedienen (Position/Fahrt/Modus)'],
             ],
 
             // ---- Konfig-Felder (Treiberwahl; im LVB gesetzt) ----
@@ -348,6 +350,8 @@ class ShadingDevice extends EntityModule
                 return $this->mgmtSetActivePlan($args);
             case 'importLegacy':
                 return $this->mgmtImportLegacy($args, $ctx);
+            case 'command':
+                return $this->mgmtCommand($args);
             case 'driverProbe':
                 return $this->mgmtDriverProbe();
             case 'reconcileProbe':
@@ -457,6 +461,13 @@ class ShadingDevice extends EntityModule
             }
             $patch['doorIds'] = array_values(array_map('intval', $args['doorIds']));
         }
+        // Sonnenzeit-Quelle: Location-Instanz ODER eigene Koordinaten.
+        if (array_key_exists('sunSource', $args)) {
+            $patch['sunSource'] = ((string) $args['sunSource'] === 'coords') ? 'coords' : 'location';
+        }
+        if (array_key_exists('locationId', $args)) { $patch['locationId'] = (int) $args['locationId']; }
+        if (array_key_exists('lat', $args))        { $patch['lat'] = (float) $args['lat']; }
+        if (array_key_exists('lon', $args))        { $patch['lon'] = (float) $args['lon']; }
         if ($patch !== []) {
             $this->store()->patch('config', $patch);
             $this->registerWatches($this->driver()); // env koennte Wind/Regen-IDs geaendert haben
@@ -478,12 +489,23 @@ class ShadingDevice extends EntityModule
         $slots = (isset($args['slots']) && is_array($args['slots'])) ? $args['slots'] : [];
         $clean = [];
         foreach ($slots as $s) {
-            if (!is_array($s) || !isset($s['end'])) {
+            if (!is_array($s)) {
                 continue;
             }
-            $val = (int) round((float) ($s['val'] ?? 0));
-            $val = max(self::POS_MIN, min(self::POS_MAX, $val));
-            $clean[] = ['end' => (int) $s['end'], 'val' => $val];
+            $hasEnd    = isset($s['end']);
+            $hasAnchor = isset($s['anchor']) && SunTimes::isAnchor((string) $s['anchor']);
+            if (!$hasEnd && !$hasAnchor) {
+                continue;
+            }
+            $val   = max(self::POS_MIN, min(self::POS_MAX, (int) round((float) ($s['val'] ?? 0))));
+            $entry = ['val' => $val];
+            if ($hasAnchor) {
+                $entry['anchor'] = (string) $s['anchor'];
+                $entry['offset'] = (int) ($s['offset'] ?? 0);
+            }
+            // Nominale Endzeit fuer Speicherung/Sortierung (verankerte werden zur Laufzeit re-aufgeloest).
+            $entry['end'] = $hasEnd ? (int) $s['end'] : $this->resolveEnd($entry, $this->sunEvents(time()));
+            $clean[] = $entry;
         }
         if (!empty($ctx['dryrun'])) {
             return ['ok' => true, 'dryrun' => true, 'variant' => $variant, 'day' => $day, 'slots' => $clean];
@@ -541,6 +563,20 @@ class ShadingDevice extends EntityModule
         }
         $v = (string) $v;
         return in_array($v, $vars, true) ? $v : $vars[0];
+    }
+
+    /**
+     * Generischer Bedien-Op (Visu -> Entitaet): setzt einen aktionablen Control
+     * ueber die native RequestAction. Nur Whitelist-Idents.
+     */
+    private function mgmtCommand(array $args): array
+    {
+        $ident = (string) ($args['ident'] ?? '');
+        if (!in_array($ident, ['Position', 'Movement', 'Mode', 'Plan', 'Season'], true)) {
+            throw new ContractException('command: ident nicht erlaubt: ' . $ident);
+        }
+        $this->RequestAction($ident, $args['value'] ?? 0);
+        return ['ok' => true, 'ident' => $ident, 'value' => $args['value'] ?? 0];
     }
 
     /**
@@ -640,6 +676,7 @@ class ShadingDevice extends EntityModule
             'sunTarget'    => $d['sunTarget'],
             'schedTarget'  => $d['schedTarget'],
             'inputs'       => $d['inp'],
+            'sunEvents'    => $this->sunEvents(time()),
         ];
     }
 
@@ -761,9 +798,8 @@ class ShadingDevice extends EntityModule
             : null;
         $sunTarget = $this->debounceSun($rawSun, $persist);
 
-        // Zeitplan: aktive Kreuzprodukt-Variante -> Positions-Sollwert.
-        $schedVal    = $this->schedules()->eval(time(), $this->activeVariant());
-        $schedTarget = is_numeric($schedVal) ? (int) round((float) $schedVal) : null;
+        // Zeitplan (sonnen-verankerte Grenzen werden fuer den Tag aufgeloest).
+        $schedTarget = $this->schedulePositionAt(time());
 
         // Safety: Wind/Regen -> sichere Position.
         $storm = $this->stormActive($inp);
@@ -922,6 +958,72 @@ class ShadingDevice extends EntityModule
     }
 
     // ==================================================================
+    // Sonnen-verankerte Zeitplan-Grenzen
+    // ==================================================================
+
+    /** Lat/Lon fuer Sonnenzeiten: Location-Instanz (Vorgabe #<ID>) ODER eigene Koordinaten. */
+    private function sunCoords(): array
+    {
+        if ((string) $this->cfgVal('sunSource', 'location') === 'coords') {
+            return [(float) $this->cfgVal('lat', 48.2082), (float) $this->cfgVal('lon', 16.3738)];
+        }
+        $lid = (int) $this->cfgVal('locationId', 13098);
+        if ($lid > 0 && function_exists('IPS_InstanceExists') && @\IPS_InstanceExists($lid)) {
+            $cfg = json_decode((string) @\IPS_GetConfiguration($lid), true);
+            $loc = is_array($cfg) ? json_decode((string) ($cfg['Location'] ?? 'null'), true) : null;
+            if (is_array($loc) && isset($loc['latitude'], $loc['longitude'])) {
+                return [(float) $loc['latitude'], (float) $loc['longitude']];
+            }
+        }
+        return [48.2082, 16.3738]; // Fallback Hauskoords
+    }
+
+    /** Sonnen-Ereigniszeiten (Minuten seit lokaler Mitternacht) fuer den Tag von $ts. */
+    private function sunEvents(int $ts): array
+    {
+        [$lat, $lon] = $this->sunCoords();
+        return SunTimes::eventsMinutes($ts, $lat, $lon);
+    }
+
+    /** Slot-Grenze aufloesen: Sonnen-Anker (+Offset, geklemmt) ODER feste Minute. */
+    private function resolveEnd(array $slot, array $sun): int
+    {
+        $anchor = isset($slot['anchor']) ? (string) $slot['anchor'] : '';
+        if ($anchor !== '' && isset($sun[$anchor]) && $sun[$anchor] !== null) {
+            return max(0, min(1440, (int) $sun[$anchor] + (int) ($slot['offset'] ?? 0)));
+        }
+        return max(0, min(1440, (int) ($slot['end'] ?? 1440)));
+    }
+
+    /**
+     * Positions-Sollwert des Zeitplans zum Zeitpunkt $ts: loest sonnen-verankerte
+     * Grenzen fuer den Tag auf, sortiert nach aufgeloester Grenze und waehlt den
+     * aktiven Slot. Ersetzt ScheduleEngine::eval() fuer die verankerte Beschattung.
+     */
+    private function schedulePositionAt(int $ts): ?int
+    {
+        $day   = (int) date('N', $ts) - 1;
+        $slots = $this->schedules()->getSlots($this->activeVariant(), $day);
+        if ($slots === []) {
+            return null;
+        }
+        $sun = $this->sunEvents($ts);
+        $res = [];
+        foreach ($slots as $s) {
+            $res[] = ['end' => $this->resolveEnd($s, $sun), 'val' => $s['val'] ?? null];
+        }
+        usort($res, static fn($a, $b) => $a['end'] - $b['end']);
+        $minNow = ((int) date('G', $ts)) * 60 + (int) date('i', $ts);
+        foreach ($res as $s) {
+            if ($minNow < $s['end']) {
+                return is_numeric($s['val']) ? (int) round((float) $s['val']) : null;
+            }
+        }
+        $last = end($res);
+        return is_numeric($last['val']) ? (int) round((float) $last['val']) : null;
+    }
+
+    // ==================================================================
     // Manual-Override / externe Eingriffe / Sofort-Safety
     // ==================================================================
 
@@ -992,8 +1094,13 @@ class ShadingDevice extends EntityModule
         $now    = time();
         $day    = (int) date('N', $now) - 1;
         $minNow = ((int) date('G', $now)) * 60 + (int) date('i', $now);
+        $sun    = $this->sunEvents($now);
+        $ends   = [];
         foreach ($this->schedules()->getSlots($this->activeVariant(), $day) as $slot) {
-            $end = (int) $slot['end'];
+            $ends[] = $this->resolveEnd($slot, $sun);
+        }
+        sort($ends);
+        foreach ($ends as $end) {
             if ($end > $minNow) {
                 return max(60, ($end - $minNow) * 60);
             }

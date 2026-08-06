@@ -49,7 +49,13 @@ final class ScheduleEngine
         $out = [];
         foreach ($list as $slot) {
             if (is_array($slot) && isset($slot['end'])) {
-                $out[] = ['end' => (int) $slot['end'], 'val' => $slot['val'] ?? null];
+                $entry = ['end' => (int) $slot['end'], 'val' => $slot['val'] ?? null];
+                // Sonnen-Anker (Beschattung) durchreichen; Heizung hat keine -> unveraendert.
+                if (isset($slot['anchor']) && $slot['anchor'] !== '' && $slot['anchor'] !== null) {
+                    $entry['anchor'] = (string) $slot['anchor'];
+                    $entry['offset'] = (int) ($slot['offset'] ?? 0);
+                }
+                $out[] = $entry;
             }
         }
         return $out;
@@ -76,7 +82,12 @@ final class ScheduleEngine
                 continue;
             }
             // Doppelte Endzeit: letzter Eintrag gewinnt.
-            $norm[$end] = ['end' => $end, 'val' => $slot['val'] ?? null];
+            $entry = ['end' => $end, 'val' => $slot['val'] ?? null];
+            if (isset($slot['anchor']) && $slot['anchor'] !== '' && $slot['anchor'] !== null) {
+                $entry['anchor'] = (string) $slot['anchor'];
+                $entry['offset'] = (int) ($slot['offset'] ?? 0);
+            }
+            $norm[$end] = $entry;
         }
         if ($norm === []) {
             $this->s->set('schedule.' . $variant . '.' . $day, []);

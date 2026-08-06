@@ -64,6 +64,7 @@ $__hs_files = [
     // --- Engines ---
     'Engines/ProfileEngine.php',       // Anlegen/Bearbeiten/Zuweisen von Profilen (getrennt)
     'Engines/ScheduleEngine.php',      // Slot-/Geo-/Rule-Auswertung, Homematic-Wochenexport
+    'Engines/SunTimes.php',            // Sonnen-Ereigniszeiten (date_sun_info) fuer verankerte Grenzen
     'Engines/ShadeKinematics.php',     // Positions-/Lamellen-Kinematik der Beschattung
 
     // --- Provision ---
