@@ -242,10 +242,11 @@ class HeatingZone extends EntityModule
     // ==================================================================
 
     /**
-     * Baut den HAL-Treiber aus der gespeicherten Konfiguration. Aktuell ist nur
-     * der vendor-freie 'generic-thermostat' verdrahtet: er bindet die im LVB
-     * zugeordneten Standard-Symcon-Variablen (Sollwert/Ist/Feuchte). Fuer hm-*
-     * liefert driver() bewusst noch null (Adapter folgt separat, aktor-vorsichtig).
+     * Baut den HAL-Treiber aus der gespeicherten Konfiguration:
+     *  - 'generic-thermostat' bindet die im LVB zugeordneten Standard-Variablen
+     *    (Sollwert/Ist), scheduleMode 'controller'.
+     *  - 'hm-*' baut den kanal-erkennenden HomeMaticThermostat gegen die
+     *    CCU-Geraeteinstanz (targetId = Instanz-ID), scheduleMode 'device'.
      */
     protected function driver(): ?IDriver
     {
@@ -258,29 +259,35 @@ class HeatingZone extends EntityModule
         $cfg      = $this->store()->get('config', []);
         $cfg      = is_array($cfg) ? $cfg : [];
         $driverId = (string) ($cfg['driver'] ?? '');
-
-        if ($driverId !== 'generic-thermostat') {
-            return null; // hm-* / unkonfiguriert: in M1.2 (noch) kein Treiber
-        }
-
         $targetId = (int) ($cfg['targetId'] ?? 0);
-        if ($targetId <= 0) {
-            return null; // ohne Sollwert-Variable kein sinnvoller Treiber
-        }
-        $sensorId = (int) ($cfg['sensorId'] ?? 0);
 
-        $driverCfg = [
-            'setpointVarId' => $targetId,
-            'min'           => self::SETPOINT_MIN,
-            'max'           => self::SETPOINT_MAX,
-            'step'          => 0.5,
-        ];
-        if ($sensorId > 0) {
-            $driverCfg['actualVarId'] = $sensorId;
+        if ($driverId === '' || $targetId <= 0) {
+            return null; // unkonfiguriert
         }
 
         try {
-            $this->driverInstance = DriverFactory::create('generic-thermostat', $driverCfg);
+            if ($driverId === 'generic-thermostat') {
+                $driverCfg = [
+                    'setpointVarId' => $targetId,
+                    'min'           => self::SETPOINT_MIN,
+                    'max'           => self::SETPOINT_MAX,
+                    'step'          => 0.5,
+                ];
+                $sensorId = (int) ($cfg['sensorId'] ?? 0);
+                if ($sensorId > 0) {
+                    $driverCfg['actualVarId'] = $sensorId;
+                }
+                $this->driverInstance = DriverFactory::create('generic-thermostat', $driverCfg);
+            } elseif (strncmp($driverId, 'hm-', 3) === 0) {
+                // hm-*: targetId ist die CCU-Geraeteinstanz; der Treiber loest die
+                // Kanaele (SET_/ACTUAL_TEMPERATURE, HUMIDITY, VALVE) selbst auf.
+                $this->driverInstance = DriverFactory::create($driverId, [
+                    'deviceInstanceId' => $targetId,
+                    'min'              => self::SETPOINT_MIN,
+                    'max'              => self::SETPOINT_MAX,
+                    'step'             => 0.5,
+                ]);
+            }
         } catch (\Throwable $e) {
             $this->SendDebug('HSHT.driver', 'Treiberaufbau fehlgeschlagen: ' . $e->getMessage(), 0);
             $this->driverInstance = null;
@@ -394,14 +401,28 @@ class HeatingZone extends EntityModule
 
         $targetId = (int) ($args['targetId'] ?? 0);
         $sensorId = (int) ($args['sensorId'] ?? 0);
+        $isHm     = strncmp($driver, 'hm-', 3) === 0;
 
-        foreach (['targetId' => $targetId, 'sensorId' => $sensorId] as $key => $vid) {
-            if ($vid > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($vid)) {
-                throw new ContractException($key . ' #' . $vid . ' ist keine Variable');
+        // targetId-Semantik je Treiber: generic = Sollwert-VARIABLE, hm-* = CCU-INSTANZ.
+        if ($targetId > 0) {
+            if ($isHm) {
+                if (function_exists('IPS_InstanceExists') && !\IPS_InstanceExists($targetId)) {
+                    throw new ContractException('targetId #' . $targetId . ' ist keine Instanz (HM-Geraet erwartet)');
+                }
+                // Plausibilitaet: hat die Instanz einen SET_TEMPERATURE-Kanal?
+                if (function_exists('IPS_GetObjectIDByIdent')
+                    && @\IPS_GetObjectIDByIdent('SET_TEMPERATURE', $targetId) === false) {
+                    throw new ContractException('Instanz #' . $targetId . ' hat keinen SET_TEMPERATURE-Kanal');
+                }
+            } elseif (function_exists('IPS_VariableExists') && !\IPS_VariableExists($targetId)) {
+                throw new ContractException('targetId #' . $targetId . ' ist keine Variable');
             }
         }
-        if ($driver === 'generic-thermostat' && $targetId <= 0) {
-            throw new ContractException('generischer Treiber braucht eine Sollwert-Variable (targetId)');
+        if ($sensorId > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($sensorId)) {
+            throw new ContractException('sensorId #' . $sensorId . ' ist keine Variable');
+        }
+        if ($targetId <= 0 && $driver !== '') {
+            throw new ContractException($driver . ' braucht ein Ziel (targetId): generic=Variable, hm-*=CCU-Instanz');
         }
 
         $config = ['driver' => $driver, 'targetId' => $targetId, 'sensorId' => $sensorId];

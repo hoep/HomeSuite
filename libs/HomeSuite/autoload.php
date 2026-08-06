@@ -55,6 +55,9 @@ $__hs_files = [
     'HAL/GenericVariableShutter.php',
     'HAL/GenericVariableValve.php',
 
+    // --- Vendor-Treiber (self-registrieren bei der DriverFactory) ---
+    'Drivers/HomeMaticThermostat.php',
+
     // --- Engines ---
     'Engines/ProfileEngine.php',       // Anlegen/Bearbeiten/Zuweisen von Profilen (getrennt)
     'Engines/ScheduleEngine.php',      // Slot-/Geo-/Rule-Auswertung, Homematic-Wochenexport
