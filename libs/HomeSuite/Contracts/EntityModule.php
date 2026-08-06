@@ -481,6 +481,94 @@ abstract class EntityModule extends \IPSModule
         return 0;
     }
 
+    // ==================================================================
+    // Sonnen-verankerte Zeitplan-Grenzen (universell, jede controller-Domaene)
+    // ==================================================================
+
+    /** Lat/Lon fuer Sonnenzeiten: config.sunSource='coords' -> lat/lon; sonst Location-Instanz. */
+    protected function sunCoords(): array
+    {
+        $cfg = $this->store()->get('config', []);
+        $cfg = is_array($cfg) ? $cfg : [];
+        if (($cfg['sunSource'] ?? 'location') === 'coords') {
+            return [(float) ($cfg['lat'] ?? 48.2082), (float) ($cfg['lon'] ?? 16.3738)];
+        }
+        $lid = (int) ($cfg['locationId'] ?? 13098);
+        if ($lid > 0 && function_exists('IPS_InstanceExists') && @\IPS_InstanceExists($lid)) {
+            $c   = json_decode((string) @\IPS_GetConfiguration($lid), true);
+            $loc = is_array($c) ? json_decode((string) ($c['Location'] ?? 'null'), true) : null;
+            if (is_array($loc) && isset($loc['latitude'], $loc['longitude'])) {
+                return [(float) $loc['latitude'], (float) $loc['longitude']];
+            }
+        }
+        return [48.2082, 16.3738];
+    }
+
+    /** Sonnen-Ereigniszeiten (Minuten seit lokaler Mitternacht) fuer den Tag von $ts. */
+    protected function sunEvents(int $ts): array
+    {
+        [$lat, $lon] = $this->sunCoords();
+        return SunTimes::eventsMinutes($ts, $lat, $lon);
+    }
+
+    /** Slot-Grenze aufloesen: Sonnen-Anker (+Offset, geklemmt) ODER feste Minute. */
+    protected function resolveEnd(array $slot, array $sun): int
+    {
+        $anchor = isset($slot['anchor']) ? (string) $slot['anchor'] : '';
+        if ($anchor !== '' && isset($sun[$anchor]) && $sun[$anchor] !== null) {
+            return max(0, min(1440, (int) $sun[$anchor] + (int) ($slot['offset'] ?? 0)));
+        }
+        return max(0, min(1440, (int) ($slot['end'] ?? 1440)));
+    }
+
+    /**
+     * Aktiver Slot-WERT zum Zeitpunkt $ts mit AUFGELOESTEN Sonnen-Ankern (generisch:
+     * Temperatur/Position). Ersetzt ScheduleEngine::eval() dort, wo Grenzen an Sonnen-
+     * ereignisse gebunden sein koennen (controller-Modus). @return mixed|null
+     */
+    protected function scheduleValueAt(int $ts, string $variant)
+    {
+        $day   = (int) date('N', $ts) - 1;
+        $slots = $this->schedules()->getSlots($variant, $day);
+        if ($slots === []) {
+            return null;
+        }
+        $sun = $this->sunEvents($ts);
+        $res = [];
+        foreach ($slots as $s) {
+            $res[] = ['end' => $this->resolveEnd($s, $sun), 'val' => $s['val'] ?? null];
+        }
+        usort($res, static fn($a, $b) => $a['end'] - $b['end']);
+        $minNow = ((int) date('G', $ts)) * 60 + (int) date('i', $ts);
+        foreach ($res as $s) {
+            if ($minNow < $s['end']) {
+                return $s['val'];
+            }
+        }
+        $last = end($res);
+        return $last['val'];
+    }
+
+    /** Sekunden bis zur naechsten (aufgeloesten) Slot-Grenze der Variante (min. 60s). */
+    protected function secondsToNextBoundary(string $variant): int
+    {
+        $now    = time();
+        $day    = (int) date('N', $now) - 1;
+        $minNow = ((int) date('G', $now)) * 60 + (int) date('i', $now);
+        $sun    = $this->sunEvents($now);
+        $ends   = [];
+        foreach ($this->schedules()->getSlots($variant, $day) as $slot) {
+            $ends[] = $this->resolveEnd($slot, $sun);
+        }
+        sort($ends);
+        foreach ($ends as $end) {
+            if ($end > $minNow) {
+                return max(60, ($end - $minNow) * 60);
+            }
+        }
+        return max(60, (1440 - $minNow) * 60);
+    }
+
     /** syncStatus — vergleicht Modul-Wochenplan (aktive Variante) mit dem Geraet. */
     protected function opSyncStatus(): array
     {

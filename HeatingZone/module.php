@@ -470,7 +470,7 @@ class HeatingZone extends EntityModule
         }
         // Auto (0) und Boost (2, vorerst wie Auto) -> aus dem Wochenplan.
         $variant = $this->activeVariant();
-        $v = $this->schedules()->eval(time(), $variant);
+        $v = $this->scheduleValueAt(time(), $variant); // Basis: loest ggf. Sonnen-Anker auf
         return is_numeric($v) ? (float) $v : null;
     }
 
@@ -565,7 +565,7 @@ class HeatingZone extends EntityModule
             return;
         }
         // Externer Eingriff -> Override bis zur naechsten Slot-Grenze halten.
-        $this->manualHold('Setpoint', $this->secondsToNextSlotBoundary());
+        $this->manualHold('Setpoint', $this->secondsToNextBoundary($this->activeVariant()));
         $this->SendDebug('HSHT.override', 'Externer Sollwert ' . $newVal . ' erkannt -> Hold bis Slot-Grenze', 0);
     }
 
@@ -787,7 +787,12 @@ class HeatingZone extends EntityModule
             $end = (int) $s['end'];
             $val = (float) ($s['val'] ?? 0);
             $val = max(self::SETPOINT_MIN, min(self::SETPOINT_MAX, $val));
-            $clean[] = ['end' => $end, 'val' => $val];
+            $entry = ['end' => $end, 'val' => $val];
+            if (isset($s['anchor']) && \Hoep\HomeSuite\SunTimes::isAnchor((string) $s['anchor'])) {
+                $entry['anchor'] = (string) $s['anchor'];
+                $entry['offset'] = (int) ($s['offset'] ?? 0);
+            }
+            $clean[] = $entry;
         }
 
         if (!empty($ctx['dryrun'])) {
@@ -820,7 +825,8 @@ class HeatingZone extends EntityModule
         for ($d = 0; $d < 7; $d++) {
             $week[$d] = $this->schedules()->getSlots($variant, $d);
         }
-        return ['ok' => true, 'variant' => $variant, 'week' => $week, 'activeVariant' => $this->activeVariant()];
+        return ['ok' => true, 'variant' => $variant, 'week' => $week, 'activeVariant' => $this->activeVariant(),
+            'sunEvents' => $this->sunEvents(time()), 'anchors' => array_keys(\Hoep\HomeSuite\SunTimes::ANCHORS)];
     }
 
     /** Setzt die aktive Praesenz (0..2) ueber die native RequestAction. */

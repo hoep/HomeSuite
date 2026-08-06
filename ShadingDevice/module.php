@@ -678,6 +678,7 @@ class ShadingDevice extends EntityModule
             'schedTarget'  => $d['schedTarget'],
             'inputs'       => $d['inp'],
             'sunEvents'    => $this->sunEvents(time()),
+            'geoProfile'   => $this->cfgVal('geoProfile', null),
         ];
     }
 
@@ -800,7 +801,8 @@ class ShadingDevice extends EntityModule
         $sunTarget = $this->debounceSun($rawSun, $persist);
 
         // Zeitplan (sonnen-verankerte Grenzen werden fuer den Tag aufgeloest).
-        $schedTarget = $this->schedulePositionAt(time());
+        $schedV      = $this->scheduleValueAt(time(), $this->activeVariant()); // Basis loest Sonnen-Anker auf
+        $schedTarget = is_numeric($schedV) ? (int) round((float) $schedV) : null;
 
         // Safety: Wind/Regen -> sichere Position.
         $storm = $this->stormActive($inp);
@@ -958,71 +960,6 @@ class ShadingDevice extends EntityModule
         return $cfg[$key] ?? $def;
     }
 
-    // ==================================================================
-    // Sonnen-verankerte Zeitplan-Grenzen
-    // ==================================================================
-
-    /** Lat/Lon fuer Sonnenzeiten: Location-Instanz (Vorgabe #<ID>) ODER eigene Koordinaten. */
-    private function sunCoords(): array
-    {
-        if ((string) $this->cfgVal('sunSource', 'location') === 'coords') {
-            return [(float) $this->cfgVal('lat', 48.2082), (float) $this->cfgVal('lon', 16.3738)];
-        }
-        $lid = (int) $this->cfgVal('locationId', 13098);
-        if ($lid > 0 && function_exists('IPS_InstanceExists') && @\IPS_InstanceExists($lid)) {
-            $cfg = json_decode((string) @\IPS_GetConfiguration($lid), true);
-            $loc = is_array($cfg) ? json_decode((string) ($cfg['Location'] ?? 'null'), true) : null;
-            if (is_array($loc) && isset($loc['latitude'], $loc['longitude'])) {
-                return [(float) $loc['latitude'], (float) $loc['longitude']];
-            }
-        }
-        return [48.2082, 16.3738]; // Fallback Hauskoords
-    }
-
-    /** Sonnen-Ereigniszeiten (Minuten seit lokaler Mitternacht) fuer den Tag von $ts. */
-    private function sunEvents(int $ts): array
-    {
-        [$lat, $lon] = $this->sunCoords();
-        return SunTimes::eventsMinutes($ts, $lat, $lon);
-    }
-
-    /** Slot-Grenze aufloesen: Sonnen-Anker (+Offset, geklemmt) ODER feste Minute. */
-    private function resolveEnd(array $slot, array $sun): int
-    {
-        $anchor = isset($slot['anchor']) ? (string) $slot['anchor'] : '';
-        if ($anchor !== '' && isset($sun[$anchor]) && $sun[$anchor] !== null) {
-            return max(0, min(1440, (int) $sun[$anchor] + (int) ($slot['offset'] ?? 0)));
-        }
-        return max(0, min(1440, (int) ($slot['end'] ?? 1440)));
-    }
-
-    /**
-     * Positions-Sollwert des Zeitplans zum Zeitpunkt $ts: loest sonnen-verankerte
-     * Grenzen fuer den Tag auf, sortiert nach aufgeloester Grenze und waehlt den
-     * aktiven Slot. Ersetzt ScheduleEngine::eval() fuer die verankerte Beschattung.
-     */
-    private function schedulePositionAt(int $ts): ?int
-    {
-        $day   = (int) date('N', $ts) - 1;
-        $slots = $this->schedules()->getSlots($this->activeVariant(), $day);
-        if ($slots === []) {
-            return null;
-        }
-        $sun = $this->sunEvents($ts);
-        $res = [];
-        foreach ($slots as $s) {
-            $res[] = ['end' => $this->resolveEnd($s, $sun), 'val' => $s['val'] ?? null];
-        }
-        usort($res, static fn($a, $b) => $a['end'] - $b['end']);
-        $minNow = ((int) date('G', $ts)) * 60 + (int) date('i', $ts);
-        foreach ($res as $s) {
-            if ($minNow < $s['end']) {
-                return is_numeric($s['val']) ? (int) round((float) $s['val']) : null;
-            }
-        }
-        $last = end($res);
-        return is_numeric($last['val']) ? (int) round((float) $last['val']) : null;
-    }
 
     // ==================================================================
     // Manual-Override / externe Eingriffe / Sofort-Safety
@@ -1077,7 +1014,7 @@ class ShadingDevice extends EntityModule
             if ($selfVal !== null && abs($selfVal - $newVal) < 1.0 && (time() - $selfTs) <= 10) {
                 return; // Self-Write (das war das Modul)
             }
-            $this->manualHold('Position', $this->secondsToNextSlotBoundary());
+            $this->manualHold('Position', $this->secondsToNextBoundary($this->activeVariant()));
             $this->SendDebug('HSSH.override', 'Externe Position ' . $newVal . '% -> Hold bis Slot-Grenze', 0);
             return;
         }
@@ -1089,25 +1026,6 @@ class ShadingDevice extends EntityModule
         }
     }
 
-    /** Sekunden bis zur naechsten Slot-Grenze der aktiven Variante (min. 60s). */
-    private function secondsToNextSlotBoundary(): int
-    {
-        $now    = time();
-        $day    = (int) date('N', $now) - 1;
-        $minNow = ((int) date('G', $now)) * 60 + (int) date('i', $now);
-        $sun    = $this->sunEvents($now);
-        $ends   = [];
-        foreach ($this->schedules()->getSlots($this->activeVariant(), $day) as $slot) {
-            $ends[] = $this->resolveEnd($slot, $sun);
-        }
-        sort($ends);
-        foreach ($ends as $end) {
-            if ($end > $minNow) {
-                return max(60, ($end - $minNow) * 60);
-            }
-        }
-        return max(60, (1440 - $minNow) * 60);
-    }
 
     /** Integer-Wert einer Status-Variable per Ident (0, wenn nicht vorhanden). */
     private function intVal(string $ident): int
