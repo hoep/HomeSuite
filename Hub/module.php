@@ -31,7 +31,7 @@ declare(strict_types=1);
  * Hub-managementActions-Whitelist.
  */
 
-require_once __DIR__ . '/../../libs/HomeSuite/autoload.php';
+require_once __DIR__ . '/../libs/HomeSuite/autoload.php';
 
 use Hoep\HomeSuite\ActionContext;
 use Hoep\HomeSuite\Control;
