@@ -1,0 +1,18 @@
+{
+    "id": "{A0C082B4-9E74-430E-BD97-F9CEBB364257}",
+    "name": "HomeSuite Hub",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": [
+        "HomeSuite Hub",
+        "HSH"
+    ],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSH",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "compatibility": {
+        "version": "1.0"
+    }
+}

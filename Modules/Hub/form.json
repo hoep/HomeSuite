@@ -1,0 +1,47 @@
+{
+    "elements": [
+        {
+            "type": "Label",
+            "caption": "HomeSuite Hub — zentrale Singleton-Instanz. Die eigentliche Verwaltung (Anlegen/Provisionieren/Migrieren) erfolgt im LiveViewBuilder ueber das Manifest. Dieser Dialog dient nur der Token-Verwaltung, der Status- und Diagnoseanzeige."
+        }
+    ],
+    "actions": [
+        {
+            "type": "Button",
+            "caption": "Verwaltungs-Token neu erzeugen",
+            "confirm": "Das bestehende X-HS-Token wird ungueltig. Alle Clients (LiveViewBuilder) muessen das neue Token uebernehmen. Fortfahren?",
+            "onClick": "echo HSH_RotateToken($id);"
+        },
+        {
+            "type": "Label",
+            "caption": "Nach dem Erzeugen den Dialog schliessen und erneut oeffnen, um das aktuelle Token oben abzulesen."
+        },
+        {
+            "type": "Button",
+            "caption": "Entitaeten auflisten",
+            "onClick": "echo HSH_ListEntities($id);"
+        },
+        {
+            "type": "Button",
+            "caption": "Suite-Manifest anzeigen",
+            "onClick": "echo HSH_GetSuiteManifest($id);"
+        }
+    ],
+    "status": [
+        {
+            "code": 102,
+            "icon": "active",
+            "caption": "Hub aktiv"
+        },
+        {
+            "code": 104,
+            "icon": "inactive",
+            "caption": "Hub inaktiv"
+        },
+        {
+            "code": 201,
+            "icon": "error",
+            "caption": "Fehler — siehe Meldungen"
+        }
+    ]
+}

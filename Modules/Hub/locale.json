@@ -1,0 +1,18 @@
+{
+    "translations": {
+        "de": {
+            "HomeSuite Hub": "HomeSuite Hub"
+        },
+        "en": {
+            "HomeSuite Hub — zentrale Singleton-Instanz. Die eigentliche Verwaltung (Anlegen/Provisionieren/Migrieren) erfolgt im LiveViewBuilder ueber das Manifest. Dieser Dialog dient nur der Token-Verwaltung, der Status- und Diagnoseanzeige.": "HomeSuite Hub — central singleton instance. The actual management (create/provision/migrate) is done in the LiveViewBuilder via the manifest. This dialog only covers token management, status and diagnostics.",
+            "Verwaltungs-Token neu erzeugen": "Regenerate management token",
+            "Das bestehende X-HS-Token wird ungueltig. Alle Clients (LiveViewBuilder) muessen das neue Token uebernehmen. Fortfahren?": "The existing X-HS-Token will be invalidated. All clients (LiveViewBuilder) must adopt the new token. Continue?",
+            "Nach dem Erzeugen den Dialog schliessen und erneut oeffnen, um das aktuelle Token oben abzulesen.": "After regenerating, close and reopen this dialog to read the current token above.",
+            "Entitaeten auflisten": "List entities",
+            "Suite-Manifest anzeigen": "Show suite manifest",
+            "Hub aktiv": "Hub active",
+            "Hub inaktiv": "Hub inactive",
+            "Fehler — siehe Meldungen": "Error — see messages"
+        }
+    }
+}
