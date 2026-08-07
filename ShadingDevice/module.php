@@ -455,6 +455,11 @@ class ShadingDevice extends EntityModule
         if (array_key_exists('safePos', $args)) {
             $patch['safePos'] = max(0, min(100, (int) $args['safePos']));
         }
+        // Wetter-/Temp-/Tag-Profil-Felder (vom Hub gepusht):
+        if (array_key_exists('rainClose', $args)) { $patch['rainClose'] = (bool) $args['rainClose']; }
+        if (array_key_exists('tempGate', $args))  { $patch['tempGate']  = is_array($args['tempGate']) ? $args['tempGate'] : null; }
+        if (array_key_exists('dayBegin', $args))  { $patch['dayBegin']  = is_array($args['dayBegin']) ? $args['dayBegin'] : null; }
+        if (array_key_exists('dayEnd', $args))    { $patch['dayEnd']    = is_array($args['dayEnd']) ? $args['dayEnd'] : null; }
         if (array_key_exists('doorIds', $args)) {
             if (!is_array($args['doorIds'])) {
                 throw new ContractException('doorIds muss eine Liste sein');
@@ -799,10 +804,17 @@ class ShadingDevice extends EntityModule
             ? $this->schedules()->evalGeo((float) ($inp['az'] ?? 0), (float) $inp['el'], (float) ($inp['bright'] ?? 0), $geo)
             : null;
         $sunTarget = $this->debounceSun($rawSun, $persist);
+        // Temp-Gate: Sonnen-Beschattung nur, wenn Temperatur ueber Schwelle (IPSShadowing shadowingByTemp).
+        $tg = $this->cfgVal('tempGate', null);
+        if (is_array($tg) && $sunTarget !== null) {
+            $tv = $this->tempNow($tg);
+            if ($tv !== null && $tv < (float) ($tg['aboveC'] ?? 24)) { $sunTarget = null; }
+        }
 
         // Zeitplan (sonnen-verankerte Grenzen werden fuer den Tag aufgeloest).
         $schedV      = $this->scheduleValueAt(time(), $this->activeVariant()); // Basis loest Sonnen-Anker auf
         $schedTarget = is_numeric($schedV) ? (int) round((float) $schedV) : null;
+        if ($schedTarget === null) { $schedTarget = $this->dayNightTarget(time()); } // Fallback: Tag/Nacht-Profil
 
         // Safety: Wind/Regen -> sichere Position.
         $storm = $this->stormActive($inp);
@@ -864,12 +876,43 @@ class ShadingDevice extends EntityModule
         return $state ? $lastTarget : null;
     }
 
-    /** Sturm-/Regen-Lage aus den Umgebungssensoren. */
+    /** Sturm-/Regen-Lage aus den Umgebungssensoren (Regen nur wenn Wetterprofil rainClose). */
     private function stormActive(array $inp): bool
     {
         $windMax = (float) $this->cfgVal('windStormKmh', self::WIND_STORM_KMH);
         $wind    = $inp['wind'];
-        return (($wind !== null) && $wind >= $windMax) || ($inp['rain'] === true);
+        $rainOn  = (bool) $this->cfgVal('rainClose', true);
+        return (($wind !== null) && $wind >= $windMax) || ($rainOn && $inp['rain'] === true);
+    }
+
+    /** Aktuelle Temperatur fuer das Temp-Gate (tg.sensorId; null = kein Sensor -> kein Gate). */
+    private function tempNow(array $tg): ?float
+    {
+        $id = (int) ($tg['sensorId'] ?? 0);
+        if ($id <= 0 || !function_exists('IPS_VariableExists') || !@\IPS_VariableExists($id)) { return null; }
+        $v = @GetValue($id);
+        return is_numeric($v) ? (float) $v : null;
+    }
+
+    /** Tag/Nacht-Grenze eines Tagesprofils in Minuten aufloesen (fixed ODER Sonnen-Modus). */
+    private function resolveDayMode(array $d, array $sun): ?int
+    {
+        $mode = (string) ($d['mode'] ?? 'sunrise'); $off = (int) ($d['offset'] ?? 0);
+        if ($mode === 'fixed') { $p = explode(':', (string) ($d['time'] ?? '07:00')); return max(0, min(1440, ((int) $p[0]) * 60 + (int) ($p[1] ?? 0) + $off)); }
+        if (isset($sun[$mode]) && $sun[$mode] !== null) { return max(0, min(1440, (int) $sun[$mode] + $off)); }
+        return null;
+    }
+
+    /** Fallback-Tag/Nacht-Position aus dayBegin/dayEnd-Profilen, wenn kein Slot-Plan existiert. */
+    private function dayNightTarget(int $ts): ?int
+    {
+        $db = $this->cfgVal('dayBegin', null); $de = $this->cfgVal('dayEnd', null);
+        if (!is_array($db) || !is_array($de)) { return null; }
+        $sun = $this->sunEvents($ts);
+        $bgn = $this->resolveDayMode($db, $sun); $end = $this->resolveDayMode($de, $sun);
+        if ($bgn === null || $end === null) { return null; }
+        $minNow = ((int) date('G', $ts)) * 60 + (int) date('i', $ts);
+        return ($minNow >= $bgn && $minNow < $end) ? (int) ($db['pos'] ?? 0) : (int) ($de['pos'] ?? 100);
     }
 
     /** Umgebungswerte lesen (null, wenn Sensor fehlt). */

@@ -249,6 +249,22 @@ class HomeSuiteHub extends EntityModule
             ],
         ]);
 
+        // --- Beschattungs-/Profil-Verwaltung (geteilte benannte Profile, ProfileEngine) ---
+        foreach ([
+            ['profileTypes',    'Profiltypen auflisten'],
+            ['profileList',     'Profile eines Typs auflisten'],
+            ['profileGet',      'Profil lesen'],
+            ['profileCreate',   'Profil anlegen'],
+            ['profileSetFields','Profil bearbeiten'],
+            ['profileRename',   'Profil umbenennen'],
+            ['profileDuplicate','Profil duplizieren'],
+            ['profileDelete',   'Profil loeschen'],
+            ['profileAssign',   'Profil einer Zone zuweisen'],
+            ['profileAssigned', 'Zuweisungen einer Zone lesen'],
+        ] as $pa) {
+            $m->addManagementAction(['op' => $pa[0], 'verb' => $pa[0], 'target' => 'hub', 'label' => $pa[1], 'destructive' => ($pa[0] === 'profileDelete'), 'fields' => []]);
+        }
+
         return $m->toArray();
     }
 
@@ -301,7 +317,72 @@ class HomeSuiteHub extends EntityModule
                 return ['ok' => true, 'op' => $op, 'result' => ['restored' => basename($file)]];
         }
 
+        if (strncmp($op, 'profile', 7) === 0) {
+            return $this->mgmtProfile($op, $args);
+        }
         return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
+    }
+
+    // --- Geteilte Beschattungs-Profile (ProfileEngine auf dem Hub-Store) -----
+
+    private function profileEngine(): \Hoep\HomeSuite\ProfileEngine
+    {
+        return new \Hoep\HomeSuite\ProfileEngine($this->store(), \Hoep\HomeSuite\ShadingProfiles::types());
+    }
+
+    private function mgmtProfile(string $op, array $args): array
+    {
+        $pe   = $this->profileEngine();
+        $type = (string) ($args['type'] ?? '');
+        $name = (string) ($args['name'] ?? '');
+        $flds = (isset($args['fields']) && is_array($args['fields'])) ? $args['fields'] : [];
+        switch ($op) {
+            case 'profileTypes':    return ['ok' => true, 'types' => \Hoep\HomeSuite\ShadingProfiles::types()];
+            case 'profileList':     return ['ok' => true, 'type' => $type, 'profiles' => $pe->list($type)];
+            case 'profileGet':      return ['ok' => true, 'type' => $type, 'name' => $name, 'fields' => $pe->get($type, $name)];
+            case 'profileCreate':   $pe->create($type, $name, $flds); return ['ok' => true, 'type' => $type, 'name' => $name];
+            case 'profileSetFields':$pe->setFields($type, $name, $flds); $this->pushProfile($type, $name); return ['ok' => true, 'type' => $type, 'name' => $name];
+            case 'profileRename':   $pe->rename($type, $name, (string) ($args['newName'] ?? '')); return ['ok' => true];
+            case 'profileDuplicate':$pe->duplicate($type, $name, (string) ($args['newName'] ?? '')); return ['ok' => true];
+            case 'profileDelete':   $pe->delete($type, $name); return ['ok' => true];
+            case 'profileAssign':
+                $eid = (int) ($args['entityId'] ?? 0);
+                if ($eid <= 0) { throw new \Hoep\HomeSuite\ContractException('entityId fehlt'); }
+                if ($name === '') { $this->store()->set('assign.' . $eid . '.' . $type, ''); }
+                else { $pe->assign($eid, $type, $name); }
+                $this->pushZone($eid);
+                return ['ok' => true, 'entityId' => $eid, 'type' => $type, 'name' => $name];
+            case 'profileAssigned':
+                $eid = (int) ($args['entityId'] ?? 0); $a = [];
+                foreach (\Hoep\HomeSuite\ShadingProfiles::typeIds() as $t) { $a[$t] = $pe->assignedName($eid, $t); }
+                return ['ok' => true, 'entityId' => $eid, 'assigned' => $a];
+        }
+        return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
+    }
+
+    /** Merged Config aller zugewiesenen Profile einer Zone -> configureAutomation der Zone. */
+    private function pushZone(int $eid): void
+    {
+        if ($eid <= 0 || !@\IPS_InstanceExists($eid) || !function_exists('HSSH_Manage')) { return; }
+        $pe = $this->profileEngine(); $cfg = [];
+        foreach (\Hoep\HomeSuite\ShadingProfiles::typeIds() as $t) {
+            $nm = $pe->assignedName($eid, $t);
+            if ($nm === null || $nm === '') { continue; }
+            try { $f = $pe->get($t, $nm); } catch (\Throwable $e) { continue; }
+            $cfg = array_merge($cfg, \Hoep\HomeSuite\ShadingProfiles::mapToConfig($t, $f));
+        }
+        if ($cfg !== []) { @\HSSH_Manage($eid, json_encode(['op' => 'configureAutomation', 'args' => $cfg])); }
+    }
+
+    /** Push ein Profil an ALLE Zonen, denen es zugewiesen ist. */
+    private function pushProfile(string $type, string $name): void
+    {
+        $pe = $this->profileEngine();
+        foreach ($this->discoverEntities() as $e) {
+            if (($e['domain'] ?? '') !== 'shading') { continue; }
+            $eid = (int) ($e['instanceID'] ?? 0);
+            if ($eid > 0 && $pe->assignedName($eid, $type) === $name) { $this->pushZone($eid); }
+        }
     }
 
     // ==================================================================
