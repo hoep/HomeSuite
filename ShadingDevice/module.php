@@ -190,6 +190,7 @@ class ShadingDevice extends EntityModule
                 ['op' => 'setArmed',           'label' => 'Scharfschalten / Schatten-Modus'],
                 ['op' => 'driverProbe',        'label' => 'Treiber-Status (Diagnose)'],
                 ['op' => 'reconcileProbe',     'label' => 'Regel-Entscheidung (Trockenlauf)'],
+                ['op' => 'getConfig',          'label' => 'Konfiguration lesen (Diagnose)'],
                 ['op' => 'command',            'label' => 'Bedienen (Position/Fahrt/Modus)'],
             ],
 
@@ -356,6 +357,9 @@ class ShadingDevice extends EntityModule
                 return $this->mgmtDriverProbe();
             case 'reconcileProbe':
                 return $this->mgmtReconcileProbe();
+            case 'getConfig':
+                $cfg = $this->store()->get('config', []);
+                return ['ok' => true, 'config' => is_array($cfg) ? $cfg : []];
             default:
                 // updateProfile/getSchedule/setActivePlan/importLegacy folgen in M6/M7.
                 return parent::mgmt($op, $args, $ctx);
