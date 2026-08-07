@@ -712,6 +712,37 @@ class ShadingDevice extends EntityModule
         $this->registerWatches($drv);
     }
 
+    /**
+     * Konsole: native Bindungs-Ansicht (additiv, ohne Properties -> wirkt sofort
+     * auf Bestandsinstanzen, kein Kernel-Neustart). Die Felder sind mit der
+     * aktuellen Store-Bindung vorbelegt; „Bindung uebernehmen" ruft configureDriver.
+     * Sicherheits-Schwellen und Sonnenprofil kommen aus den geteilten Profilen.
+     */
+    public function GetConfigurationForm()
+    {
+        $cfg = $this->store()->get('config', []);
+        $cfg = is_array($cfg) ? $cfg : [];
+        return json_encode(['elements' => [
+            ['type' => 'Label', 'caption' => 'Beschattung — Bindung an die (IPSShadowing-)Positions-Variable. '
+                . 'Sicherheits-Schwellen und Sonnenprofil kommen aus den geteilten Profilen (LiveViewBuilder), nicht hier.'],
+            ['type' => 'Select', 'name' => 'cfgDriver', 'caption' => 'Treiber',
+                'value' => (string) ($cfg['driver'] ?? 'generic-shutter'), 'options' => [
+                    ['caption' => '(keiner / Schatten-Modus)', 'value' => ''],
+                    ['caption' => 'Generischer Rollladen (Position 0..100)', 'value' => 'generic-shutter'],
+                ]],
+            ['type' => 'SelectVariable', 'name' => 'cfgPositionId', 'caption' => 'Positions-Variable (Ziel & Rueckmeldung)',
+                'value' => (int) ($cfg['positionId'] ?? 0)],
+            ['type' => 'SelectVariable', 'name' => 'cfgAutomaticId', 'caption' => 'IPSShadowing-Automatik-Variable (optional, fuer Cutover/Rollback)',
+                'value' => (int) ($cfg['automaticId'] ?? 0)],
+            ['type' => 'CheckBox', 'name' => 'cfgInvert', 'caption' => 'Position invertieren (0=zu ... 100=offen)',
+                'value' => (bool) ($cfg['invert'] ?? false)],
+            ['type' => 'Button', 'caption' => 'Bindung uebernehmen', 'onClick' =>
+                'echo HSSH_Manage($id, json_encode(["op"=>"configureDriver","args"=>['
+                . '"driver"=>$cfgDriver,"positionId"=>$cfgPositionId,"automaticId"=>$cfgAutomaticId,"invert"=>$cfgInvert]]));'],
+            ['type' => 'Label', 'caption' => 'Verwaltung/Automatik laufen im LiveViewBuilder; hier nur die Geraete-Bindung.'],
+        ]]);
+    }
+
     /** Timer-Callback (prefix HSSH_Refresh): Reflect + Reconcile. Public per SDK. */
     public function Refresh(): void
     {

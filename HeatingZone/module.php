@@ -157,6 +157,7 @@ class HeatingZone extends EntityModule
                 ['op' => 'syncStatus',        'label' => 'Sync-Status'],
                 ['op' => 'loadFromDevice',    'label' => 'Vom Geraet laden'],
                 ['op' => 'syncToDevice',      'label' => 'Ans Geraet schreiben'],
+                ['op' => 'getConfig',         'label' => 'Konfiguration lesen (Diagnose)'],
             ],
 
             // ---- Konfig-Felder (Treiberwahl; im LVB gesetzt) ----
@@ -389,6 +390,38 @@ class HeatingZone extends EntityModule
         // Manual-Override-Erkennung: auf Aenderungen der GERAETE-Sollwertvariable
         // lauschen (jemand verstellt am Geraet/HM-Oberflaeche).
         $this->registerSetpointWatch($drv);
+    }
+
+    /**
+     * Konsole: native Bindungs-Ansicht (additiv, ohne Properties -> wirkt sofort
+     * auf Bestandsinstanzen, kein Kernel-Neustart). Felder mit aktueller Store-
+     * Bindung vorbelegt; „Bindung uebernehmen" ruft configureDriver. Zeitplaene/
+     * Praesenz kommen aus dem LiveViewBuilder.
+     */
+    public function GetConfigurationForm()
+    {
+        $cfg = $this->store()->get('config', []);
+        $cfg = is_array($cfg) ? $cfg : [];
+        return json_encode(['elements' => [
+            ['type' => 'Label', 'caption' => 'Heizung — Bindung an das Thermostat. Ziel: generic = Sollwert-Variable, '
+                . 'hm-* = HomeMatic-CCU-Instanz. Zeitplaene/Praesenz kommen aus dem LiveViewBuilder.'],
+            ['type' => 'Select', 'name' => 'cfgDriver', 'caption' => 'Treiber',
+                'value' => (string) ($cfg['driver'] ?? ''), 'options' => [
+                    ['caption' => '(keiner)', 'value' => ''],
+                    ['caption' => 'Generisches Thermostat (Sollwert-Variable)', 'value' => 'generic-thermostat'],
+                    ['caption' => 'HomeMatic HM-TC-IT-WM-W-EU (Wandthermostat)', 'value' => 'hm-HM-TC-IT-WM-W-EU'],
+                    ['caption' => 'HomeMatic HM-CC-RT-DN (Heizkoerper)', 'value' => 'hm-HM-CC-RT-DN'],
+                    ['caption' => 'HomeMatic HM-CC-TC', 'value' => 'hm-HM-CC-TC'],
+                ]],
+            ['type' => 'SelectObject', 'name' => 'cfgTargetId', 'caption' => 'Ziel (Variable bei generic, CCU-Instanz bei hm-*)',
+                'value' => (int) ($cfg['targetId'] ?? 0)],
+            ['type' => 'SelectObject', 'name' => 'cfgSensorId', 'caption' => 'Ist-Sensor (optional: Variable bzw. CCU-Instanz)',
+                'value' => (int) ($cfg['sensorId'] ?? 0)],
+            ['type' => 'Button', 'caption' => 'Bindung uebernehmen', 'onClick' =>
+                'echo HSHT_Manage($id, json_encode(["op"=>"configureDriver","args"=>['
+                . '"driver"=>$cfgDriver,"targetId"=>$cfgTargetId,"sensorId"=>$cfgSensorId]]));'],
+            ['type' => 'Label', 'caption' => 'Verwaltung/Zeitplaene laufen im LiveViewBuilder; hier nur die Geraete-Bindung.'],
+        ]]);
     }
 
     /**
@@ -642,6 +675,9 @@ class HeatingZone extends EntityModule
                 return $this->ImportLegacy($args);
             case 'adoptDevice':          // Alias der generischen Basis-Op
                 return $this->opLoadFromDevice();
+            case 'getConfig':
+                $cfg = $this->store()->get('config', []);
+                return ['ok' => true, 'config' => is_array($cfg) ? $cfg : []];
             default:
                 // syncStatus/loadFromDevice/syncToDevice u.a. behandelt die Basis generisch.
                 return parent::mgmt($op, $args, $ctx);
