@@ -50,7 +50,7 @@ final class MediaProviders
             'spotify'        => ['label' => 'Spotify', 'fields' => ['clientId', 'clientSecret', 'refreshToken']],
             'plex'           => ['label' => 'Plex', 'fields' => ['url', 'token']],
             'jellyfin'       => ['label' => 'Jellyfin', 'fields' => ['url', 'apiKey', 'userId']],
-            'audiobookshelf' => ['label' => 'Audiobookshelf', 'fields' => ['url', 'token']],
+            'audiobookshelf' => ['label' => 'Audiobookshelf', 'fields' => ['url', 'username', 'password']],
             'radio'          => ['label' => 'Radio (RadioNow)', 'fields' => []],
             'local'          => ['label' => 'Lokal / DLNA', 'fields' => []],
         ];

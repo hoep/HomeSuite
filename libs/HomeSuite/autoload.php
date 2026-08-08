@@ -78,6 +78,7 @@ $__hs_files = [
     'Engines/SunTimes.php',            // Sonnen-Ereigniszeiten (date_sun_info) fuer verankerte Grenzen
     'Engines/RadioNow.php',            // Radio "was laeuft" (ICY-Titel + Song-Cover, IPSSonos-frei)
     'Engines/MediaProviders.php',      // Registry/Factory der Inhalte-Provider (renderer-unabhaengig)
+    'Media/AudiobookshelfProvider.php', // self-hosted Hoerbuecher (direkte Stream-URLs)
     'ShadingProfiles.php',             // Beschattungs-Profiltypen (Schema) + Profil->Config-Mapper
     'Engines/ShadeKinematics.php',     // Positions-/Lamellen-Kinematik der Beschattung
 
