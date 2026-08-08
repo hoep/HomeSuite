@@ -567,6 +567,8 @@ class IrrigationCircuit extends EntityModule
             case 'stopNow':
                 $this->stopRun();
                 return ['ok' => true];
+            case 'importLegacy':
+                return $this->mgmtImportLegacy($args);
             case 'configureAutomation':
                 return $this->mgmtConfigureAutomation($args);
             case 'computeProbe':
@@ -644,6 +646,38 @@ class IrrigationCircuit extends EntityModule
         $this->syncReferences();
         $this->updateHealth();
         return ['ok' => true, 'config' => $config, 'driverActive' => $this->driver() instanceof IValve];
+    }
+
+    /**
+     * Aus einer LinkTap-Instanz (bzw. beliebigem Aktor-Container) die aktionsfaehigen
+     * Variablen aufloesen und als duration-Bindung uebernehmen. KEINE IPSWatering-Variable.
+     * armed bleibt false (Schatten). Fuer den Bulk-Import der Kreise.
+     */
+    private function mgmtImportLegacy(array $args): array
+    {
+        $lt = (int) ($args['linkTapId'] ?? 0);
+        if ($lt <= 0 || !function_exists('IPS_InstanceExists') || !@\IPS_InstanceExists($lt)) {
+            throw new ContractException('linkTapId (Aktor-Instanz) fehlt/ungueltig');
+        }
+        $start = (int) (@\IPS_GetObjectIDByIdent('StartWateringImmediately', $lt) ?: 0);
+        $stop  = (int) (@\IPS_GetObjectIDByIdent('StopWatering', $lt) ?: 0);
+        $fb    = (int) (@\IPS_GetObjectIDByIdent('WateringActive', $lt) ?: 0);
+        if ($start <= 0) {
+            throw new ContractException('StartWateringImmediately auf #' . $lt . ' nicht gefunden');
+        }
+        $config = [
+            'driver' => 'generic-valve', 'mode' => 'duration',
+            'startVarId' => $start, 'stopVarId' => $stop, 'feedbackVarId' => $fb,
+            'sensorId' => (int) ($args['sensorId'] ?? 0),
+            'maxRuntimeMin' => self::DEF_MAXRUNTIME, 'armed' => false,
+        ];
+        $this->store()->patch('config', $config);
+        $this->driverResolved = false;
+        $this->driverInstance = null;
+        $this->syncReferences();
+        $this->updateHealth();
+        return ['ok' => true, 'linkTapId' => $lt, 'startVarId' => $start, 'stopVarId' => $stop,
+            'feedbackVarId' => $fb, 'driverActive' => $this->driver() instanceof IValve];
     }
 
     private function mgmtDriverProbe(): array
