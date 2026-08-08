@@ -81,6 +81,7 @@ $__hs_files = [
     'Media/AudiobookshelfProvider.php', // self-hosted Hoerbuecher (direkte Stream-URLs)
     'Media/JellyfinProvider.php',      // self-hosted Medienserver (direkte Stream-URLs)
     'Media/PlexProvider.php',          // Plex Media Server (direkte Stream-URLs)
+    'Media/SpotifyProvider.php',       // Spotify Web-API (spotify:-URIs, DRM/renderer-gebunden)
     'ShadingProfiles.php',             // Beschattungs-Profiltypen (Schema) + Profil->Config-Mapper
     'Engines/ShadeKinematics.php',     // Positions-/Lamellen-Kinematik der Beschattung
 

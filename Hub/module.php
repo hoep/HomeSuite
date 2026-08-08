@@ -127,6 +127,7 @@ class HomeSuiteHub extends EntityModule
     {
         $this->ensureToken();
         $this->registerHook(self::HOOK_PATH);
+        $this->registerHook('/hook/hsspotify'); // Spotify-OAuth-Callback (ueber Symcon Connect)
 
         // Falls beim letzten Lauf noch Jobs offen waren -> Timer reaktivieren.
         if (count($this->readQueue()) > 0) {
@@ -192,6 +193,14 @@ class HomeSuiteHub extends EntityModule
         }
         $items[] = ['type' => 'Button', 'caption' => 'Medienquellen speichern',
             'onClick' => 'echo HSH_Manage($id, json_encode(["op"=>"configureSources","args"=>[' . implode(',', $argParts) . ']]));'];
+        // Spotify-OAuth: Redirect-URI anzeigen (in Spotify-App eintragen) + Login-Link erzeugen.
+        $redir = $this->spotifyRedirectUri();
+        $items[] = ['type' => 'Label', 'caption' => '— Spotify verbinden (OAuth) —'];
+        $items[] = ['type' => 'Label', 'caption' => 'Redirect-URI fuer die Spotify-App: '
+            . ($redir !== '' ? $redir : '(Symcon Connect nicht verfuegbar)')];
+        $items[] = ['type' => 'Label', 'caption' => 'Erst Client-ID/Secret oben speichern, dann Login-Link erzeugen, im Browser oeffnen und bei Spotify anmelden.'];
+        $items[] = ['type' => 'Button', 'caption' => 'Spotify-Login-Link erzeugen',
+            'onClick' => 'echo HSH_Manage($id, json_encode(["op"=>"spotifyAuthUrl"]));'];
         $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Medienquellen (Audio-Provider)', 'items' => $items];
 
         $json = json_encode($form, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -286,6 +295,8 @@ class HomeSuiteHub extends EntityModule
             'label' => 'Medienquellen lesen', 'destructive' => false, 'fields' => []]);
         $m->addManagementAction(['op' => 'configureSources', 'verb' => 'configureSources', 'target' => 'hub',
             'label' => 'Medienquellen konfigurieren', 'destructive' => false, 'fields' => []]);
+        $m->addManagementAction(['op' => 'spotifyAuthUrl', 'verb' => 'spotifyAuthUrl', 'target' => 'hub',
+            'label' => 'Spotify-Login-Link erzeugen', 'destructive' => false, 'fields' => []]);
 
         // --- Beschattungs-/Profil-Verwaltung (geteilte benannte Profile, ProfileEngine) ---
         foreach ([
@@ -381,6 +392,9 @@ class HomeSuiteHub extends EntityModule
 
             case 'configureSources':
                 return $this->mgmtConfigureSources($args);
+
+            case 'spotifyAuthUrl':
+                return $this->mgmtSpotifyAuthUrl();
         }
 
         if (strncmp($op, 'profile', 7) === 0) {
@@ -422,6 +436,105 @@ class HomeSuiteHub extends EntityModule
         // Aktive Provider (Diagnose): welche sind jetzt konfiguriert?
         $active = array_keys(\Hoep\HomeSuite\Engines\MediaProviders::build($cur));
         return ['ok' => true, 'sources' => $cur, 'active' => $active];
+    }
+
+    /** Externe HTTPS-Basis ueber Symcon Connect (fuer OAuth-Redirect). '' wenn nicht verfuegbar. */
+    private function connectUrl(): string
+    {
+        if (!function_exists('CC_GetUrl')) {
+            return '';
+        }
+        $cid = 0;
+        foreach (@IPS_GetInstanceList() ?: [] as $iid) {
+            $mi = @IPS_GetInstance($iid)['ModuleInfo']['ModuleName'] ?? '';
+            if ($mi === 'Symcon Connect') {
+                $cid = $iid;
+                break;
+            }
+        }
+        try {
+            $u = (string) @CC_GetUrl($cid ?: 0);
+        } catch (\Throwable $e) {
+            $u = '';
+        }
+        return rtrim($u, '/');
+    }
+
+    /** Redirect-URI fuer Spotify (Connect-URL + fester Hook). */
+    private function spotifyRedirectUri(): string
+    {
+        $base = $this->connectUrl();
+        return $base === '' ? '' : ($base . '/hook/hsspotify');
+    }
+
+    /** Spotify Authorize-URL erzeugen (fuer den Connect-Button). */
+    private function mgmtSpotifyAuthUrl(): array
+    {
+        $sp = (array) ($this->sourcesConfig()['spotify'] ?? []);
+        $cid = (string) ($sp['clientId'] ?? '');
+        $redirect = $this->spotifyRedirectUri();
+        if ($cid === '') {
+            return ['ok' => false, 'error' => 'clientId fehlt (im Formular eintragen + speichern)'];
+        }
+        if ($redirect === '') {
+            return ['ok' => false, 'error' => 'Connect-URL nicht verfuegbar'];
+        }
+        $url = 'https://accounts.spotify.com/authorize?' . http_build_query([
+            'client_id'     => $cid,
+            'response_type' => 'code',
+            'redirect_uri'  => $redirect,
+            'scope'         => 'playlist-read-private playlist-read-collaborative user-library-read',
+            'state'         => 'homesuite',
+        ]);
+        return ['ok' => true, 'authUrl' => $url, 'redirectUri' => $redirect];
+    }
+
+    /** Spotify-OAuth-Callback: code -> refresh_token, im Store ablegen. Liefert HTML. */
+    private function handleSpotifyCallback(): void
+    {
+        header('Content-Type: text/html; charset=utf-8');
+        $code = (string) ($_GET['code'] ?? '');
+        $err  = (string) ($_GET['error'] ?? '');
+        $sp   = (array) ($this->sourcesConfig()['spotify'] ?? []);
+        if ($err !== '') {
+            echo $this->spotifyHtml('Spotify meldet einen Fehler: ' . htmlspecialchars($err));
+            return;
+        }
+        if ($code === '' || ($sp['clientId'] ?? '') === '' || ($sp['clientSecret'] ?? '') === '') {
+            echo $this->spotifyHtml('Kein Code oder Client-ID/Secret fehlt.');
+            return;
+        }
+        $redirect = $this->spotifyRedirectUri();
+        $body = http_build_query(['grant_type' => 'authorization_code', 'code' => $code, 'redirect_uri' => $redirect]);
+        $auth = 'Basic ' . base64_encode(((string) $sp['clientId']) . ':' . ((string) $sp['clientSecret']));
+        $resp = '';
+        if (function_exists('curl_init')) {
+            $ch = curl_init('https://accounts.spotify.com/api/token');
+            curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 10, CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => $body, CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded', 'Authorization: ' . $auth]]);
+            $resp = (string) curl_exec($ch);
+            curl_close($ch);
+        }
+        $j = json_decode($resp, true);
+        $refresh = (string) ($j['refresh_token'] ?? '');
+        if ($refresh === '') {
+            echo $this->spotifyHtml('Token-Tausch fehlgeschlagen. ' . htmlspecialchars((string) ($j['error_description'] ?? '')));
+            return;
+        }
+        $cur = $this->sourcesConfig();
+        $cur['spotify']['refreshToken'] = $refresh;
+        $cur['spotify']['enabled'] = true;
+        $this->store()->set('sources', $cur);
+        echo $this->spotifyHtml('Spotify erfolgreich verbunden! Du kannst dieses Fenster schliessen.');
+    }
+
+    private function spotifyHtml(string $msg): string
+    {
+        return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            . '<title>HomeSuite · Spotify</title></head><body style="font-family:system-ui;background:#141c1f;color:#e7eef0;'
+            . 'display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center">'
+            . '<div><div style="font-size:34px;margin-bottom:12px">&#127925;</div><div style="font-size:16px;max-width:420px;padding:0 20px">'
+            . htmlspecialchars($msg, ENT_QUOTES) . '</div></div></body></html>';
     }
 
     /**
@@ -858,6 +971,13 @@ class HomeSuiteHub extends EntityModule
      */
     protected function ProcessHookData()
     {
+        // Spotify-OAuth-Callback (eigener Hook /hook/hsspotify) — VOR jeder Token-Pruefung,
+        // da der Redirect von Spotify kommt (kein Header-Token). Liefert HTML zurueck.
+        if (strpos((string) ($_SERVER['REQUEST_URI'] ?? ''), 'hsspotify') !== false) {
+            $this->handleSpotifyCallback();
+            return;
+        }
+
         header('Content-Type: application/json; charset=utf-8');
 
         $api = strtolower((string) ($_GET['api'] ?? 'suite'));
