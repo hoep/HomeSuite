@@ -464,41 +464,25 @@ class IrrigationCircuit extends EntityModule
         if (!(bool) $this->valOf('Automatic', 0)) {
             return;
         }
-        $rt = $this->readRt();
-        if (!empty($rt['running'])) {
-            return; // max. ein Lauf gleichzeitig
-        }
         $now  = time();
         $prog = (int) $this->valOf('Program', 0);
-        if (!$this->programDue($prog, $now)) {
-            return;
-        }
-        $wd    = (int) date('N', $now) - 1;                 // 0=Mo .. 6=So
-        $slots = array_values($this->schedGet('Standard', $wd));
-        if (empty($slots)) {
-            return;
-        }
-        $today  = date('Y-m-d', $now);
-        $minNow = ((int) date('G', $now)) * 60 + (int) date('i', $now);
-        $ran    = (($rt['ranDate'] ?? '') === $today && is_array($rt['ranSlots'] ?? null)) ? $rt['ranSlots'] : [];
-        foreach ($slots as $i => $s) {
-            $start = (int) ($s['end'] ?? 0);   // Konvention: end = Startminute
-            $dur   = (int) ($s['val'] ?? 0);   // val = Dauer (Min)
-            if ($dur <= 0 || $minNow < $start || $minNow > $start + 60) {
-                continue; // nicht faellig oder Fenster (60 min) verpasst
-            }
-            if (in_array($i, $ran, true)) {
-                continue; // heute schon gelaufen
-            }
-            $this->startRun($dur * 60, false); // geplant -> Gates aktiv
-            $ran[] = $i;
+        // NORMALER An/Aus-Zeitplan (value-until-end via ScheduleEngine, Sonnen-Anker generisch
+        // ueber scheduleValueAt). FLANKE 0->an startet einen Lauf ueber die effektive Dauer
+        // (Basis x Temp x ET0), an->0 stoppt. So genuegt ein normaler Zeitplan (viele Schaltpunkte).
+        $val   = $this->programDue($prog, $now) ? $this->scheduleValueAt($now, 'Standard') : 0;
+        $onNow = is_numeric($val) && (float) $val > 0;
+        $rt    = $this->readRt();
+        $prev  = !empty($rt['schedOn']);
+        if ($onNow && !$prev) {
+            $this->startRun($this->effectiveSeconds(), false); // geplant -> Gates aktiv
             $rt = $this->readRt();
-            $rt['ranDate']     = $today;
-            $rt['ranSlots']    = $ran;
-            $rt['lastRunDate'] = $today; // Anker fuer "jeden n-ten Tag"
-            $this->writeRt($rt);
-            break; // ein Fenster pro Refresh-Tick
+            $rt['lastRunDate'] = date('Y-m-d', $now); // Anker fuer "jeden n-ten Tag"
+        } elseif (!$onNow && $prev && !empty($rt['running'])) {
+            $this->stopRun();
+            $rt = $this->readRt();
         }
+        $rt['schedOn'] = $onNow;
+        $this->writeRt($rt);
     }
 
     /** Bewaessert das Programm heute? (0 Manuell / 1 taegl. / 2-4 jeden n-ten Tag / 5 Mo-Mi-Fr / 6 Mo-Do) */
@@ -739,20 +723,27 @@ class IrrigationCircuit extends EntityModule
         if ($day < 0 || $day > 6) {
             throw new ContractException('day muss 0..6 sein');
         }
+        // Normaler An/Aus-Zeitplan (value-until-end): end = Grenze (HH:MM), val = 0 (aus) / >0 (an,
+        // z. B. 100). Sonnen-Anker (anchor/offset) generisch unterstuetzt. Ueber die ScheduleEngine.
         $slots = (isset($args['slots']) && is_array($args['slots'])) ? $args['slots'] : [];
         $clean = [];
         foreach ($slots as $s) {
             if (!is_array($s) || !isset($s['end'])) {
-                continue; // end = Startminute, val = Dauer(Min)
+                continue;
             }
-            $clean[] = ['end' => max(0, min(1440, (int) $s['end'])),
-                        'val' => max(1, min(self::DUR_MAX, (int) round((float) ($s['val'] ?? 0))))];
+            $entry = ['end' => max(1, min(1440, (int) $s['end'])),
+                      'val' => max(0, min(100, (int) round((float) ($s['val'] ?? 0))))];
+            if (isset($s['anchor']) && $s['anchor'] !== '' && $s['anchor'] !== null) {
+                $entry['anchor'] = (string) $s['anchor'];
+                $entry['offset'] = (int) ($s['offset'] ?? 0);
+            }
+            $clean[] = $entry;
         }
         if (!empty($ctx['dryrun'])) {
             return ['ok' => true, 'dryrun' => true, 'variant' => $variant, 'day' => $day, 'slots' => $clean];
         }
-        $this->schedSet($variant, $day, $clean);
-        return ['ok' => true, 'variant' => $variant, 'day' => $day, 'slots' => $this->schedGet($variant, $day)];
+        $this->schedules()->setSlots($variant, $day, $clean);
+        return ['ok' => true, 'variant' => $variant, 'day' => $day, 'slots' => $this->schedules()->getSlots($variant, $day)];
     }
 
     private function mgmtGetSchedule(array $args): array
@@ -760,9 +751,11 @@ class IrrigationCircuit extends EntityModule
         $variant = (string) ($args['variant'] ?? 'Standard');
         $week = [];
         for ($d = 0; $d < 7; $d++) {
-            $week[$d] = $this->schedGet($variant, $d);
+            $week[$d] = $this->schedules()->getSlots($variant, $d);
         }
-        return ['ok' => true, 'variant' => $variant, 'week' => $week];
+        return ['ok' => true, 'variant' => $variant, 'week' => $week, 'activeVariant' => 'Standard',
+            'variants' => $this->scheduleVariants(), 'sunEvents' => $this->sunEvents(time()),
+            'anchors' => array_keys(\Hoep\HomeSuite\SunTimes::ANCHORS)];
     }
 
     // ==================================================================
