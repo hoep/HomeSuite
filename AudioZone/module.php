@@ -54,8 +54,8 @@ class AudioZone extends EntityModule
     private const REFRESH_MS = 5000;
     private const RAMP_MS = 4000;
 
-    private ?IDriver $driverInstance = null;
-    private bool $driverResolved = false;
+    protected ?IDriver $driverInstance = null;
+    protected bool $driverResolved = false;
 
     // ==================================================================
     // Manifest (Vertrag 2)
@@ -273,7 +273,7 @@ class AudioZone extends EntityModule
      *   mode 'script'   : Ein-/Aus-Skript (z. B. Relais-Skript)
      *   mode 'playstop' : Play (ein) / Stop (aus) ueber den Treiber (Default)
      */
-    private function applyPower(bool $on, IAudioRenderer $drv): void
+    protected function applyPower(bool $on, IAudioRenderer $drv): void
     {
         $p = (array) ($this->cfg()['power'] ?? []);
         $mode = (string) ($p['mode'] ?? 'playstop');
@@ -413,7 +413,7 @@ class AudioZone extends EntityModule
      * FLANKE 0->an: Power on -> Volume (ggf. Ramp/Ruhezeit-Cap) -> playSource.
      * an->0: stop (+ optional Power off). Rein HomeSuite (play/stop), kein Geraete-Alarm.
      */
-    private function runSchedule(): void
+    protected function runSchedule(): void
     {
         if (!$this->automationEnabled()) {
             return;
@@ -943,13 +943,13 @@ class AudioZone extends EntityModule
     // Helfer
     // ==================================================================
 
-    private function cfg(): array
+    protected function cfg(): array
     {
         $c = $this->store()->get('config', []);
         return is_array($c) ? $c : [];
     }
 
-    private function cfgVal(string $key, $def)
+    protected function cfgVal(string $key, $def)
     {
         $c = $this->cfg();
         return array_key_exists($key, $c) ? $c[$key] : $def;

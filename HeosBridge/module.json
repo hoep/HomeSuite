@@ -1,0 +1,12 @@
+{
+    "id": "{BCDCA10C-BDFD-4270-8D28-1CC690A130DB}",
+    "name": "HeosBridge",
+    "type": 2,
+    "vendor": "Hoep",
+    "aliases": ["HeosBridge", "HSBH", "HomeSuite HEOS Bridge"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSBH",
+    "parentRequirements": ["{79827379-F36E-4ADA-8A95-5F8313DAE8DB}"],
+    "childRequirements": [],
+    "implemented": ["{D7E6F5C4-B3A2-4190-8E7D-6C5B4A392817}"]
+}
