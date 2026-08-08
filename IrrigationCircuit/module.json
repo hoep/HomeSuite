@@ -1,0 +1,12 @@
+{
+    "id": "{D264A82B-DE31-45CC-8AF2-8F4C5D076508}",
+    "name": "IrrigationCircuit",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["IrrigationCircuit", "HSIR", "HomeSuite Bewaesserung"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSIR",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}

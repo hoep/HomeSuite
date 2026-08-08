@@ -5,21 +5,34 @@ declare(strict_types=1);
 namespace Hoep\HomeSuite\HAL;
 
 /**
- * GenericVariableValve — generischer, VENDOR-FREIER Ventil-/Relais-Treiber.
+ * GenericVariableValve — generischer, VENDOR-FREIER Ventil-/Bewaesserungs-Treiber.
  *
- * Bindet an eine Schalt-Variable (idealerweise mit EnableAction) und optional an
- * eine Durchfluss-Variable -> beliebiges Relais/Ventil ohne Vendor-Code.
+ * UNIVERSELL (Nutzer-Vorgabe): deckt beliebige Aktoren ab, LinkTap ist nur ein Fall.
+ * Drei Modi, je Kreis frei waehlbar — IMMER Variable ODER Skript bindbar:
  *
- * Konfiguration (cfg / bind):
- *   switchVarId  int   Schalt-Variable (bool; true=offen)
- *   flowVarId    int?  Durchfluss-Variable (l/min)
- *   invert       bool? falls true=zu
+ *   mode='switch'   : bool-Schalt-Variable (switchVarId; true=offen). Das MODUL timt
+ *                     die Dauer (open + Timer -> close). Relais/Homematic/Shelly.
+ *   mode='duration' : Dauer-Variable (startVarId, Sekunden) — das GERAET timt selbst
+ *                     (z. B. LinkTap StartWateringImmediately). Stop via stopVarId
+ *                     (bool) oder startVarId=0. Ist-Zustand aus feedbackVarId.
+ *   mode='script'   : Start-/Stop-Skript (onScriptId/offScriptId). Optional Dauer in
+ *                     durationVarId schreiben, bevor das Start-Skript laeuft.
  *
- * pulse() ist bewusst NICHT-blockierend umgesetzt: der Treiber oeffnet nur und
- * ueberlaesst das getimte Schliessen der Run-Queue/dem Timer des Moduls
- * (Blocker J — kein blockierendes sleep()/Semaphor im Treiber). Als Fallback
- * plant er, sofern verfuegbar, einen einmaligen Kernel-Timer per IPS_RunScriptTimer
- * NICHT selbst — die maximale Laufzeit erzwingt die Domaene.
+ * bind()-config:
+ *   mode          string  'switch'|'duration'|'script' (Default 'switch')
+ *   switchVarId   int     Schalt-Variable (mode switch)
+ *   startVarId    int     Dauer-/Start-Variable in Sekunden (mode duration)
+ *   stopVarId     int     Stop-Variable (mode duration/optional)
+ *   feedbackVarId int     Ist-Zustand (bool; z. B. WateringActive)
+ *   flowVarId     int?    Durchfluss (l/min)
+ *   onScriptId/offScriptId int  (mode script)
+ *   durationVarId int?    Dauer-Ablage fuer das Start-Skript (mode script)
+ *   invert        bool?   Schalt-Logik invertieren
+ *   stopValue     mixed?  Wert fuer stopVarId (Default true)
+ *
+ * pulse() ist NICHT-blockierend (Blocker J): mode 'duration'/'script' uebergeben die
+ * Dauer an Geraet/Skript (self-timing); mode 'switch' oeffnet nur — das getimte
+ * Schliessen macht der Modul-Timer. Kein sleep()/Semaphor im Treiber.
  */
 final class GenericVariableValve implements IValve
 {
@@ -39,11 +52,20 @@ final class GenericVariableValve implements IValve
         $this->send = $send;
     }
 
+    private function mode(): string
+    {
+        $m = (string) ($this->cfg['mode'] ?? 'switch');
+        return in_array($m, ['switch', 'duration', 'script'], true) ? $m : 'switch';
+    }
+
     public function capabilities(): array
     {
+        $m = $this->mode();
         return [
-            'hasFlow' => ((int) ($this->cfg['flowVarId'] ?? 0)) > 0,
-            'pulse'   => true,
+            'mode'       => $m,
+            'selfTiming' => ($m === 'duration' || $m === 'script'), // Geraet/Skript timt selbst
+            'hasFlow'    => ((int) ($this->cfg['flowVarId'] ?? 0)) > 0,
+            'pulse'      => true,
         ];
     }
 
@@ -62,23 +84,49 @@ final class GenericVariableValve implements IValve
         return null;
     }
 
+    /** Oeffnen. mode switch: bool an. mode script: Start-Skript. mode duration: nur mit Dauer (pulse). */
     public function open(): bool
     {
-        return $this->writeSwitch(true);
+        switch ($this->mode()) {
+            case 'switch':
+                return $this->writeSwitch(true);
+            case 'script':
+                return $this->runScript((int) ($this->cfg['onScriptId'] ?? 0));
+            case 'duration':
+                $this->log('open() im duration-Modus ohne Dauer — nutze pulse(sekunden)');
+                return false;
+        }
+        return false;
     }
 
     public function close(): bool
     {
-        return $this->writeSwitch(false);
+        switch ($this->mode()) {
+            case 'switch':
+                return $this->writeSwitch(false);
+            case 'script':
+                return $this->runScript((int) ($this->cfg['offScriptId'] ?? 0));
+            case 'duration':
+                $stop = (int) ($this->cfg['stopVarId'] ?? 0);
+                if ($stop > 0) {
+                    return $this->writeVar($stop, $this->cfg['stopValue'] ?? true);
+                }
+                $start = (int) ($this->cfg['startVarId'] ?? 0);
+                return $start > 0 ? $this->writeVar($start, 0) : false;
+        }
+        return false;
     }
 
     public function isOpen(): ?bool
     {
-        $vid = (int) ($this->cfg['switchVarId'] ?? 0);
-        if ($vid <= 0 || !function_exists('GetValue')) {
+        $fb = (int) ($this->cfg['feedbackVarId'] ?? 0);
+        if ($fb <= 0 && $this->mode() === 'switch') {
+            $fb = (int) ($this->cfg['switchVarId'] ?? 0);
+        }
+        if ($fb <= 0 || !function_exists('GetValue')) {
             return null;
         }
-        $val = @\GetValue($vid);
+        $val = @\GetValue($fb);
         if (!is_bool($val) && !is_numeric($val)) {
             return null;
         }
@@ -87,17 +135,34 @@ final class GenericVariableValve implements IValve
     }
 
     /**
-     * Oeffnet das Ventil. Das getimte Schliessen nach $seconds ist NICHT Sache des
-     * Treibers (non-blocking, Blocker J) — die Domaenen-Run-Queue schliesst wieder.
-     * $seconds wird nur zur Nachvollziehbarkeit protokolliert.
+     * Zeitlich begrenzter Puls ($seconds). mode duration: Sekunden ans Geraet (self-timing).
+     * mode script: Dauer optional in durationVarId, dann Start-Skript. mode switch: nur oeffnen
+     * (Schliessen macht der Modul-Timer).
      */
     public function pulse(int $seconds): bool
     {
         if ($seconds <= 0) {
             return false;
         }
-        $this->log('pulse: open fuer ' . $seconds . 's (Schliessen uebernimmt die Run-Queue)');
-        return $this->open();
+        switch ($this->mode()) {
+            case 'duration':
+                $start = (int) ($this->cfg['startVarId'] ?? 0);
+                if ($start <= 0) {
+                    $this->log('pulse: keine startVarId (duration-Modus)');
+                    return false;
+                }
+                return $this->writeVar($start, $seconds);
+            case 'script':
+                $dv = (int) ($this->cfg['durationVarId'] ?? 0);
+                if ($dv > 0) {
+                    $this->writeVar($dv, $seconds);
+                }
+                return $this->runScript((int) ($this->cfg['onScriptId'] ?? 0));
+            case 'switch':
+            default:
+                $this->log('pulse: open fuer ' . $seconds . 's (Schliessen uebernimmt der Modul-Timer)');
+                return $this->writeSwitch(true);
+        }
     }
 
     public function flow(): ?float
@@ -120,6 +185,15 @@ final class GenericVariableValve implements IValve
             return false;
         }
         $value = (bool) ($this->cfg['invert'] ?? false) ? !$open : $open;
+        return $this->writeVar($vid, $value);
+    }
+
+    /** Schreibt einen Wert per RequestAction (falls actionable), sonst SetValue. */
+    private function writeVar(int $vid, $value): bool
+    {
+        if ($vid <= 0) {
+            return false;
+        }
         try {
             if ($this->isActionable($vid) && function_exists('RequestAction')) {
                 @\RequestAction($vid, $value);
@@ -130,10 +204,25 @@ final class GenericVariableValve implements IValve
                 return true;
             }
         } catch (\Throwable $e) {
-            $this->log('writeSwitch #' . $vid . ': ' . $e->getMessage());
+            $this->log('writeVar #' . $vid . ': ' . $e->getMessage());
             return false;
         }
         return false;
+    }
+
+    private function runScript(int $sid): bool
+    {
+        if ($sid <= 0 || !function_exists('IPS_RunScript') || !@\IPS_ScriptExists($sid)) {
+            $this->log('runScript: Skript #' . $sid . ' fehlt');
+            return false;
+        }
+        try {
+            @\IPS_RunScript($sid);
+            return true;
+        } catch (\Throwable $e) {
+            $this->log('runScript #' . $sid . ': ' . $e->getMessage());
+            return false;
+        }
     }
 
     private function isActionable(int $vid): bool
