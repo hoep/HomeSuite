@@ -64,6 +64,7 @@ $__hs_files = [
     // --- Audio-Treiber (generisch variablen-/skriptgebunden + native Vendor-Codecs) ---
     'Drivers/Audio/GenericBoundAudioRenderer.php',
     'Drivers/Audio/SonosUpnp.php',     // nativer Sonos-Codec (self-registriert 'sonos-upnp')
+    'Drivers/Audio/Heos.php',          // Denon/Marantz HEOS-Codec (self-registriert 'heos')
 
     // --- Vendor-Treiber (self-registrieren bei der DriverFactory) ---
     'Drivers/HomeMaticThermostat.php',
