@@ -25,6 +25,7 @@ final class DriverFactory
         'generic-thermostat' => GenericVariableThermostat::class,
         'generic-shutter'    => GenericVariableShutter::class,
         'generic-valve'      => GenericVariableValve::class,
+        'generic-audio'      => GenericBoundAudioRenderer::class,
     ];
 
     private function __construct()
