@@ -464,6 +464,81 @@ class IrrigationCircuit extends EntityModule
                 $this->stopRun();
             }
         }
+        $this->runSchedule();
+    }
+
+    /**
+     * Automatik-Zeitplan: startet faellige Fenster des heutigen Tages, sofern Automatik an,
+     * das Programm heute bewaessert und kein Lauf aktiv ist. Mehrere Fenster/Tag; je Fenster
+     * genau ein Start pro Tag. Gates greifen (nicht force).
+     */
+    private function runSchedule(): void
+    {
+        if (!(bool) $this->valOf('Automatic', 0)) {
+            return;
+        }
+        $rt = $this->readRt();
+        if (!empty($rt['running'])) {
+            return; // max. ein Lauf gleichzeitig
+        }
+        $now  = time();
+        $prog = (int) $this->valOf('Program', 0);
+        if (!$this->programDue($prog, $now)) {
+            return;
+        }
+        $wd    = (int) date('N', $now) - 1;                 // 0=Mo .. 6=So
+        $slots = array_values($this->schedGet('Standard', $wd));
+        if (empty($slots)) {
+            return;
+        }
+        $today  = date('Y-m-d', $now);
+        $minNow = ((int) date('G', $now)) * 60 + (int) date('i', $now);
+        $ran    = (($rt['ranDate'] ?? '') === $today && is_array($rt['ranSlots'] ?? null)) ? $rt['ranSlots'] : [];
+        foreach ($slots as $i => $s) {
+            $start = (int) ($s['end'] ?? 0);   // Konvention: end = Startminute
+            $dur   = (int) ($s['val'] ?? 0);   // val = Dauer (Min)
+            if ($dur <= 0 || $minNow < $start || $minNow > $start + 60) {
+                continue; // nicht faellig oder Fenster (60 min) verpasst
+            }
+            if (in_array($i, $ran, true)) {
+                continue; // heute schon gelaufen
+            }
+            $this->startRun($dur * 60, false); // geplant -> Gates aktiv
+            $ran[] = $i;
+            $rt = $this->readRt();
+            $rt['ranDate']     = $today;
+            $rt['ranSlots']    = $ran;
+            $rt['lastRunDate'] = $today; // Anker fuer "jeden n-ten Tag"
+            $this->writeRt($rt);
+            break; // ein Fenster pro Refresh-Tick
+        }
+    }
+
+    /** Bewaessert das Programm heute? (0 Manuell / 1 taegl. / 2-4 jeden n-ten Tag / 5 Mo-Mi-Fr / 6 Mo-Do) */
+    private function programDue(int $prog, int $ts): bool
+    {
+        if ($prog === 0) {
+            return false;
+        }
+        if ($prog === 1) {
+            return true;
+        }
+        if ($prog >= 2 && $prog <= 4) {
+            $last = (string) ($this->readRt()['lastRunDate'] ?? '');
+            if ($last === '') {
+                return true;
+            }
+            $days = (int) floor((strtotime(date('Y-m-d', $ts)) - strtotime($last)) / 86400);
+            return $days >= $prog;
+        }
+        $wd = (int) date('N', $ts); // 1=Mo .. 7=So
+        if ($prog === 5) {
+            return in_array($wd, [1, 3, 5], true);
+        }
+        if ($prog === 6) {
+            return in_array($wd, [1, 4], true);
+        }
+        return false;
     }
 
     // ==================================================================
@@ -655,8 +730,8 @@ class IrrigationCircuit extends EntityModule
         if (!empty($ctx['dryrun'])) {
             return ['ok' => true, 'dryrun' => true, 'variant' => $variant, 'day' => $day, 'slots' => $clean];
         }
-        $this->schedules()->setSlots($variant, $day, $clean);
-        return ['ok' => true, 'variant' => $variant, 'day' => $day, 'slots' => $this->schedules()->getSlots($variant, $day)];
+        $this->schedSet($variant, $day, $clean);
+        return ['ok' => true, 'variant' => $variant, 'day' => $day, 'slots' => $this->schedGet($variant, $day)];
     }
 
     private function mgmtGetSchedule(array $args): array
@@ -664,7 +739,7 @@ class IrrigationCircuit extends EntityModule
         $variant = (string) ($args['variant'] ?? 'Standard');
         $week = [];
         for ($d = 0; $d < 7; $d++) {
-            $week[$d] = $this->schedules()->getSlots($variant, $d);
+            $week[$d] = $this->schedGet($variant, $d);
         }
         return ['ok' => true, 'variant' => $variant, 'week' => $week];
     }
@@ -852,6 +927,29 @@ class IrrigationCircuit extends EntityModule
         return is_array($c) ? $c : [];
     }
 
+    /**
+     * Eigene Zeitplan-Ablage (Konvention end=Startminute, val=Dauer(Min); mehrere/Tag).
+     * BEWUSST NICHT ueber ScheduleEngine (die erzwingt value-until-end + letzter Slot=1440).
+     */
+    private function schedGet(string $variant, int $day): array
+    {
+        $sc = $this->store()->get('irriSchedule', []);
+        $sc = is_array($sc) ? $sc : [];
+        $d  = $sc[$variant][$day] ?? [];
+        return is_array($d) ? $d : [];
+    }
+
+    private function schedSet(string $variant, int $day, array $slots): void
+    {
+        $sc = $this->store()->get('irriSchedule', []);
+        $sc = is_array($sc) ? $sc : [];
+        if (!isset($sc[$variant]) || !is_array($sc[$variant])) {
+            $sc[$variant] = [];
+        }
+        $sc[$variant][(string) $day] = array_values($slots);
+        $this->store()->set('irriSchedule', $sc);
+    }
+
     private function cfgVal(string $key, $def)
     {
         $c = $this->cfg();
@@ -870,7 +968,7 @@ class IrrigationCircuit extends EntityModule
             $id = @$this->GetIDForIdent($ident);
             if (is_int($id) && $id > 0) {
                 $v = @GetValue($id);
-                if (is_numeric($v)) {
+                if (is_bool($v) || is_numeric($v)) {
                     return $v;
                 }
             }
