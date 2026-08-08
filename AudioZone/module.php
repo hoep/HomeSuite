@@ -49,7 +49,10 @@ class AudioZone extends EntityModule
     private const TR_PREV = 5;
 
     private const TIMER_REFRESH = 'Refresh';
+    private const TIMER_SLEEP = 'Sleep';       // Ein-Schuss: Sleep-Timer -> stop
+    private const TIMER_RAMP = 'Ramp';         // sanftes Wecken: Volume schrittweise
     private const REFRESH_MS = 5000;
+    private const RAMP_MS = 4000;
 
     private ?IDriver $driverInstance = null;
     private bool $driverResolved = false;
@@ -155,6 +158,10 @@ class AudioZone extends EntityModule
                 ['op' => 'playSource',      'label' => 'Quelle abspielen'],
                 ['op' => 'updateProfile',   'label' => 'Wochenplan bearbeiten'],
                 ['op' => 'getSchedule',     'label' => 'Wochenplan lesen'],
+                ['op' => 'configureSchedule', 'label' => 'Zeitplan-Optionen (Quelle/Volume/Ramp/Ruhezeit)'],
+                ['op' => 'setSleep',        'label' => 'Sleep-Timer setzen'],
+                ['op' => 'cancelSleep',     'label' => 'Sleep-Timer abbrechen'],
+                ['op' => 'computeProbe',    'label' => 'Zeitplan/Regel-Vorschau (Trockenlauf)'],
             ],
 
             'capabilities' => [
@@ -180,6 +187,8 @@ class AudioZone extends EntityModule
     protected function setupTimers(): void
     {
         $this->RegisterTimer(self::TIMER_REFRESH, 0, 'HSAU_Refresh($_IPS[\'TARGET\']);');
+        $this->RegisterTimer(self::TIMER_SLEEP, 0, 'HSAU_RunSleep($_IPS[\'TARGET\']);');
+        $this->RegisterTimer(self::TIMER_RAMP, 0, 'HSAU_RunRamp($_IPS[\'TARGET\']);');
     }
 
     public function ApplyChanges()
@@ -361,6 +370,194 @@ class AudioZone extends EntityModule
         $g = $drv->readGroup();
         $this->setReflect('GroupRole', (string) ($g['role'] ?? 'standalone'));
         $this->setReflect('GroupCoordinator', (string) ($g['coordinatorUid'] ?? ''));
+
+        $this->runSchedule();
+    }
+
+    // ==================================================================
+    // Zeitregeln (rein HomeSuite ueber ScheduleEngine, gesteuert per play/stop)
+    // ==================================================================
+
+    private function scheduleCfg(): array
+    {
+        $c = $this->cfg();
+        $s = (isset($c['schedule']) && is_array($c['schedule'])) ? $c['schedule'] : [];
+        return [
+            'enabled'      => (bool) ($s['enabled'] ?? false),
+            'sourceKind'   => (string) ($s['sourceKind'] ?? 'favorite'), // favorite|station|playlist
+            'sourceId'     => (string) ($s['sourceId'] ?? ''),           // leer -> Slot-val als Index
+            'volume'       => (int) ($s['volume'] ?? 25),
+            'rampMin'      => (int) ($s['rampMin'] ?? 0),                 // 0 = sofort
+            'powerOffEnd'  => (bool) ($s['powerOffEnd'] ?? true),
+            'quietFrom'    => (int) ($s['quietFrom'] ?? -1),             // Minuten seit Mitternacht (-1 aus)
+            'quietTo'      => (int) ($s['quietTo'] ?? -1),
+            'quietCapVol'  => (int) ($s['quietCapVol'] ?? 15),
+        ];
+    }
+
+    /** Volume-Deckel in der Ruhezeit (Nachtabsenkung). PURE-ish (nutzt Uhrzeit). */
+    private function ruleVolumeCap(array $sc, int $vol, ?int $nowMin = null): int
+    {
+        $from = (int) $sc['quietFrom'];
+        $to   = (int) $sc['quietTo'];
+        if ($from < 0 || $to < 0) {
+            return $vol;
+        }
+        $m = $nowMin ?? ((int) date('G') * 60 + (int) date('i'));
+        $inQuiet = ($from <= $to) ? ($m >= $from && $m < $to) : ($m >= $from || $m < $to); // ueber Mitternacht
+        return $inQuiet ? min($vol, (int) $sc['quietCapVol']) : $vol;
+    }
+
+    /**
+     * Automatik-Zeitplan (value-until-end via ScheduleEngine, Sonnen-Anker generisch).
+     * FLANKE 0->an: Power on -> Volume (ggf. Ramp/Ruhezeit-Cap) -> playSource.
+     * an->0: stop (+ optional Power off). Rein HomeSuite (play/stop), kein Geraete-Alarm.
+     */
+    private function runSchedule(): void
+    {
+        if (!$this->automationEnabled()) {
+            return;
+        }
+        $sc = $this->scheduleCfg();
+        if (!$sc['enabled']) {
+            return;
+        }
+        $now  = time();
+        $val  = $this->scheduleValueAt($now, 'Standard');
+        $onNow = is_numeric($val) && (float) $val > 0;
+        $rt   = $this->readRt();
+        $prev = !empty($rt['schedOn']);
+        if ($onNow && !$prev) {
+            $this->scheduleStart((int) $val, $sc);
+        } elseif (!$onNow && $prev) {
+            $this->scheduleStop($sc);
+        }
+        $rt = $this->readRt();
+        $rt['schedOn'] = $onNow;
+        $this->writeRt($rt);
+    }
+
+    private function scheduleStart(int $slotVal, array $sc): void
+    {
+        $drv = $this->driver();
+        $target = $this->ruleVolumeCap($sc, max(0, min(100, (int) $sc['volume'])));
+        $kind = $sc['sourceKind'];
+        $sid  = ($sc['sourceId'] !== '') ? $sc['sourceId'] : (string) $slotVal;
+
+        if (!$drv instanceof IAudioRenderer || !(bool) $this->cfgVal('armed', false)) {
+            $this->SendDebug('HSAU.sched', 'Schatten: WUERDE starten (' . $kind . ' #' . $sid . ', vol ' . $target . ')', 0);
+            return;
+        }
+        $this->applyPower(true, $drv);
+        $drv->playSource(new AudioSourceRef($kind, $sid));
+        if ((int) $sc['rampMin'] > 0) {
+            $this->startRamp($target, (int) $sc['rampMin']);
+        } else {
+            $drv->setVolume($target);
+        }
+    }
+
+    private function scheduleStop(array $sc): void
+    {
+        $this->SetTimerInterval(self::TIMER_RAMP, 0);
+        $drv = $this->driver();
+        if (!$drv instanceof IAudioRenderer || !(bool) $this->cfgVal('armed', false)) {
+            $this->SendDebug('HSAU.sched', 'Schatten: WUERDE stoppen', 0);
+            return;
+        }
+        $drv->stop();
+        if ($sc['powerOffEnd']) {
+            $this->applyPower(false, $drv);
+        }
+    }
+
+    /** Sanftes Wecken: Volume in Schritten bis Ziel ueber rampMin Minuten. */
+    private function startRamp(int $target, int $rampMin): void
+    {
+        $steps = max(1, (int) round($rampMin * 60000 / self::RAMP_MS));
+        $rt = $this->readRt();
+        $rt['ramp'] = ['target' => $target, 'cur' => 0, 'step' => max(1, (int) ceil($target / $steps))];
+        $this->writeRt($rt);
+        $drv = $this->driver();
+        if ($drv instanceof IAudioRenderer) {
+            $drv->setVolume(0);
+        }
+        $this->SetTimerInterval(self::TIMER_RAMP, self::RAMP_MS);
+    }
+
+    public function RunRamp(): void
+    {
+        $rt = $this->readRt();
+        $r = $rt['ramp'] ?? null;
+        $drv = $this->driver();
+        if (!is_array($r) || !$drv instanceof IAudioRenderer) {
+            $this->SetTimerInterval(self::TIMER_RAMP, 0);
+            return;
+        }
+        $cur = min((int) $r['target'], (int) $r['cur'] + (int) $r['step']);
+        if ((bool) $this->cfgVal('armed', false)) {
+            $drv->setVolume($cur);
+        }
+        if ($cur >= (int) $r['target']) {
+            $this->SetTimerInterval(self::TIMER_RAMP, 0);
+            unset($rt['ramp']);
+        } else {
+            $rt['ramp']['cur'] = $cur;
+        }
+        $this->writeRt($rt);
+    }
+
+    private function mgmtConfigureSchedule(array $args): array
+    {
+        $s = (array) ($this->cfg()['schedule'] ?? []);
+        foreach (['enabled', 'sourceKind', 'sourceId', 'volume', 'rampMin', 'powerOffEnd', 'quietFrom', 'quietTo', 'quietCapVol'] as $k) {
+            if (array_key_exists($k, $args)) {
+                $s[$k] = $args[$k];
+            }
+        }
+        $this->store()->patch('config', ['schedule' => $s]);
+        return ['ok' => true, 'schedule' => $this->scheduleCfg()];
+    }
+
+    private function mgmtSetSleep(array $args): array
+    {
+        $min = max(1, (int) ($args['minutes'] ?? 30));
+        $this->SetTimerInterval(self::TIMER_SLEEP, $min * 60000);
+        $rt = $this->readRt();
+        $rt['sleepUntil'] = time() + $min * 60;
+        $this->writeRt($rt);
+        return ['ok' => true, 'minutes' => $min, 'until' => date('H:i', $rt['sleepUntil'])];
+    }
+
+    public function RunSleep(): void
+    {
+        $this->SetTimerInterval(self::TIMER_SLEEP, 0);
+        $rt = $this->readRt();
+        unset($rt['sleepUntil']);
+        $this->writeRt($rt);
+        $drv = $this->driver();
+        if ($drv instanceof IAudioRenderer && (bool) $this->cfgVal('armed', false)) {
+            $drv->stop();
+            $this->applyPower(false, $drv);
+        } else {
+            $this->SendDebug('HSAU.sleep', 'Schatten: WUERDE stoppen (Sleep)', 0);
+        }
+    }
+
+    private function mgmtComputeProbe(): array
+    {
+        $sc = $this->scheduleCfg();
+        $now = time();
+        $val = $this->scheduleValueAt($now, 'Standard');
+        return [
+            'ok'          => true,
+            'schedule'    => $sc,
+            'scheduleVal' => $val,
+            'onNow'       => is_numeric($val) && (float) $val > 0,
+            'volumeCapNow' => $this->ruleVolumeCap($sc, (int) $sc['volume']),
+            'armed'       => (bool) $this->cfgVal('armed', false),
+            'sleepUntil'  => ($this->readRt()['sleepUntil'] ?? null),
+        ];
     }
 
     // ==================================================================
@@ -396,6 +593,16 @@ class AudioZone extends EntityModule
                 return $this->mgmtUpdateProfile($args, $ctx);
             case 'getSchedule':
                 return $this->mgmtGetSchedule($args);
+            case 'configureSchedule':
+                return $this->mgmtConfigureSchedule($args);
+            case 'setSleep':
+                return $this->mgmtSetSleep($args);
+            case 'cancelSleep':
+                $this->SetTimerInterval(self::TIMER_SLEEP, 0);
+                $rt = $this->readRt(); unset($rt['sleepUntil']); $this->writeRt($rt);
+                return ['ok' => true];
+            case 'computeProbe':
+                return $this->mgmtComputeProbe();
             default:
                 return parent::mgmt($op, $args, $ctx);
         }
