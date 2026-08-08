@@ -166,6 +166,34 @@ class HomeSuiteHub extends EntityModule
             'caption' => $info,
         ]);
 
+        // --- Medienquellen (Provider) im Frontend konfigurierbar (Nutzer-Anforderung) ---
+        $sources = $this->sourcesConfig();
+        $schema  = \Hoep\HomeSuite\Engines\MediaProviders::schema();
+        $items   = [[
+            'type' => 'Label',
+            'caption' => 'Haus-weite Medienquellen. Aktivieren + Zugangsdaten eintragen, dann speichern. '
+                . 'Plex/Jellyfin/Audiobookshelf liefern direkte Stream-URLs (renderer-unabhaengig); '
+                . 'Spotify/Audible sind dienst-gebunden (DRM, nur ueber einen dienstfaehigen Renderer).',
+        ]];
+        $argParts = [];
+        foreach ($schema as $id => $def) {
+            $cfg = $sources[$id] ?? ['enabled' => false];
+            $items[] = ['type' => 'Label', 'caption' => '— ' . $def['label'] . ' —'];
+            $items[] = ['type' => 'CheckBox', 'name' => 'src_' . $id . '_enabled', 'caption' => 'aktiv',
+                'value' => (bool) ($cfg['enabled'] ?? false)];
+            $arg = '"enabled"=>$src_' . $id . '_enabled';
+            foreach ((array) $def['fields'] as $f) {
+                $secret = in_array($f, ['clientSecret', 'token', 'apiKey', 'refreshToken'], true);
+                $items[] = ['type' => $secret ? 'PasswordTextBox' : 'ValidationTextBox',
+                    'name' => 'src_' . $id . '_' . $f, 'caption' => $f, 'value' => (string) ($cfg[$f] ?? '')];
+                $arg .= ',"' . $f . '"=>$src_' . $id . '_' . $f;
+            }
+            $argParts[] = '"' . $id . '"=>[' . $arg . ']';
+        }
+        $items[] = ['type' => 'Button', 'caption' => 'Medienquellen speichern',
+            'onClick' => 'echo HSH_Manage($id, json_encode(["op"=>"configureSources","args"=>[' . implode(',', $argParts) . ']]));'];
+        $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Medienquellen (Audio-Provider)', 'items' => $items];
+
         $json = json_encode($form, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         return $json === false ? '{"elements":[]}' : $json;
     }
@@ -252,6 +280,12 @@ class HomeSuiteHub extends EntityModule
         // Dead-Binding-Scan ueber alle Entitaeten (read-only Diagnose).
         $m->addManagementAction(['op' => 'validate', 'verb' => 'validate', 'target' => 'hub',
             'label' => 'Bindungen pruefen (alle Entitaeten)', 'destructive' => false, 'fields' => []]);
+
+        // --- Medienquellen (Provider) — haus-weit, im Symcon-Frontend konfigurierbar ---
+        $m->addManagementAction(['op' => 'getSources', 'verb' => 'getSources', 'target' => 'hub',
+            'label' => 'Medienquellen lesen', 'destructive' => false, 'fields' => []]);
+        $m->addManagementAction(['op' => 'configureSources', 'verb' => 'configureSources', 'target' => 'hub',
+            'label' => 'Medienquellen konfigurieren', 'destructive' => false, 'fields' => []]);
 
         // --- Beschattungs-/Profil-Verwaltung (geteilte benannte Profile, ProfileEngine) ---
         foreach ([
@@ -340,12 +374,54 @@ class HomeSuiteHub extends EntityModule
 
             case 'validate':
                 return $this->mgmtValidateAll();
+
+            case 'getSources':
+                return ['ok' => true, 'op' => $op, 'sources' => $this->sourcesConfig(),
+                    'schema' => \Hoep\HomeSuite\Engines\MediaProviders::schema()];
+
+            case 'configureSources':
+                return $this->mgmtConfigureSources($args);
         }
 
         if (strncmp($op, 'profile', 7) === 0) {
             return $this->mgmtProfile($op, $args);
         }
         return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
+    }
+
+    /** Quellen-Konfig (Medien-Provider) aus dem Store, inkl. Defaults je bekanntem Provider. */
+    private function sourcesConfig(): array
+    {
+        $s = $this->store()->get('sources', []);
+        $s = is_array($s) ? $s : [];
+        foreach (array_keys(\Hoep\HomeSuite\Engines\MediaProviders::schema()) as $id) {
+            if (!isset($s[$id]) || !is_array($s[$id])) {
+                $s[$id] = ['enabled' => false];
+            }
+        }
+        return $s;
+    }
+
+    /** Medienquellen speichern (haus-weit). Nur bekannte Provider/Felder werden uebernommen. */
+    private function mgmtConfigureSources(array $args): array
+    {
+        $schema = \Hoep\HomeSuite\Engines\MediaProviders::schema();
+        $cur = $this->sourcesConfig();
+        foreach ($schema as $id => $def) {
+            if (!isset($args[$id]) || !is_array($args[$id])) {
+                continue;
+            }
+            $in = $args[$id];
+            $entry = ['enabled' => (bool) ($in['enabled'] ?? ($cur[$id]['enabled'] ?? false))];
+            foreach ((array) $def['fields'] as $f) {
+                $entry[$f] = (string) ($in[$f] ?? ($cur[$id][$f] ?? ''));
+            }
+            $cur[$id] = $entry;
+        }
+        $this->store()->set('sources', $cur);
+        // Aktive Provider (Diagnose): welche sind jetzt konfiguriert?
+        $active = array_keys(\Hoep\HomeSuite\Engines\MediaProviders::build($cur));
+        return ['ok' => true, 'sources' => $cur, 'active' => $active];
     }
 
     /**

@@ -43,7 +43,8 @@ $__hs_files = [
     'Contracts/Manifest.php',          // Manifest-JSON v1.0 (Struktur + state-Snapshot)
 
     // --- Value Objects: Audio-HAL (reine Datenhalter, vor den Interfaces/Treibern) ---
-    'Drivers/Audio/types.php',         // AudioState, AudioCapabilities, AudioSourceRef, AudioBrowseResult
+    'Drivers/Audio/types.php',         // AudioState, AudioCapabilities, AudioSourceRef, AudioBrowseResult, ContentRef
+    'Contracts/IMediaProvider.php',    // Quellen-Abstraktion (renderer-unabhaengig)
 
     // --- HAL: Interfaces (kernel-frei, zustandslos) ---
     'HAL/IDriver.php',                 // Basis: bind/capabilities/discover/poll/parseEvent
@@ -76,6 +77,7 @@ $__hs_files = [
     'Engines/ScheduleEngine.php',      // Slot-/Geo-/Rule-Auswertung, Homematic-Wochenexport
     'Engines/SunTimes.php',            // Sonnen-Ereigniszeiten (date_sun_info) fuer verankerte Grenzen
     'Engines/RadioNow.php',            // Radio "was laeuft" (ICY-Titel + Song-Cover, IPSSonos-frei)
+    'Engines/MediaProviders.php',      // Registry/Factory der Inhalte-Provider (renderer-unabhaengig)
     'ShadingProfiles.php',             // Beschattungs-Profiltypen (Schema) + Profil->Config-Mapper
     'Engines/ShadeKinematics.php',     // Positions-/Lamellen-Kinematik der Beschattung
 

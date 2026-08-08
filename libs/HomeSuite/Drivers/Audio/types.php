@@ -189,6 +189,66 @@ final class AudioSourceRef
 }
 
 /**
+ * ContentRef — RENDERER-UNABHAENGIGE Referenz auf Medien-Inhalt (Provider-Ebene).
+ * Trennt Quelle (Spotify/Plex/Jellyfin/Audiobookshelf/Radio/lokal) vom Renderer
+ * (Sonos/HEOS/...). Wo moeglich ist `uri` eine echte Stream-URL (universell spielbar);
+ * bei DRM-Diensten (Spotify/Audible) traegt `uri` die Dienst-URI (z. B. spotify:...),
+ * die der Renderer-Treiber in sein Schema uebersetzt.
+ *
+ * container=true -> abspielbare/aufklappbare Sammlung (Playlist/Album/Hoerbuch).
+ */
+final class ContentRef
+{
+    public function __construct(
+        public string $provider,           // spotify|plex|jellyfin|audiobookshelf|radio|local|sonos
+        public string $kind,               // url|dlna|spotify|audible|plex|library|station|preset|container
+        public string $id = '',            // provider-interne Id (Container/Item)
+        public string $uri = '',           // abspielbare URL/URI (leer -> erst resolve())
+        public string $title = '',
+        public string $artist = '',
+        public string $album = '',
+        public string $cover = '',
+        public string $mime = '',
+        public int $durationSec = 0,
+        public bool $isContainer = false
+    ) {
+    }
+
+    public function toArray(): array
+    {
+        return [
+            'provider' => $this->provider, 'kind' => $this->kind, 'id' => $this->id, 'uri' => $this->uri,
+            'title' => $this->title, 'artist' => $this->artist, 'album' => $this->album, 'cover' => $this->cover,
+            'mime' => $this->mime, 'durationSec' => $this->durationSec, 'isContainer' => $this->isContainer,
+        ];
+    }
+
+    public static function fromArray(array $a): self
+    {
+        return new self(
+            (string) ($a['provider'] ?? ''), (string) ($a['kind'] ?? 'url'), (string) ($a['id'] ?? ''),
+            (string) ($a['uri'] ?? ''), (string) ($a['title'] ?? ''), (string) ($a['artist'] ?? ''),
+            (string) ($a['album'] ?? ''), (string) ($a['cover'] ?? ''), (string) ($a['mime'] ?? ''),
+            (int) ($a['durationSec'] ?? 0), (bool) ($a['isContainer'] ?? false)
+        );
+    }
+
+    /** ContentRef -> AudioSourceRef (fuer IAudioRenderer::playSource). */
+    public function toSourceRef(): AudioSourceRef
+    {
+        $map = [
+            'url' => AudioSourceRef::KIND_STATION, 'dlna' => AudioSourceRef::KIND_STATION,
+            'spotify' => AudioSourceRef::KIND_PLAYLIST, 'audible' => AudioSourceRef::KIND_PLAYLIST,
+            'container' => AudioSourceRef::KIND_PLAYLIST, 'library' => AudioSourceRef::KIND_PLAYLIST,
+            'station' => AudioSourceRef::KIND_STATION, 'preset' => AudioSourceRef::KIND_PRESET,
+        ];
+        $kind = $map[$this->kind] ?? AudioSourceRef::KIND_URI;
+        return new AudioSourceRef($kind, $this->id !== '' ? $this->id : $this->uri, $this->title, $this->uri,
+            ['provider' => $this->provider, 'contentKind' => $this->kind, 'cover' => $this->cover, 'isContainer' => $this->isContainer]);
+    }
+}
+
+/**
  * AudioBrowseResult — Seite eines Browse-Vorgangs (browse()).
  * @property AudioSourceRef[] $items
  */
