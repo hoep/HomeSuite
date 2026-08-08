@@ -90,6 +90,30 @@ final class RadioNow
         return (string) (self::STATIONS[$stationKey]['stream'] ?? '');
     }
 
+    /**
+     * Aus einem streamContent/StreamTitle einen Song ableiten (+Cover-Entscheidung).
+     * @return array{artist:string,title:string,isTalk:bool}
+     */
+    public static function songParse(string $raw, string $stationTitle = ''): array
+    {
+        [$artist, $title] = self::splitArtistTitle($raw, '');
+        $isTalk = ($artist === '' || $title === '' || self::looksNonSong($title) || self::looksNonSong($artist));
+        // Sender-Claim: "Artist" ist im Grunde der Sendername -> kein Song.
+        if (!$isTalk && $stationTitle !== '') {
+            $na = self::alnum($artist);
+            $ns = self::alnum($stationTitle);
+            if ($na !== '' && $ns !== '' && (strpos($ns, $na) !== false || strpos($na, $ns) !== false)) {
+                $isTalk = true;
+            }
+        }
+        return ['artist' => $artist, 'title' => $title, 'isTalk' => $isTalk];
+    }
+
+    private static function alnum(string $s): string
+    {
+        return preg_replace('/[^a-z0-9]/', '', mb_strtolower($s));
+    }
+
     // ---- ICY -----------------------------------------------------------------
 
     /**
@@ -202,7 +226,8 @@ final class RadioNow
         if ($s === '') {
             return true;
         }
-        foreach (['nachrichten', 'news', 'wetter', 'verkehr', 'werbung', 'advert', 'jingle'] as $kw) {
+        foreach (['nachrichten', 'news', 'wetter', 'verkehr', 'werbung', 'advert', 'jingle',
+                  'livestream', 'webradio', 'live stream', 'www.', '.at', '.de', 'app'] as $kw) {
             if (strpos($s, $kw) !== false) {
                 return true;
             }

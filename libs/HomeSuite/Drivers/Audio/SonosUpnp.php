@@ -166,7 +166,9 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
         // konkrete URI vorliegt, abspielen.
         if ($ref->uri !== '') {
             if ($ref->kind === AudioSourceRef::KIND_STATION) {
-                $this->setUri($ref->uri, $ref->metadata['didl'] ?? '');
+                // Direkter Radio-Stream (werbefrei, statt TuneIn): x-rincon-mp3radio://<url>
+                $uri = (strpos($ref->uri, 'x-rincon') === 0) ? $ref->uri : ('x-rincon-mp3radio://' . $ref->uri);
+                $this->setUri($uri, $ref->metadata['didl'] ?? $this->radioDidl($ref->title !== '' ? $ref->title : 'Radio'));
             } else {
                 // Queue ersetzen
                 $this->soap(self::AVT, 'RemoveAllTracksFromQueue', '<InstanceID>0</InstanceID>');
@@ -284,6 +286,64 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
         );
     }
 
+    /**
+     * "Was kommt als Naechstes": naechster Titel der Warteschlange (Q:0). Bei Radio/
+     * Livestream ODER am Ende der Queue -> [] (kein naechster Titel). PURE-ish (SOAP-GET).
+     * @return array{title:string,artist:string,album:string,coverUri:string}|array{}
+     */
+    public function readNext(): array
+    {
+        $pi  = $this->soap(self::AVT, 'GetPositionInfo', '<InstanceID>0</InstanceID>');
+        $uri = $this->tag($pi, 'TrackURI');
+        // Radio/Stream/Line-In/Gruppe haben keine Queue-Nachfolge.
+        if ($uri === '' || preg_match('~^(x-sonosapi-stream|x-rincon-mp3radio|x-rincon-stream|x-rincon:)~', $uri)) {
+            return [];
+        }
+        $track = (int) $this->tag($pi, 'Track');       // 1-basiert = aktueller
+        if ($track <= 0) {
+            return [];
+        }
+        // naechster Eintrag: 0-basierter Index == aktueller 1-basierter Track.
+        $resp = $this->soap('urn:schemas-upnp-org:service:ContentDirectory:1', 'Browse',
+            '<ObjectID>Q:0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter>'
+            . '<StartingIndex>' . $track . '</StartingIndex><RequestedCount>1</RequestedCount><SortCriteria></SortCriteria>',
+            '/MediaServer/ContentDirectory/Control');
+        $didl = $this->unescapeXml($this->tag($resp, 'Result'));
+        if ($didl === '' || stripos($didl, '<item') === false) {
+            return [];
+        }
+        return [
+            'title'    => $this->tag($didl, 'dc:title'),
+            'artist'   => $this->tag($didl, 'dc:creator'),
+            'album'    => $this->tag($didl, 'upnp:album'),
+            'coverUri' => $this->tag($didl, 'upnp:albumArtURI'),
+        ];
+    }
+
+    /**
+     * Radio-Info direkt vom Player: aktueller Sendername + laufender Titel (streamContent)
+     * + CurrentURI. @return array{isRadio:bool,station:string,uri:string,streamContent:string}
+     */
+    public function radioInfo(): array
+    {
+        $mi  = $this->soap(self::AVT, 'GetMediaInfo', '<InstanceID>0</InstanceID>');
+        $pi  = $this->soap(self::AVT, 'GetPositionInfo', '<InstanceID>0</InstanceID>');
+        $uri = $this->tag($pi, 'TrackURI');
+        if ($uri === '') {
+            $uri = $this->tag($mi, 'CurrentURI');
+        }
+        $isRadio = (bool) preg_match('~(x-sonosapi-stream|x-rincon-mp3radio|mp3radio|sonos.*stream)~i', $uri)
+            || stripos($this->sourceType($uri), 'radio') !== false;
+        $curMeta = $this->unescapeXml($this->tag($mi, 'CurrentURIMetaData'));
+        $station = $this->tag($curMeta, 'dc:title');
+        $trkMeta = $this->unescapeXml($this->tag($pi, 'TrackMetaData'));
+        $stream  = $this->tag($trkMeta, 'r:streamContent');
+        if ($stream === '') {
+            $stream = $this->tag($trkMeta, 'streamContent');
+        }
+        return ['isRadio' => $isRadio, 'station' => $station, 'uri' => $uri, 'streamContent' => $stream];
+    }
+
     public function readGroup(): array
     {
         $self = (string) ($this->cfg['rincon'] ?? '');
@@ -296,6 +356,17 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
     }
 
     // ---- SOAP/HTTP + Parsing -------------------------------------------------
+
+    /** Minimales DIDL fuer einen Radiosender (audioBroadcast), damit Sonos ihn als Sender fuehrt. */
+    private function radioDidl(string $title): string
+    {
+        return '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            . 'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+            . 'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
+            . '<item id="R:0/0/0" parentID="R:0/0" restricted="true"><dc:title>' . $this->esc($title) . '</dc:title>'
+            . '<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>'
+            . '<desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc></item></DIDL-Lite>';
+    }
 
     private function setUri(string $uri, string $didl): void
     {

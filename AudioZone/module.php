@@ -38,6 +38,8 @@ use Hoep\HomeSuite\HAL\DriverFactory;
 use Hoep\HomeSuite\HAL\IAudioRenderer;
 use Hoep\HomeSuite\HAL\IAudioStateReadable;
 use Hoep\HomeSuite\HAL\IDriver;
+use Hoep\HomeSuite\HAL\SonosUpnp;
+use Hoep\HomeSuite\Engines\RadioNow;
 
 class AudioZone extends EntityModule
 {
@@ -162,6 +164,9 @@ class AudioZone extends EntityModule
                 ['op' => 'setSleep',        'label' => 'Sleep-Timer setzen'],
                 ['op' => 'cancelSleep',     'label' => 'Sleep-Timer abbrechen'],
                 ['op' => 'computeProbe',    'label' => 'Zeitplan/Regel-Vorschau (Trockenlauf)'],
+                ['op' => 'radioNow',        'label' => 'Radio: laufender Titel + Cover'],
+                ['op' => 'playDirect',      'label' => 'Radio: werbefreien HQ-Stream direkt spielen'],
+                ['op' => 'radioStations',   'label' => 'Radio: Senderliste'],
             ],
 
             'capabilities' => [
@@ -603,6 +608,16 @@ class AudioZone extends EntityModule
                 return ['ok' => true];
             case 'computeProbe':
                 return $this->mgmtComputeProbe();
+            case 'radioNow':
+                return $this->mgmtRadioNow();
+            case 'playDirect':
+                return $this->mgmtPlayDirect($args);
+            case 'radioStations':
+                $list = [];
+                foreach (RadioNow::STATIONS as $k => $s) {
+                    $list[] = ['key' => $k, 'title' => $s['title']];
+                }
+                return ['ok' => true, 'stations' => $list];
             default:
                 return parent::mgmt($op, $args, $ctx);
         }
@@ -824,6 +839,91 @@ class AudioZone extends EntityModule
         return ['ok' => true, 'variant' => $variant, 'week' => $week, 'activeVariant' => 'Standard',
             'variants' => $this->scheduleVariants(), 'sunEvents' => $this->sunEvents(time()),
             'anchors' => array_keys(\Hoep\HomeSuite\SunTimes::ANCHORS)];
+    }
+
+    // ==================================================================
+    // Radio: laufender Titel + Song-Cover (RadioNow) + werbefreier Direktstream
+    // ==================================================================
+
+    /** Speaker-IP/RINCON aus der gebundenen Raum-Instanz (bind.transport-Variable -> Parent). */
+    private function resolveSpeaker(): array
+    {
+        $tv = (int) ((($this->cfg()['bind'] ?? [])['transport']['varId']) ?? 0);
+        if ($tv <= 0 || !function_exists('IPS_GetParent')) {
+            return ['', ''];
+        }
+        $room = (int) @\IPS_GetParent($tv);
+        if ($room <= 0) {
+            return ['', ''];
+        }
+        $ip  = (string) @\GetValue((int) (@\IPS_GetObjectIDByIdent('IPADDR', $room) ?: 0));
+        $rin = (string) @\GetValue((int) (@\IPS_GetObjectIDByIdent('RINCON', $room) ?: 0));
+        return [$ip, $rin];
+    }
+
+    /** Radio "was laeuft": aktueller Titel (streamContent) + Song-Cover, 20s gecacht (RtState). */
+    private function mgmtRadioNow(): array
+    {
+        $rt = $this->readRt();
+        $c  = $rt['radioCache'] ?? null;
+        if (is_array($c) && (time() - (int) ($c['ts'] ?? 0)) < 20) {
+            return ['ok' => true, 'cached' => true] + (array) $c['data'];
+        }
+        [$ip, $rin] = $this->resolveSpeaker();
+        $data = ['isRadio' => false, 'station' => '', 'key' => null, 'artist' => '', 'title' => '', 'cover' => '', 'isTalk' => true, 'reachable' => false];
+        if ($ip !== '') {
+            try {
+                $drv = DriverFactory::create('sonos-upnp', ['host' => $ip, 'rincon' => $rin, 'timeout' => 2500]);
+                if ($drv instanceof SonosUpnp) {
+                    $info = $drv->radioInfo();
+                    $data['reachable'] = true;
+                    $data['isRadio']   = (bool) $info['isRadio'];
+                    $data['station']   = (string) $info['station'];
+                    $data['key'] = RadioNow::detect($info['station'] . ' ' . $info['uri']);
+                    $song = ['artist' => '', 'title' => '', 'isTalk' => true];
+                    if (trim((string) $info['streamContent']) !== '') {
+                        $song = RadioNow::songParse((string) $info['streamContent'], (string) $info['station']);
+                    } elseif ($data['key'] !== null) {
+                        $n = RadioNow::now($data['key'], false);
+                        $song = ['artist' => $n['artist'], 'title' => $n['title'], 'isTalk' => $n['isTalk']];
+                    }
+                    $data['artist'] = $song['artist'];
+                    $data['title']  = $song['title'];
+                    $data['isTalk'] = $song['isTalk'];
+                    if (!$song['isTalk']) {
+                        $data['cover'] = RadioNow::cover($song['artist'], $song['title']);
+                    }
+                }
+            } catch (\Throwable $e) {
+                $this->SendDebug('HSAU.radioNow', $e->getMessage(), 0);
+            }
+        }
+        $rt['radioCache'] = ['ts' => time(), 'data' => $data];
+        $this->writeRt($rt);
+        return ['ok' => true] + $data;
+    }
+
+    /** Werbefreien HQ-Direktstream eines Senders auf diesem Speaker spielen (statt TuneIn). */
+    private function mgmtPlayDirect(array $args): array
+    {
+        $key = (string) ($args['station'] ?? '');
+        $url = RadioNow::streamUrl($key);
+        if ($url === '') {
+            throw new ContractException('unbekannter Sender: ' . $key);
+        }
+        if (!(bool) $this->cfgVal('armed', false)) {
+            return ['ok' => true, 'armed' => false, 'note' => 'Schatten: WUERDE direkt spielen', 'station' => $key];
+        }
+        [$ip, $rin] = $this->resolveSpeaker();
+        if ($ip === '') {
+            return ['ok' => false, 'error' => 'Speaker nicht aufloesbar'];
+        }
+        $title = (string) (RadioNow::STATIONS[$key]['title'] ?? 'Radio');
+        $drv = DriverFactory::create('sonos-upnp', ['host' => $ip, 'rincon' => $rin, 'timeout' => 3000]);
+        $drv->playSource(new AudioSourceRef(AudioSourceRef::KIND_STATION, $key, $title, $url));
+        // Cache invalidieren, damit der neue Titel sofort gezogen wird.
+        $rt = $this->readRt(); unset($rt['radioCache']); $this->writeRt($rt);
+        return ['ok' => true, 'station' => $key, 'title' => $title, 'url' => $url];
     }
 
     // ==================================================================
