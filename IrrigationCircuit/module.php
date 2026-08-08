@@ -301,21 +301,8 @@ class IrrigationCircuit extends EntityModule
      */
     private function tempFactor(): float
     {
-        $t = $this->tempCfg();
-        if (!$t['enabled']) {
-            return 1.0;
-        }
-        $temp = $this->tempNow();
-        if ($temp === null) {
-            return 1.0;
-        }
-        if ($temp >= $t['hotAboveC']) {
-            return max(0.0, $t['hotPct'] / 100.0);
-        }
-        if ($temp < $t['coldBelowC']) {
-            return max(0.0, $t['coldPct'] / 100.0);
-        }
-        return 1.0;
+        // Generische Schwellen-Regel der Basis (wiederverwendbar in allen Domaenen).
+        return $this->ruleTempFactor($this->tempCfg(), $this->tempNow());
     }
 
     /** Evaporations-Faktor = ET0_aktuell / ET0_ref (geklemmt). Ohne Konfig/Quelle -> 1.0. (Forecast/ET0-Quelle -> M3b) */
@@ -356,11 +343,8 @@ class IrrigationCircuit extends EntityModule
     private function gateBlock(): ?string
     {
         $t = $this->tempCfg();
-        if ($t['enabled']) {
-            $temp = $this->tempNow();
-            if ($temp !== null && $temp < $t['blockBelowC']) {
-                return 'Kaelte (< ' . rtrim(rtrim(number_format($t['blockBelowC'], 1, ',', ''), '0'), ',') . ' C)';
-            }
+        if ($this->ruleBlockBelow($t, $this->tempNow())) {
+            return 'Kaelte (< ' . rtrim(rtrim(number_format((float) $t['blockBelowC'], 1, ',', ''), '0'), ',') . ' C)';
         }
         $c = $this->cfg();
         $g = (isset($c['rain']) && is_array($c['rain'])) ? $c['rain'] : [];

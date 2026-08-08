@@ -436,6 +436,40 @@ abstract class EntityModule extends \IPSModule
         return @\GetValue($vid) === false ? false : true;
     }
 
+    // ==================================================================
+    // GENERISCHE REGELN (wiederverwendbar in allen Domaenen)
+    // Sonnen-Anker (Auf/Untergang ± Offset) stecken bereits in resolveEnd/sunEvents/
+    // scheduleValueAt. Hier ergaenzt: Schwellen-Ueberschreibung (Temperatur).
+    // ==================================================================
+
+    /**
+     * Temperatur-Faktor aus einer Schwellen-Regel. PURE.
+     * $cfg {enabled,coldBelowC,coldPct,hotAboveC,hotPct}; >=hotAboveC -> hotPct%,
+     * < coldBelowC -> coldPct%, sonst 100 %. Kein $temp/deaktiviert -> 1.0.
+     */
+    protected function ruleTempFactor(array $cfg, ?float $temp): float
+    {
+        if (empty($cfg['enabled']) || $temp === null) {
+            return 1.0;
+        }
+        if (isset($cfg['hotAboveC']) && $temp >= (float) $cfg['hotAboveC']) {
+            return max(0.0, (float) ($cfg['hotPct'] ?? 100) / 100.0);
+        }
+        if (isset($cfg['coldBelowC']) && $temp < (float) $cfg['coldBelowC']) {
+            return max(0.0, (float) ($cfg['coldPct'] ?? 100) / 100.0);
+        }
+        return 1.0;
+    }
+
+    /** Harte Sperre unterhalb einer Schwelle (z. B. Frost). PURE. */
+    protected function ruleBlockBelow(array $cfg, ?float $temp): bool
+    {
+        if (empty($cfg['enabled']) || $temp === null || !isset($cfg['blockBelowC'])) {
+            return false;
+        }
+        return $temp < (float) $cfg['blockBelowC'];
+    }
+
     /**
      * Laenge des manualHold-Fensters in Sekunden (aus Konfig, sonst Default).
      */
