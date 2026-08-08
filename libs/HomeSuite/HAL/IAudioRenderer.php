@@ -86,3 +86,26 @@ interface IAudioRendererExtended extends IAudioRenderer
     public function setTone(array $bands): void;              // CAP_TONE
     public function setSleepTimer(int $minutes): void;        // CAP_SLEEPTIMER
 }
+
+/**
+ * IAudioStateReadable — Erweiterung fuer VARIABLENGEBUNDENE Treiber ohne Push-Frames
+ * (z. B. der GenericBoundAudioRenderer im IPSSonos-Uebergang). Solche Treiber liefern
+ * ihren Zustand nicht ueber parseEvent() (kein Frame-Strom), sondern lesen ihn beim
+ * Refresh() der Instanz direkt aus den gebundenen Reflect-Variablen.
+ *
+ * Push-Treiber (HEOS/UPnP-Event) implementieren dies NICHT — sie nutzen weiterhin
+ * parseEvent(): ?AudioState (IDriver::parseEvent). Das Modul entscheidet je Treiber:
+ * readState() aufrufen ODER Frames an parseEvent() geben.
+ */
+interface IAudioStateReadable extends IAudioRenderer
+{
+    /** Liest den aktuellen Zustand aus den gebundenen Reflect-Variablen (GetValue). */
+    public function readState(): AudioState;
+
+    /**
+     * Aktuelle Gruppen-Sicht dieses Renderers.
+     * @return array{role:string,coordinatorUid:string,memberUids:string[]}
+     *   role = standalone|coordinator|member
+     */
+    public function readGroup(): array;
+}

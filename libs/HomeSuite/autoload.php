@@ -42,6 +42,9 @@ $__hs_files = [
     'Contracts/Store.php',             // JSON-Store auf Attribut "FabricStore" (nur Konfig/Profile)
     'Contracts/Manifest.php',          // Manifest-JSON v1.0 (Struktur + state-Snapshot)
 
+    // --- Value Objects: Audio-HAL (reine Datenhalter, vor den Interfaces/Treibern) ---
+    'Drivers/Audio/types.php',         // AudioState, AudioCapabilities, AudioSourceRef, AudioBrowseResult
+
     // --- HAL: Interfaces (kernel-frei, zustandslos) ---
     'HAL/IDriver.php',                 // Basis: bind/capabilities/discover/poll/parseEvent
     'HAL/IThermostat.php',             // Heizungs-HAL
