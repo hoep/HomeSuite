@@ -42,6 +42,7 @@ use Hoep\HomeSuite\EntityModule;
 use Hoep\HomeSuite\HAL\DriverFactory;
 use Hoep\HomeSuite\HAL\IDriver;
 use Hoep\HomeSuite\HAL\IShutter;
+use Hoep\HomeSuite\ShadeKinematics;
 use Hoep\HomeSuite\SunTimes;
 
 // Klassenname MUSS = module.json "name" (ohne Leerzeichen) sein.
@@ -69,6 +70,7 @@ class ShadingDevice extends EntityModule
 
     /** Timer + Reconcile-Parameter. */
     private const TIMER_REFRESH  = 'Refresh';
+    private const TIMER_MOVE      = 'MoveStop'; // Ein-Schuss: stoppt/settlet eine zeitbasierte Fahrt
     private const REFRESH_MS      = 30000;   // Reflect + Reconcile
     private const POS_TOLERANCE   = 3;        // % Drift, bevor gefahren wird
     private const SAFE_POS        = 0;        // Sturm-/Regen-sichere Position (offen/eingefahren)
@@ -192,6 +194,8 @@ class ShadingDevice extends EntityModule
                 ['op' => 'reconcileProbe',     'label' => 'Regel-Entscheidung (Trockenlauf)'],
                 ['op' => 'getConfig',          'label' => 'Konfiguration lesen (Diagnose)'],
                 ['op' => 'command',            'label' => 'Bedienen (Position/Fahrt/Modus)'],
+                ['op' => 'referenceRun',       'label' => 'Referenzfahrt (kalibrieren)'],
+                ['op' => 'validate',           'label' => 'Bindung pruefen (Diagnose)'],
             ],
 
             // ---- Konfig-Felder (Treiberwahl; im LVB gesetzt) ----
@@ -310,11 +314,14 @@ class ShadingDevice extends EntityModule
         $driverId   = (string) ($cfg['driver'] ?? '');
         $positionId = (int) ($cfg['positionId'] ?? 0);
 
-        if ($driverId === '' || $positionId <= 0) {
+        if ($driverId === '') {
             return null; // unkonfiguriert -> applyControl bleibt im Schatten-Modus
         }
         try {
             if ($driverId === 'generic-shutter') {
+                if ($positionId <= 0) {
+                    return null; // generic-shutter braucht eine Positions-Variable
+                }
                 $dcfg = [
                     'positionVarId'    => $positionId,
                     'feedbackVarId'    => $positionId,
@@ -322,6 +329,39 @@ class ShadingDevice extends EntityModule
                     'invert'           => (bool) ($cfg['invert'] ?? false),
                 ];
                 $this->driverInstance = DriverFactory::create('generic-shutter', $dcfg);
+            } elseif ($driverId === 'somfy-rts') {
+                // Roh-Aktor: Somfy RTS via Client-Socket zum TCP-Gateway. Der Treiber
+                // ist zustandslos (B1); der Sende-Callback schiebt den Frame ueber
+                // CSCK_SendText auf den Socket. KEINE Absolutposition/Feedback ->
+                // Absolutfahrten macht das Modul zeitbasiert (ShadeKinematics).
+                $socketId = (int) ($cfg['socketId'] ?? 0);
+                $channel  = (int) ($cfg['channel'] ?? 0);
+                if ($socketId <= 0 || $channel < 1 || $channel > 16) {
+                    return null; // unvollstaendig konfiguriert -> Schatten-Modus
+                }
+                $send = static function ($frame) use ($socketId): void {
+                    if (function_exists('CSCK_SendText')) {
+                        @\CSCK_SendText($socketId, (string) $frame);
+                    }
+                };
+                $this->driverInstance = DriverFactory::create('somfy-rts', [
+                    'channel'    => $channel,
+                    'repeat'     => (int) ($cfg['repeat'] ?? 3),
+                    'stopRepeat' => (int) ($cfg['stopRepeat'] ?? 4),
+                    'gapMs'      => (int) ($cfg['gapMs'] ?? 50),
+                    'invert'     => (bool) ($cfg['invert'] ?? false),
+                ], $send);
+            } elseif ($driverId === 'hm-shutter') {
+                // Homematic-Rollo/Markise: LEVEL-Datenpunkt (absolut + Feedback).
+                $levelVarId = (int) ($cfg['levelVarId'] ?? 0);
+                if ($levelVarId <= 0) {
+                    return null;
+                }
+                $this->driverInstance = DriverFactory::create('hm-shutter', [
+                    'levelVarId' => $levelVarId,
+                    'instanceId' => (int) ($cfg['instanceId'] ?? 0),
+                    'invert'     => (bool) ($cfg['invert'] ?? true),
+                ]);
             }
         } catch (\Throwable $e) {
             $this->SendDebug('HSSH.driver', 'Treiberaufbau fehlgeschlagen: ' . $e->getMessage(), 0);
@@ -360,6 +400,10 @@ class ShadingDevice extends EntityModule
             case 'getConfig':
                 $cfg = $this->store()->get('config', []);
                 return ['ok' => true, 'config' => is_array($cfg) ? $cfg : []];
+            case 'referenceRun':
+                return $this->mgmtReferenceRun($args);
+            case 'validate':
+                return $this->mgmtValidate();
             default:
                 // updateProfile/getSchedule/setActivePlan/importLegacy folgen in M6/M7.
                 return parent::mgmt($op, $args, $ctx);
@@ -374,24 +418,58 @@ class ShadingDevice extends EntityModule
     private function mgmtConfigureDriver(array $args, array $ctx): array
     {
         $driver = (string) ($args['driver'] ?? '');
-        if (!in_array($driver, ['', 'generic-shutter'], true)) {
+        if (!in_array($driver, ['', 'generic-shutter', 'somfy-rts', 'hm-shutter'], true)) {
             throw new ContractException('unbekannter Treiber: ' . $driver);
         }
-        $positionId  = (int) ($args['positionId'] ?? 0);
-        $automaticId = (int) ($args['automaticId'] ?? 0);
-        $invert      = (bool) ($args['invert'] ?? false);
+        $config = ['driver' => $driver, 'invert' => (bool) ($args['invert'] ?? false)];
 
-        if ($positionId > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($positionId)) {
-            throw new ContractException('positionId #' . $positionId . ' ist keine Variable');
+        if ($driver === 'generic-shutter') {
+            $positionId  = (int) ($args['positionId'] ?? 0);
+            $automaticId = (int) ($args['automaticId'] ?? 0);
+            if ($positionId > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($positionId)) {
+                throw new ContractException('positionId #' . $positionId . ' ist keine Variable');
+            }
+            if ($automaticId > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($automaticId)) {
+                throw new ContractException('automaticId #' . $automaticId . ' ist keine Variable');
+            }
+            if ($positionId <= 0) {
+                throw new ContractException('generic-shutter braucht eine Positions-Variable (positionId)');
+            }
+            $config['positionId']  = $positionId;
+            $config['automaticId'] = $automaticId;
+        } elseif ($driver === 'somfy-rts') {
+            // Roh-Aktor Somfy RTS: Client-Socket-Instanz + Kanal 1..16 + Fahrzeiten
+            // (kein Feedback -> Position wird zeitbasiert geschaetzt).
+            $socketId = (int) ($args['socketId'] ?? 0);
+            $channel  = (int) ($args['channel'] ?? 0);
+            if ($socketId <= 0 || !function_exists('IPS_InstanceExists') || !\IPS_InstanceExists($socketId)) {
+                throw new ContractException('somfy-rts braucht die Client-Socket-Instanz (socketId)');
+            }
+            if ($channel < 1 || $channel > 16) {
+                throw new ContractException('somfy-rts Kanal muss 1..16 sein');
+            }
+            $config['socketId']    = $socketId;
+            $config['channel']     = $channel;
+            $config['repeat']      = max(1, (int) ($args['repeat'] ?? 2));
+            $config['timeOpening'] = max(0, (int) ($args['timeOpening'] ?? 0));
+            $config['timeClosing'] = max(0, (int) ($args['timeClosing'] ?? 0));
+        } elseif ($driver === 'hm-shutter') {
+            // Homematic-Rollo/Markise: LEVEL-Variable (aktionsfaehig) aus der Instanz aufloesen.
+            $instanceId = (int) ($args['instanceId'] ?? 0);
+            if ($instanceId <= 0 || !function_exists('IPS_InstanceExists') || !\IPS_InstanceExists($instanceId)) {
+                throw new ContractException('hm-shutter braucht die Homematic-Instanz (instanceId)');
+            }
+            $levelVarId = (int) ($args['levelVarId'] ?? 0);
+            if ($levelVarId <= 0) {
+                $levelVarId = (int) (@\IPS_GetObjectIDByIdent('LEVEL', $instanceId) ?: 0);
+            }
+            if ($levelVarId <= 0 || !\IPS_VariableExists($levelVarId)) {
+                throw new ContractException('LEVEL-Variable der Instanz #' . $instanceId . ' nicht gefunden');
+            }
+            $config['instanceId'] = $instanceId;
+            $config['levelVarId'] = $levelVarId;
+            $config['invert']     = (bool) ($args['invert'] ?? true);
         }
-        if ($automaticId > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($automaticId)) {
-            throw new ContractException('automaticId #' . $automaticId . ' ist keine Variable');
-        }
-        if ($positionId <= 0 && $driver !== '') {
-            throw new ContractException($driver . ' braucht eine Positions-Variable (positionId)');
-        }
-
-        $config = ['driver' => $driver, 'positionId' => $positionId, 'automaticId' => $automaticId, 'invert' => $invert];
 
         if (!empty($ctx['dryrun'])) {
             return ['ok' => true, 'dryrun' => true, 'config' => $config, 'scheduleMode' => 'controller'];
@@ -400,9 +478,72 @@ class ShadingDevice extends EntityModule
         $this->store()->patch('config', $config);
         $this->driverResolved = false;
         $this->driverInstance = null;
+        $this->syncReferences();
+        $this->updateHealth();
         $active = $this->driver() instanceof IShutter;
 
         return ['ok' => true, 'config' => $config, 'scheduleMode' => 'controller', 'driverActive' => $active];
+    }
+
+    /**
+     * Loesch-Schutz: registriert die real gebundenen Objekte als Instanz-Referenzen,
+     * damit Symcon beim Loeschen warnt ("wird von Beschattung X verwendet"). Bei
+     * jedem Rebind alte Referenzen entfernen und neu setzen. RegisterReference
+     * schuetzt Variablen/Instanzen (Positions-Var, Client-Socket, Sensoren) — NICHT
+     * die IPSLibrary-Klassendatei; der Somfy-Treiber lebt jetzt in HomeSuite.
+     */
+    private function syncReferences(): void
+    {
+        if (!method_exists($this, 'GetReferenceList')) {
+            return;
+        }
+        foreach ($this->GetReferenceList() as $ref) {
+            @$this->UnregisterReference($ref);
+        }
+        $cfg = $this->store()->get('config', []);
+        $cfg = is_array($cfg) ? $cfg : [];
+        $driver = (string) ($cfg['driver'] ?? '');
+        $ids = [];
+        // Nur die vom AKTIVEN Treiber real genutzten Bindungen referenzieren:
+        //  - generic-shutter: Positions-Variable
+        //  - somfy-rts: Client-Socket (NICHT die alte IPSShadowing-Position-Variable,
+        //    sonst bliebe IPSShadowing faelschlich unloeschbar)
+        // automaticId immer (Cutover/Rollback-Helfer), env/doors immer (Safety/Sonne).
+        $keys = ['automaticId'];
+        if ($driver === 'generic-shutter') {
+            $keys[] = 'positionId';
+        }
+        if ($driver === 'somfy-rts') {
+            $keys[] = 'socketId';
+        }
+        if ($driver === 'hm-shutter') {
+            $keys[] = 'levelVarId';
+            $keys[] = 'instanceId';
+        }
+        foreach ($keys as $k) {
+            $id = (int) ($cfg[$k] ?? 0);
+            if ($id > 0) {
+                $ids[$id] = true;
+            }
+        }
+        $env = $cfg['env'] ?? [];
+        if (is_array($env)) {
+            foreach ($env as $id) {
+                if ((int) $id > 0) {
+                    $ids[(int) $id] = true;
+                }
+            }
+        }
+        foreach (($cfg['doorIds'] ?? []) as $id) {
+            if ((int) $id > 0) {
+                $ids[(int) $id] = true;
+            }
+        }
+        foreach (array_keys($ids) as $id) {
+            if (function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($id)) {
+                @$this->RegisterReference($id);
+            }
+        }
     }
 
     /**
@@ -698,6 +839,7 @@ class ShadingDevice extends EntityModule
     protected function setupTimers(): void
     {
         $this->RegisterTimer(self::TIMER_REFRESH, 0, 'HSSH_Refresh($_IPS[\'TARGET\']);');
+        $this->RegisterTimer(self::TIMER_MOVE, 0, 'HSSH_MoveDone($_IPS[\'TARGET\']);');
     }
 
     public function ApplyChanges()
@@ -710,6 +852,8 @@ class ShadingDevice extends EntityModule
         $active = $drv instanceof IShutter;
         $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
         $this->registerWatches($drv);
+        $this->syncReferences();
+        $this->updateHealth();
     }
 
     /**
@@ -722,24 +866,66 @@ class ShadingDevice extends EntityModule
     {
         $cfg = $this->store()->get('config', []);
         $cfg = is_array($cfg) ? $cfg : [];
+        $active   = $this->driver() instanceof IShutter;
+        $rt       = $this->readRt();
+        $estKnown = !empty($rt['posKnown']);
+        $armed    = (bool) ($cfg['armed'] ?? false);
+        $status   = 'Treiber: ' . ($active ? 'aktiv' : 'inaktiv')
+            . ' · scharf: ' . ($armed ? 'JA (faehrt real)' : 'nein (Schatten-Modus)')
+            . ' · Position: ' . ($estKnown ? ((int) ($rt['estPos'] ?? 0) . '% (geschaetzt)') : 'unbekannt (Referenzfahrt noetig)');
         return json_encode(['elements' => [
-            ['type' => 'Label', 'caption' => 'Beschattung — Bindung an die (IPSShadowing-)Positions-Variable. '
-                . 'Sicherheits-Schwellen und Sonnenprofil kommen aus den geteilten Profilen (LiveViewBuilder), nicht hier.'],
+            ['type' => 'Label', 'caption' => 'Beschattung — Geraete-Bindung. Sicherheits-Schwellen, Sonnen- und '
+                . 'Wetterprofile kommen aus den geteilten Profilen (LiveViewBuilder), nicht hier.'],
             ['type' => 'Select', 'name' => 'cfgDriver', 'caption' => 'Treiber',
                 'value' => (string) ($cfg['driver'] ?? 'generic-shutter'), 'options' => [
                     ['caption' => '(keiner / Schatten-Modus)', 'value' => ''],
-                    ['caption' => 'Generischer Rollladen (Position 0..100)', 'value' => 'generic-shutter'],
+                    ['caption' => 'Absolutposition 0..100 (generisch / Homematic-LEVEL)', 'value' => 'generic-shutter'],
+                    ['caption' => 'Somfy RTS (Bus-Rollo: auf/ab/stop + Fahrzeiten)', 'value' => 'somfy-rts'],
+                    ['caption' => 'Homematic-Rollo/Markise (LEVEL, absolut)', 'value' => 'hm-shutter'],
                 ]],
+            ['type' => 'Label', 'caption' => '— Absolutposition (generisch / Homematic-LEVEL) —'],
             ['type' => 'SelectVariable', 'name' => 'cfgPositionId', 'caption' => 'Positions-Variable (Ziel & Rueckmeldung)',
                 'value' => (int) ($cfg['positionId'] ?? 0)],
             ['type' => 'SelectVariable', 'name' => 'cfgAutomaticId', 'caption' => 'IPSShadowing-Automatik-Variable (optional, fuer Cutover/Rollback)',
                 'value' => (int) ($cfg['automaticId'] ?? 0)],
-            ['type' => 'CheckBox', 'name' => 'cfgInvert', 'caption' => 'Position invertieren (0=zu ... 100=offen)',
+            ['type' => 'Label', 'caption' => '— Somfy RTS (Bus-Rollo ohne Positions-Rueckmeldung) —'],
+            ['type' => 'SelectInstance', 'name' => 'cfgSocketId', 'caption' => 'Client-Socket (RTS-Gateway)',
+                'value' => (int) ($cfg['socketId'] ?? 45711)],
+            ['type' => 'NumberSpinner', 'name' => 'cfgChannel', 'caption' => 'RTS-Kanal (1..16)',
+                'value' => (int) ($cfg['channel'] ?? 0), 'minimum' => 0, 'maximum' => 16],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'NumberSpinner', 'name' => 'cfgTimeClosing', 'caption' => 'Fahrzeit ZU (0->100) in s',
+                    'value' => (int) ($cfg['timeClosing'] ?? 0), 'minimum' => 0, 'maximum' => 300],
+                ['type' => 'NumberSpinner', 'name' => 'cfgTimeOpening', 'caption' => 'Fahrzeit AUF (100->0) in s',
+                    'value' => (int) ($cfg['timeOpening'] ?? 0), 'minimum' => 0, 'maximum' => 300],
+                ['type' => 'NumberSpinner', 'name' => 'cfgRepeat', 'caption' => 'Sende-Wiederholungen',
+                    'value' => (int) ($cfg['repeat'] ?? 3), 'minimum' => 1, 'maximum' => 8],
+            ]],
+            ['type' => 'Label', 'caption' => '— Homematic-Rollo/Markise (LEVEL-Datenpunkt, absolut) —'],
+            ['type' => 'SelectInstance', 'name' => 'cfgHmInstance', 'caption' => 'Homematic-Instanz (LEVEL/STOP)',
+                'value' => (int) ($cfg['instanceId'] ?? 0)],
+            ['type' => 'CheckBox', 'name' => 'cfgInvert', 'caption' => 'Richtung invertieren (auf/ab bzw. LEVEL 1=offen / 0=zu..100=offen)',
                 'value' => (bool) ($cfg['invert'] ?? false)],
             ['type' => 'Button', 'caption' => 'Bindung uebernehmen', 'onClick' =>
                 'echo HSSH_Manage($id, json_encode(["op"=>"configureDriver","args"=>['
-                . '"driver"=>$cfgDriver,"positionId"=>$cfgPositionId,"automaticId"=>$cfgAutomaticId,"invert"=>$cfgInvert]]));'],
-            ['type' => 'Label', 'caption' => 'Verwaltung/Automatik laufen im LiveViewBuilder; hier nur die Geraete-Bindung.'],
+                . '"driver"=>$cfgDriver,"invert"=>$cfgInvert,'
+                . '"positionId"=>$cfgPositionId,"automaticId"=>$cfgAutomaticId,'
+                . '"socketId"=>$cfgSocketId,"channel"=>$cfgChannel,"repeat"=>$cfgRepeat,'
+                . '"timeOpening"=>$cfgTimeOpening,"timeClosing"=>$cfgTimeClosing,'
+                . '"instanceId"=>$cfgHmInstance]]));'],
+            ['type' => 'Label', 'caption' => $status],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'Button', 'caption' => 'Referenzfahrt: voll AUF (setzt 0%)', 'onClick' =>
+                    'echo HSSH_Manage($id, json_encode(["op"=>"referenceRun","args"=>["dir"=>"up"]]));'],
+                ['type' => 'Button', 'caption' => 'Referenzfahrt: voll ZU (setzt 100%)', 'onClick' =>
+                    'echo HSSH_Manage($id, json_encode(["op"=>"referenceRun","args"=>["dir"=>"down"]]));'],
+                ['type' => 'Button', 'caption' => 'Bindung pruefen', 'onClick' =>
+                    'echo HSSH_Manage($id, json_encode(["op"=>"validate"]));'],
+            ]],
+            ['type' => 'Label', 'caption' => 'Achtung: Referenzfahrt faehrt das Rollo REAL in den Endanschlag (zum Kalibrieren). '
+                . 'Somfy: kein Positions-Feedback -> die Position wird aus den Fahrzeiten '
+                . 'geschaetzt. Erst nach einer Referenzfahrt (voll auf/zu) ist sie bekannt. Real gefahren wird nur bei '
+                . '"scharf"; bis dahin werden Fahrten nur protokolliert (Schatten-Modus).'],
         ]]);
     }
 
@@ -758,10 +944,263 @@ class ShadingDevice extends EntityModule
     private function reflectFromDriver(IShutter $drv): void
     {
         $pos = $drv->readPosition();
+        if ($pos === IShutter::POS_UNKNOWN) {
+            $pos = $this->estPos(); // travel-only: geschaetzte Lage spiegeln (oder UNKNOWN)
+        }
         if ($pos !== IShutter::POS_UNKNOWN) {
             $this->setReflect('ActualPosition', $pos);
         }
         $this->setReflect('Online', $pos !== IShutter::POS_UNKNOWN);
+    }
+
+    // ==================================================================
+    // Zeitbasierter Fahr-Executor (travel-only Treiber ohne Feedback, z. B. Somfy)
+    // ==================================================================
+
+    /**
+     * Faehrt eine Zielposition an. Absolut-Treiber -> moveTo(). Travel-only
+     * (Somfy RTS) -> ShadeKinematics: move(dir) jetzt, Stop per Ein-Schuss-Timer
+     * nach der berechneten Fahrdauer. Die geschaetzte Position (estPos) dient als
+     * Ausgangslage; ist sie unbekannt, wird NICHT absolut gefahren (Referenzfahrt
+     * noetig).
+     */
+    private function driveTo(IShutter $drv, int $target): bool
+    {
+        $caps = $drv->capabilities();
+        if (!empty($caps['absolutePosition'])) {
+            if ($drv->moveTo((float) $target)) {
+                $this->SetValue('Position', $target);
+                $rt = $this->readRt();
+                $rt['lastSet']      = $target;
+                $rt['lastAssertTs'] = time();
+                $this->writeRt($rt);
+                return true;
+            }
+            return false;
+        }
+
+        // travel-only: laufende Fahrt zuerst beenden (Position aus verstrichener Zeit).
+        $rt = $this->readRt();
+        if (!empty($rt['moving'])) {
+            $this->finishMove(true);
+        }
+        $from = $this->estPos();
+        if ($from === IShutter::POS_UNKNOWN) {
+            $this->SendDebug('HSSH.move', 'estPos unbekannt -> keine Absolutfahrt (Referenzfahrt noetig)', 0);
+            return false;
+        }
+        $steps = ShadeKinematics::steps($from, $target, [
+            'timeOpening'    => (float) $this->cfgVal('timeOpening', 0),
+            'timeClosing'    => (float) $this->cfgVal('timeClosing', 0),
+            'runIntoEndstop' => true,
+        ]);
+        if (empty($steps)) {
+            return false; // kein Bewegungsbedarf oder keine Fahrzeiten konfiguriert
+        }
+        $first = $steps[0];
+        if ($first->action === 'stop' || $first->durationMs <= 0) {
+            return true;
+        }
+        if (!$drv->move($first->action)) {
+            return false;
+        }
+        $rt = $this->readRt();
+        $rt['moving']      = true;
+        $rt['moveTarget']  = $target;
+        $rt['moveDir']     = $first->action;
+        $rt['moveFrom']    = $from;
+        $rt['moveStartTs'] = time();
+        $rt['moveDurMs']   = $first->durationMs;
+        $this->writeRt($rt);
+        $this->SetTimerInterval(self::TIMER_MOVE, $first->durationMs);
+        return true;
+    }
+
+    /**
+     * Beendet eine laufende zeitbasierte Fahrt: Stop senden (ausser sauber in den
+     * Endanschlag 0/100 gelaufen) und estPos setzen. $interrupted=true bei
+     * vorzeitigem Abbruch -> Position aus verstrichener Zeit interpolieren.
+     */
+    private function finishMove(bool $interrupted): void
+    {
+        $this->SetTimerInterval(self::TIMER_MOVE, 0);
+        $rt = $this->readRt();
+        if (empty($rt['moving'])) {
+            return;
+        }
+        $target = (int) ($rt['moveTarget'] ?? 0);
+        $from   = (int) ($rt['moveFrom'] ?? 0);
+        $newPos = $target;
+        if ($interrupted) {
+            $elapsedMs = max(0, (time() - (int) ($rt['moveStartTs'] ?? time())) * 1000);
+            $durMs     = max(1, (int) ($rt['moveDurMs'] ?? 1));
+            $frac      = min(1.0, $elapsedMs / $durMs);
+            $newPos    = (int) round($from + ($target - $from) * $frac);
+        }
+        $drv     = $this->driver();
+        $endstop = ($target === 0 || $target === 100);
+        // Bei sauberem Erreichen eines Endanschlags kein Stop noetig (Motor stoppt
+        // am Anschlag selbst -> selbstkalibrierend). Sonst Stop senden.
+        if ($drv instanceof IShutter && !($endstop && !$interrupted)) {
+            $drv->move('stop');
+        }
+        $rt = $this->readRt();
+        $rt['moving'] = false;
+        $this->writeRt($rt);
+        $this->setEstPos($newPos, true);
+        $this->SetValue('Position', $newPos);
+    }
+
+    /** Timer-Callback (prefix HSSH_MoveDone): beendet die zeitbasierte Fahrt reglaer. */
+    public function MoveDone(): void
+    {
+        $this->finishMove(false);
+    }
+
+    /** Geschaetzte Ist-Position (nur wenn kalibriert), sonst POS_UNKNOWN. */
+    private function estPos(): int
+    {
+        $rt = $this->readRt();
+        return !empty($rt['posKnown']) ? (int) ($rt['estPos'] ?? 0) : IShutter::POS_UNKNOWN;
+    }
+
+    /** Geschaetzte Position setzen (known=true nach Fahrt/Referenzfahrt). */
+    private function setEstPos(int $pos, bool $known): void
+    {
+        $rt = $this->readRt();
+        $rt['estPos']   = max(self::POS_MIN, min(self::POS_MAX, $pos));
+        $rt['posKnown'] = $known;
+        $this->writeRt($rt);
+    }
+
+    /**
+     * Trockenlauf-Vorschau des geplanten Fahrbefehls (Schatten-Modus/Log). Zeigt
+     * bei Somfy Richtung + rohes Telegramm (Hex) + geplante Fahrdauer, damit vor
+     * dem Scharfschalten geprueft werden kann, was real gesendet WUERDE.
+     */
+    private function drivePreview(IShutter $drv, int $target, int $cur): string
+    {
+        $caps = $drv->capabilities();
+        if (!empty($caps['absolutePosition'])) {
+            return 'moveTo ' . $target . '%';
+        }
+        $from = $this->estPos();
+        $ref  = ($from === IShutter::POS_UNKNOWN) ? $cur : $from;
+        $dir  = ($target > $ref) ? 'down' : 'up';
+        $hex  = method_exists($drv, 'frameHex') ? $drv->frameHex($dir) : '';
+        if ($from === IShutter::POS_UNKNOWN) {
+            return 'travel ' . strtoupper($dir) . ($hex !== '' ? ' [' . $hex . ']' : '') . ' (estPos unbekannt -> Referenzfahrt noetig)';
+        }
+        $steps = ShadeKinematics::steps($from, $target, [
+            'timeOpening' => (float) $this->cfgVal('timeOpening', 0),
+            'timeClosing' => (float) $this->cfgVal('timeClosing', 0),
+        ]);
+        $dur = (!empty($steps)) ? $steps[0]->durationMs : 0;
+        return 'travel ' . strtoupper($dir) . ($hex !== '' ? ' [' . $hex . ']' : '') . ' ' . $from . '%->' . $target . '% (' . $dur . 'ms)';
+    }
+
+    /**
+     * Referenzfahrt (Kalibrierung): voll in einen Endanschlag fahren und estPos
+     * exakt auf 0 (up) bzw. 100 (down) setzen. NUR auf Operator-Kommando, hart
+     * safety-gegatet (kein Fahren bei Sturm/Regen). Dies IST ein realer Fahrbefehl
+     * — bewusst nicht an armed gebunden, weil man vor dem Scharfschalten kalibriert.
+     */
+    private function mgmtReferenceRun(array $args): array
+    {
+        $dir = strtolower((string) ($args['dir'] ?? ''));
+        if (!in_array($dir, ['up', 'down'], true)) {
+            throw new ContractException('dir muss up|down sein');
+        }
+        $drv = $this->driver();
+        if (!$drv instanceof IShutter) {
+            throw new ContractException('kein Treiber gebunden');
+        }
+        if ($this->stormActive($this->readInputs())) {
+            throw new ContractException('Sturm/Regen aktiv -> Referenzfahrt gesperrt (Safety)');
+        }
+        $drv->referenceRun($dir); // realer Fahrbefehl in den Endanschlag
+        $endstop = ($dir === 'up') ? self::POS_MIN : self::POS_MAX;
+        $full    = ($dir === 'up') ? (float) $this->cfgVal('timeOpening', 0) : (float) $this->cfgVal('timeClosing', 0);
+        $durMs   = max(1000, (int) round($full * 1000));
+        // Abschluss ueber den MoveStop-Timer: setzt estPos exakt auf den Endanschlag.
+        $rt = $this->readRt();
+        $rt['moving']      = true;
+        $rt['moveTarget']  = $endstop;
+        $rt['moveFrom']    = ($endstop === self::POS_MIN) ? self::POS_MAX : self::POS_MIN;
+        $rt['moveDir']     = $dir;
+        $rt['moveStartTs'] = time();
+        $rt['moveDurMs']   = $durMs;
+        $this->writeRt($rt);
+        $this->SetTimerInterval(self::TIMER_MOVE, $durMs);
+        return ['ok' => true, 'dir' => $dir, 'endstop' => $endstop, 'settleMs' => $durMs];
+    }
+
+    /** Diagnose: prueft die Bindung dieser Instanz (op=validate + Konsolen-Button). */
+    private function mgmtValidate(): array
+    {
+        $h = $this->computeHealth();
+        $cfg = $this->store()->get('config', []);
+        return ['ok' => $h['ok'], 'health' => $h['text'], 'issues' => $h['issues'], 'config' => is_array($cfg) ? $cfg : []];
+    }
+
+    /**
+     * Bindungs-Gesundheit: existieren die gebundenen Objekte, ist der Treiber aktiv,
+     * ist die Position bekannt. Liefert ['ok','text','issues'] fuer Health-Variable,
+     * Konsole und den Hub-Aggregat-Scan.
+     */
+    private function computeHealth(): array
+    {
+        $cfg = $this->store()->get('config', []);
+        $cfg = is_array($cfg) ? $cfg : [];
+        $drv = (string) ($cfg['driver'] ?? '');
+        if ($drv === '') {
+            return ['ok' => false, 'text' => 'inaktiv (kein Treiber)', 'issues' => ['kein Treiber']];
+        }
+        $issues = [];
+        foreach (['positionId', 'socketId', 'automaticId'] as $k) {
+            $id = (int) ($cfg[$k] ?? 0);
+            if ($id > 0 && function_exists('IPS_ObjectExists') && !@\IPS_ObjectExists($id)) {
+                $issues[] = $k . ' #' . $id . ' fehlt';
+            }
+        }
+        if ($drv === 'somfy-rts') {
+            $sid = (int) ($cfg['socketId'] ?? 0);
+            if ($sid <= 0 || !function_exists('IPS_InstanceExists') || !@\IPS_InstanceExists($sid)) {
+                $issues[] = 'Client-Socket fehlt';
+            }
+            if (((int) ($cfg['timeOpening'] ?? 0)) <= 0 || ((int) ($cfg['timeClosing'] ?? 0)) <= 0) {
+                $issues[] = 'Fahrzeiten fehlen';
+            }
+        }
+        if ($drv === 'hm-shutter') {
+            $lv = (int) ($cfg['levelVarId'] ?? 0);
+            if ($lv <= 0 || !function_exists('IPS_VariableExists') || !@\IPS_VariableExists($lv)) {
+                $issues[] = 'LEVEL-Variable fehlt';
+            }
+        }
+        $drv = $this->driver();
+        if (!($drv instanceof IShutter)) {
+            $issues[] = 'Treiber inaktiv';
+        }
+        if ($issues) {
+            return ['ok' => false, 'text' => 'FEHLER: ' . implode(', ', $issues), 'issues' => $issues];
+        }
+        // Absolut-Treiber (HM) melden echtes Feedback; travel-only nutzt estPos.
+        $pos = $drv->readPosition();
+        if ($pos === IShutter::POS_UNKNOWN) {
+            $pos = $this->estPos();
+        }
+        $known = $pos !== IShutter::POS_UNKNOWN;
+        return ['ok' => true, 'issues' => [],
+            'text' => 'OK' . ($known ? ' · ' . $pos . '%' : ' · Position unbekannt (Referenzfahrt noetig)')];
+    }
+
+    /** Sichtbare Bindungs-Health-Variable aktualisieren (nicht still ausfallen). */
+    private function updateHealth(): void
+    {
+        @$this->RegisterVariableString('BindHealth', 'Bindung', '', 90);
+        $h = $this->computeHealth();
+        @$this->SetValue('BindHealth', (string) $h['text']);
     }
 
     // ==================================================================
@@ -806,16 +1245,14 @@ class ShadingDevice extends EntityModule
             $rt['selfWriteTs']  = time();
             $rt['selfWriteVal'] = $target;
             $this->writeRt($rt);
-            if ($drv->moveTo((float) $target)) {
-                $this->SetValue('Position', $target);
-                $rt['lastSet']      = $target;
-                $rt['lastAssertTs'] = time();
-                $this->writeRt($rt);
-            }
+            // Absolut-Treiber: moveTo. Travel-only (Somfy): zeitbasiert ueber driveTo.
+            $this->driveTo($drv, (int) $target);
         } else {
-            // Schatten-Modus: nur protokollieren, kein Geraeteschreiben.
+            // Schatten-Modus: nur protokollieren, kein Geraeteschreiben. Fuer den
+            // Trockenlauf wird der geplante Fahrbefehl inkl. Telegramm-Vorschau geloggt.
             $this->SendDebug('HSSH.shadow', 'Ziel ' . $target . '% (ist ' . $cur . '%, '
-                . ($d['storm'] ? 'STURM' : ($d['sunTarget'] !== null ? 'Sonne' : 'Zeitplan')) . ') - nicht scharf', 0);
+                . ($d['storm'] ? 'STURM' : ($d['sunTarget'] !== null ? 'Sonne' : 'Zeitplan')) . ') - nicht scharf | '
+                . $this->drivePreview($drv, (int) $target, (int) $cur), 0);
             $rt['shadowTarget'] = $target;
             $rt['shadowTs']     = time();
             $this->writeRt($rt);
@@ -831,6 +1268,9 @@ class ShadingDevice extends EntityModule
     {
         $mode = $this->intVal('Mode');          // 0 Auto, 1 Manuell, 2 Sonne
         $cur  = $drv->readPosition();
+        if ($cur === IShutter::POS_UNKNOWN) {
+            $cur = $this->estPos();             // travel-only (Somfy): geschaetzte Ist-Lage
+        }
         $inp  = $this->readInputs();
 
         // Sonne: Sonnenstandsvergleich gegen das Raum-Sonnenprofil (evalGeo) + Min-Dwell.

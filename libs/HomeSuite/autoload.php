@@ -60,6 +60,8 @@ $__hs_files = [
 
     // --- Vendor-Treiber (self-registrieren bei der DriverFactory) ---
     'Drivers/HomeMaticThermostat.php',
+    'Drivers/SomfyRtsShutter.php',
+    'Drivers/HomeMaticShutter.php',
 
     // --- Engines ---
     'Engines/ProfileEngine.php',       // Anlegen/Bearbeiten/Zuweisen von Profilen (getrennt)

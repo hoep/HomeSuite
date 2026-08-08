@@ -249,6 +249,10 @@ class HomeSuiteHub extends EntityModule
             ],
         ]);
 
+        // Dead-Binding-Scan ueber alle Entitaeten (read-only Diagnose).
+        $m->addManagementAction(['op' => 'validate', 'verb' => 'validate', 'target' => 'hub',
+            'label' => 'Bindungen pruefen (alle Entitaeten)', 'destructive' => false, 'fields' => []]);
+
         // --- Beschattungs-/Profil-Verwaltung (geteilte benannte Profile, ProfileEngine) ---
         foreach ([
             ['profileTypes',    'Profiltypen auflisten'],
@@ -315,12 +319,63 @@ class HomeSuiteHub extends EntityModule
                 }
                 (new Backup())->restore($file);
                 return ['ok' => true, 'op' => $op, 'result' => ['restored' => basename($file)]];
+
+            case 'validate':
+                return $this->mgmtValidateAll();
         }
 
         if (strncmp($op, 'profile', 7) === 0) {
             return $this->mgmtProfile($op, $args);
         }
         return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
+    }
+
+    /**
+     * Aggregat-Bindungspruefung ueber ALLE Entitaeten (Dead-Binding-Scan): ruft je
+     * validate-faehiger Entitaet deren op=validate und sammelt die Problemfaelle.
+     * Direkte Antwort auf „jemand loescht einen Aktor/IPSShadowing" -> zentral sichtbar.
+     */
+    private function mgmtValidateAll(): array
+    {
+        $problems = [];
+        $total    = 0;
+        $checked  = 0;
+        $healthy  = 0;
+        foreach ($this->discoverEntities() as $e) {
+            $total++;
+            $prefix = (string) ($e['prefix'] ?? '');
+            $iid    = (int) ($e['instanceID'] ?? 0);
+            if ($prefix === '' || $iid <= 0) {
+                continue;
+            }
+            $fn = $prefix . '_Manage';
+            if (!function_exists($fn)) {
+                continue;
+            }
+            try {
+                $res = json_decode((string) $fn($iid, json_encode(['op' => 'validate'])), true);
+            } catch (\Throwable $ex) {
+                $res = null;
+            }
+            // Nur validate-faehige Entitaeten zaehlen (liefern health/issues).
+            if (!is_array($res) || (!isset($res['health']) && !isset($res['issues']))) {
+                continue;
+            }
+            $checked++;
+            if (!empty($res['ok'])) {
+                $healthy++;
+            } else {
+                $problems[] = [
+                    'id'     => $iid,
+                    'name'   => (string) ($e['name'] ?? ''),
+                    'domain' => (string) ($e['domain'] ?? ''),
+                    'health' => (string) ($res['health'] ?? '?'),
+                    'issues' => $res['issues'] ?? [],
+                ];
+            }
+        }
+        return ['ok' => empty($problems), 'total' => $total, 'checked' => $checked,
+            'healthy' => $healthy, 'problems' => $problems];
     }
 
     // --- Geteilte Beschattungs-Profile (ProfileEngine auf dem Hub-Store) -----
