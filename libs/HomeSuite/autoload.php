@@ -61,8 +61,9 @@ $__hs_files = [
     'HAL/GenericVariableShutter.php',
     'HAL/GenericVariableValve.php',
 
-    // --- Audio-Treiber (generisch variablen-/skriptgebunden; nativ folgt: sonos-upnp/heos) ---
+    // --- Audio-Treiber (generisch variablen-/skriptgebunden + native Vendor-Codecs) ---
     'Drivers/Audio/GenericBoundAudioRenderer.php',
+    'Drivers/Audio/SonosUpnp.php',     // nativer Sonos-Codec (self-registriert 'sonos-upnp')
 
     // --- Vendor-Treiber (self-registrieren bei der DriverFactory) ---
     'Drivers/HomeMaticThermostat.php',
