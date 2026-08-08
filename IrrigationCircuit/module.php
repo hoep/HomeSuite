@@ -474,6 +474,9 @@ class IrrigationCircuit extends EntityModule
      */
     private function runSchedule(): void
     {
+        if (!$this->automationEnabled()) {
+            return; // globaler Automatik-Schalter (Hub) aus
+        }
         if (!(bool) $this->valOf('Automatic', 0)) {
             return;
         }

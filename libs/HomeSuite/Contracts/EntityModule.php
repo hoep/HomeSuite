@@ -415,6 +415,28 @@ abstract class EntityModule extends \IPSModule
     }
 
     /**
+     * GLOBALER Automatik-Schalter (HomeSuite-weit). Liest das Hub-Flag
+     * 'AutomationEnabled'. FAIL-SAFE: true, wenn kein Hub/Flag existiert -> die
+     * Automatik laeuft im Zweifel weiter. Jede Domaene ruft dies in ihrem
+     * Automatik-/Reconcile-Pfad; Safety (z. B. Sturm) bleibt davon unberuehrt.
+     */
+    protected function automationEnabled(): bool
+    {
+        if (!function_exists('IPS_GetInstanceListByModuleID')) {
+            return true;
+        }
+        $hubs = @\IPS_GetInstanceListByModuleID('{A0C082B4-9E74-430E-BD97-F9CEBB364257}');
+        if (!is_array($hubs) || $hubs === []) {
+            return true;
+        }
+        $vid = @\IPS_GetObjectIDByIdent('AutomationEnabled', (int) $hubs[0]);
+        if (!$vid) {
+            return true;
+        }
+        return @\GetValue($vid) === false ? false : true;
+    }
+
+    /**
      * Laenge des manualHold-Fensters in Sekunden (aus Konfig, sonst Default).
      */
     protected function holdSeconds(): int

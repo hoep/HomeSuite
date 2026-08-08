@@ -269,6 +269,14 @@ class HomeSuiteHub extends EntityModule
             $m->addManagementAction(['op' => $pa[0], 'verb' => $pa[0], 'target' => 'hub', 'label' => $pa[1], 'destructive' => ($pa[0] === 'profileDelete'), 'fields' => []]);
         }
 
+        // Globaler Automatik-Schalter (HomeSuite-weit). Jede Entitaet liest ihn ueber
+        // EntityModule::automationEnabled(); Default true (seed in ApplyChanges).
+        $m->addControl([
+            'ident' => 'AutomationEnabled', 'type' => \Hoep\HomeSuite\ControlContract::T_SWITCH,
+            'role' => 'hub:automation', 'label' => 'Automatik global', 'varType' => 0,
+            'profile' => '~Switch', 'actionable' => true,
+        ]);
+
         return $m->toArray();
     }
 
@@ -277,9 +285,19 @@ class HomeSuiteHub extends EntityModule
      * einem gueltigen Control aufgerufen. Die Basis faengt das ab. Dieser Hook
      * bleibt daher leer.
      */
+    public function ApplyChanges()
+    {
+        parent::ApplyChanges();
+        // Globalen Automatik-Schalter einmalig auf AN setzen (fail-safe Default true).
+        if (!(bool) $this->store()->get('autoSeeded', false)) {
+            @$this->SetValue('AutomationEnabled', true);
+            $this->store()->set('autoSeeded', true);
+        }
+    }
+
     protected function applyControl(Control $c, $value, ActionContext $ctx): void
     {
-        // absichtlich leer — Hub wird nicht bedient
+        // absichtlich leer — Hub wird nur ueber Statusvariablen/Manage gesteuert
     }
 
     // ==================================================================

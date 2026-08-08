@@ -449,6 +449,9 @@ class HeatingZone extends EntityModule
      */
     private function reconcile(IThermostat $drv): void
     {
+        if (!$this->automationEnabled()) {
+            return; // globaler Automatik-Schalter (Hub) aus
+        }
         $caps = $drv->capabilities();
 
         if (($caps['scheduleMode'] ?? 'controller') === 'device') {

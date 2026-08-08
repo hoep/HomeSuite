@@ -1217,6 +1217,10 @@ class ShadingDevice extends EntityModule
     {
         $d = $this->computeDecision($drv, true);
         $target = $d['target'];
+        // Globaler Automatik-Schalter (Hub) aus -> keine Komfort-Automatik; Sturm/Safety bleibt.
+        if (!$this->automationEnabled() && empty($d['storm'])) {
+            return;
+        }
         $rt = $this->readRt();
         if ($target === null) {
             $this->writeRt($rt); // Debounce-State ggf. schon in computeDecision persistiert
