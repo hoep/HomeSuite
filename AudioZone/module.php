@@ -39,6 +39,7 @@ use Hoep\HomeSuite\HAL\IAudioRenderer;
 use Hoep\HomeSuite\HAL\IAudioStateReadable;
 use Hoep\HomeSuite\HAL\IDriver;
 use Hoep\HomeSuite\HAL\SonosUpnp;
+use Hoep\HomeSuite\HAL\ContentRef;
 use Hoep\HomeSuite\Engines\RadioNow;
 
 class AudioZone extends EntityModule
@@ -167,6 +168,7 @@ class AudioZone extends EntityModule
                 ['op' => 'radioNow',        'label' => 'Radio: laufender Titel + Cover'],
                 ['op' => 'playDirect',      'label' => 'Radio: werbefreien HQ-Stream direkt spielen'],
                 ['op' => 'radioStations',   'label' => 'Radio: Senderliste'],
+                ['op' => 'playContent',     'label' => 'Bibliotheks-Inhalt abspielen (ContentRef)'],
             ],
 
             'capabilities' => [
@@ -618,6 +620,8 @@ class AudioZone extends EntityModule
                     $list[] = ['key' => $k, 'title' => $s['title']];
                 }
                 return ['ok' => true, 'stations' => $list];
+            case 'playContent':
+                return $this->mgmtPlayContent($args);
             default:
                 return parent::mgmt($op, $args, $ctx);
         }
@@ -909,6 +913,26 @@ class AudioZone extends EntityModule
         $rt['radioCache'] = ['ts' => time(), 'data' => $data];
         $this->writeRt($rt);
         return ['ok' => true] + $data;
+    }
+
+    /** Aufgeloesten Bibliotheks-Inhalt (ContentRef) auf diesem Renderer abspielen. */
+    private function mgmtPlayContent(array $args): array
+    {
+        $ref = ContentRef::fromArray((array) ($args['ref'] ?? []));
+        if ($ref->uri === '') {
+            return ['ok' => false, 'error' => 'ref ohne uri (erst ueber Hub mediaResolve aufloesen)'];
+        }
+        if (!(bool) $this->cfgVal('armed', false)) {
+            return ['ok' => true, 'armed' => false, 'note' => 'Schatten: WUERDE abspielen', 'title' => $ref->title];
+        }
+        [$ip, $rin] = $this->resolveSpeaker();
+        if ($ip === '') {
+            return ['ok' => false, 'error' => 'Speaker nicht aufloesbar'];
+        }
+        $drv = DriverFactory::create('sonos-upnp', ['host' => $ip, 'rincon' => $rin, 'timeout' => 3000]);
+        $drv->playSource($ref->toSourceRef());
+        $rt = $this->readRt(); unset($rt['radioCache']); $this->writeRt($rt);
+        return ['ok' => true, 'title' => $ref->title, 'provider' => $ref->provider, 'kind' => $ref->kind];
     }
 
     /** Werbefreien HQ-Direktstream eines Senders auf diesem Speaker spielen (statt TuneIn). */

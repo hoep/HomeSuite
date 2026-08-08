@@ -297,6 +297,11 @@ class HomeSuiteHub extends EntityModule
             'label' => 'Medienquellen konfigurieren', 'destructive' => false, 'fields' => []]);
         $m->addManagementAction(['op' => 'spotifyAuthUrl', 'verb' => 'spotifyAuthUrl', 'target' => 'hub',
             'label' => 'Spotify-Login-Link erzeugen', 'destructive' => false, 'fields' => []]);
+        foreach ([['mediaProviders', 'Provider auflisten'], ['mediaBrowse', 'Bibliothek browsen'],
+                  ['mediaSearch', 'Bibliothek suchen'], ['mediaResolve', 'Inhalt aufloesen']] as $ma) {
+            $m->addManagementAction(['op' => $ma[0], 'verb' => $ma[0], 'target' => 'hub',
+                'label' => $ma[1], 'destructive' => false, 'fields' => []]);
+        }
 
         // --- Beschattungs-/Profil-Verwaltung (geteilte benannte Profile, ProfileEngine) ---
         foreach ([
@@ -395,6 +400,20 @@ class HomeSuiteHub extends EntityModule
 
             case 'spotifyAuthUrl':
                 return $this->mgmtSpotifyAuthUrl();
+
+            case 'mediaProviders':
+                $ps = [];
+                foreach (\Hoep\HomeSuite\Engines\MediaProviders::build($this->sourcesConfig()) as $id => $p) {
+                    $ps[] = ['id' => $id, 'label' => $p->label(), 'configured' => $p->isConfigured()];
+                }
+                return ['ok' => true, 'providers' => $ps];
+
+            case 'mediaBrowse':
+                return $this->mgmtMediaBrowse($args);
+            case 'mediaSearch':
+                return $this->mgmtMediaBrowse($args, true);
+            case 'mediaResolve':
+                return $this->mgmtMediaResolve($args);
         }
 
         if (strncmp($op, 'profile', 7) === 0) {
@@ -526,6 +545,39 @@ class HomeSuiteHub extends EntityModule
         $cur['spotify']['enabled'] = true;
         $this->store()->set('sources', $cur);
         echo $this->spotifyHtml('Spotify erfolgreich verbunden! Du kannst dieses Fenster schliessen.');
+    }
+
+    /** Provider browsen/suchen -> ContentRef-Liste (Array). */
+    private function mgmtMediaBrowse(array $args, bool $search = false): array
+    {
+        $pid = (string) ($args['provider'] ?? '');
+        $providers = \Hoep\HomeSuite\Engines\MediaProviders::build($this->sourcesConfig());
+        $p = $providers[$pid] ?? null;
+        if ($p === null) {
+            return ['ok' => false, 'error' => 'provider nicht aktiv: ' . $pid];
+        }
+        if ($search) {
+            $items = $p->search((string) ($args['query'] ?? ''), (int) ($args['limit'] ?? 50));
+        } else {
+            $container = (string) ($args['container'] ?? '');
+            $items = ($container === '') ? $p->roots()
+                : $p->browse($container, (int) ($args['offset'] ?? 0), (int) ($args['limit'] ?? 100));
+        }
+        return ['ok' => true, 'provider' => $pid,
+            'items' => array_map(fn($r) => $r->toArray(), $items)];
+    }
+
+    /** Einen ContentRef abspielbereit machen (uri fuellen). */
+    private function mgmtMediaResolve(array $args): array
+    {
+        $pid = (string) ($args['provider'] ?? '');
+        $providers = \Hoep\HomeSuite\Engines\MediaProviders::build($this->sourcesConfig());
+        $p = $providers[$pid] ?? null;
+        if ($p === null) {
+            return ['ok' => false, 'error' => 'provider nicht aktiv: ' . $pid];
+        }
+        $ref = \Hoep\HomeSuite\HAL\ContentRef::fromArray((array) ($args['ref'] ?? []));
+        return ['ok' => true, 'ref' => $p->resolve($ref)->toArray()];
     }
 
     private function spotifyHtml(string $msg): string

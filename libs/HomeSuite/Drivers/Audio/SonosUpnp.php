@@ -161,28 +161,79 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
 
     public function playSource(AudioSourceRef $ref): void
     {
-        // Direkte URI-Quellen (Radio/Stream) koennen wir sofort setzen; Favoriten/Playlists
-        // benoetigen eine ContentDirectory-Aufloesung (Browse) -> Ausbaustufe. Wenn eine
-        // konkrete URI vorliegt, abspielen.
-        if ($ref->uri !== '') {
-            if ($ref->kind === AudioSourceRef::KIND_STATION) {
-                // Direkter Radio-Stream (werbefrei, statt TuneIn): x-rincon-mp3radio://<url>
-                $uri = (strpos($ref->uri, 'x-rincon') === 0) ? $ref->uri : ('x-rincon-mp3radio://' . $ref->uri);
-                $this->setUri($uri, $ref->metadata['didl'] ?? $this->radioDidl($ref->title !== '' ? $ref->title : 'Radio'));
-            } else {
-                // Queue ersetzen
-                $this->soap(self::AVT, 'RemoveAllTracksFromQueue', '<InstanceID>0</InstanceID>');
-                $this->soap(self::AVT, 'AddURIToQueue',
-                    '<InstanceID>0</InstanceID><EnqueuedURI>' . $this->esc($ref->uri) . '</EnqueuedURI>'
-                    . '<EnqueuedURIMetaData>' . $this->esc($ref->metadata['didl'] ?? '') . '</EnqueuedURIMetaData>'
-                    . '<DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>');
-                $uid = (string) ($this->cfg['rincon'] ?? '');
-                if ($uid !== '') {
-                    $this->setUri('x-rincon-queue:' . $uid . '#0', '');
-                }
-            }
-            $this->play();
+        if ($ref->uri === '') {
+            return;
         }
+        // Uebersetzung nach Inhalts-Art (aus ContentRef): url/dlna = direkter Track,
+        // spotify = Dienst-URI (x-sonos-spotify), station = Radio (mp3radio), sonst Queue.
+        $ck = (string) ($ref->metadata['contentKind'] ?? '');
+        if ($ck === 'spotify' || strncmp($ref->uri, 'spotify:', 8) === 0) {
+            $this->playSpotify($ref->uri);
+            return;
+        }
+        if ($ref->kind === AudioSourceRef::KIND_STATION || $ck === 'station') {
+            $uri = (strpos($ref->uri, 'x-rincon') === 0) ? $ref->uri : ('x-rincon-mp3radio://' . $ref->uri);
+            $this->setUri($uri, $ref->metadata['didl'] ?? $this->radioDidl($ref->title !== '' ? $ref->title : 'Radio'));
+            $this->play();
+            return;
+        }
+        // url/dlna/library/container: als Track in die (geleerte) Queue -> abspielen.
+        $this->soap(self::AVT, 'RemoveAllTracksFromQueue', '<InstanceID>0</InstanceID>');
+        $didl = $ref->metadata['didl'] ?? $this->trackDidl($ref->title, (string) ($ref->metadata['cover'] ?? ''));
+        $this->soap(self::AVT, 'AddURIToQueue',
+            '<InstanceID>0</InstanceID><EnqueuedURI>' . $this->esc($ref->uri) . '</EnqueuedURI>'
+            . '<EnqueuedURIMetaData>' . $this->esc($didl) . '</EnqueuedURIMetaData>'
+            . '<DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>');
+        $uid = (string) ($this->cfg['rincon'] ?? '');
+        if ($uid !== '') {
+            $this->setUri('x-rincon-queue:' . $uid . '#0', '');
+        }
+        $this->play();
+    }
+
+    /** Spotify-URI (spotify:track|album|playlist:ID) auf Sonos abspielen (x-sonos-spotify). */
+    private function playSpotify(string $spUri): void
+    {
+        if (!preg_match('~spotify:(track|album|playlist|artist):([A-Za-z0-9]+)~', $spUri, $m)) {
+            return;
+        }
+        $type = $m[1];
+        $enc  = rawurlencode('spotify:' . $type . ':' . $m[2]);
+        $sid  = (int) ($this->cfg['spotifySid'] ?? 9);   // Household-spezifisch (Default 9)
+        $sn   = (int) ($this->cfg['spotifySn'] ?? 1);
+        if ($type === 'track') {
+            $uri = 'x-sonos-spotify:' . $enc . '?sid=' . $sid . '&flags=8224&sn=' . $sn;
+            $this->soap(self::AVT, 'RemoveAllTracksFromQueue', '<InstanceID>0</InstanceID>');
+            $this->soap(self::AVT, 'AddURIToQueue',
+                '<InstanceID>0</InstanceID><EnqueuedURI>' . $this->esc($uri) . '</EnqueuedURI>'
+                . '<EnqueuedURIMetaData></EnqueuedURIMetaData>'
+                . '<DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>');
+        } else {
+            // Container (Playlist/Album): x-rincon-cpcontainer + Queue
+            $cont = 'x-rincon-cpcontainer:1006206c' . $enc . '?sid=' . $sid . '&flags=8300&sn=' . $sn;
+            $this->soap(self::AVT, 'RemoveAllTracksFromQueue', '<InstanceID>0</InstanceID>');
+            $this->soap(self::AVT, 'AddURIToQueue',
+                '<InstanceID>0</InstanceID><EnqueuedURI>' . $this->esc($cont) . '</EnqueuedURI>'
+                . '<EnqueuedURIMetaData></EnqueuedURIMetaData>'
+                . '<DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>');
+        }
+        $uid = (string) ($this->cfg['rincon'] ?? '');
+        if ($uid !== '') {
+            $this->setUri('x-rincon-queue:' . $uid . '#0', '');
+        }
+        $this->play();
+    }
+
+    /** Minimales DIDL fuer einen einzelnen Musik-Track (direkte URL). */
+    private function trackDidl(string $title, string $cover): string
+    {
+        return '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            . 'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+            . 'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="0" parentID="-1" restricted="true">'
+            . '<dc:title>' . $this->esc($title !== '' ? $title : 'Titel') . '</dc:title>'
+            . '<upnp:class>object.item.audioItem.musicTrack</upnp:class>'
+            . ($cover !== '' ? '<upnp:albumArtURI>' . $this->esc($cover) . '</upnp:albumArtURI>' : '')
+            . '</item></DIDL-Lite>';
     }
 
     public function playAnnouncement(string $uri, int $volume = 0): void

@@ -233,18 +233,21 @@ final class ContentRef
         );
     }
 
-    /** ContentRef -> AudioSourceRef (fuer IAudioRenderer::playSource). */
+    /**
+     * ContentRef -> AudioSourceRef (fuer IAudioRenderer::playSource). Die eigentliche
+     * Uebersetzung macht der Renderer anhand metadata.contentKind (url|dlna|spotify|
+     * station|container|...). kind bleibt hier bewusst grob (STATION nur fuer Radio).
+     */
     public function toSourceRef(): AudioSourceRef
     {
-        $map = [
-            'url' => AudioSourceRef::KIND_STATION, 'dlna' => AudioSourceRef::KIND_STATION,
-            'spotify' => AudioSourceRef::KIND_PLAYLIST, 'audible' => AudioSourceRef::KIND_PLAYLIST,
-            'container' => AudioSourceRef::KIND_PLAYLIST, 'library' => AudioSourceRef::KIND_PLAYLIST,
-            'station' => AudioSourceRef::KIND_STATION, 'preset' => AudioSourceRef::KIND_PRESET,
-        ];
-        $kind = $map[$this->kind] ?? AudioSourceRef::KIND_URI;
-        return new AudioSourceRef($kind, $this->id !== '' ? $this->id : $this->uri, $this->title, $this->uri,
-            ['provider' => $this->provider, 'contentKind' => $this->kind, 'cover' => $this->cover, 'isContainer' => $this->isContainer]);
+        $kind = ($this->kind === 'station') ? AudioSourceRef::KIND_STATION
+            : (($this->kind === 'preset') ? AudioSourceRef::KIND_PRESET : AudioSourceRef::KIND_URI);
+        return new AudioSourceRef($kind, $this->id !== '' ? $this->id : $this->uri, $this->title, $this->uri, [
+            'provider'     => $this->provider,
+            'contentKind'  => $this->kind,
+            'cover'        => $this->cover,
+            'isContainer'  => $this->isContainer,
+        ]);
     }
 }
 
