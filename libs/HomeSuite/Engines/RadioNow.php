@@ -28,17 +28,23 @@ final class RadioNow
      * @var array<string,array{title:string,stream:string,orf:?string,match:string[]}>
      */
     public const STATIONS = [
-        'oe3'      => ['title' => 'Hitradio Ö3',            'stream' => 'https://orf-live.ors-shoutcast.at/oe3-q2a', 'orf' => 'oe3', 'match' => ['oe3', 'hitradio ö3', 's8007']],
-        'fm4'      => ['title' => 'FM4',                    'stream' => 'https://orf-live.ors-shoutcast.at/fm4-q2a', 'orf' => 'fm4', 'match' => ['fm4', 'fm 4']],
-        'oe1'      => ['title' => 'Österreich 1',           'stream' => 'https://orf-live.ors-shoutcast.at/oe1-q2a', 'orf' => 'oe1', 'match' => ['oe1', 'österreich 1', 'ö1']],
-        'ooe'      => ['title' => 'Radio der Region',   'stream' => 'https://orf-live.ors-shoutcast.at/ooe-q2a', 'orf' => 'ooe', 'match' => ['oberösterreich', 'ooe', 'radio oö']],
-        'kronehit' => ['title' => 'Kronehit',               'stream' => 'http://onair-ha1.krone.at/kronehit1058.mp3', 'orf' => null, 'match' => ['kronehit', 'krone']],
-        'antenne'  => ['title' => 'Antenne Bayern',         'stream' => 'https://stream.antenne.de/antenne/stream/mp3', 'orf' => null, 'match' => ['antenne bayern 103', 'antenne bayern (', 'antenne bayern pop']],
-        'antenne_chillout' => ['title' => 'Antenne Bayern Chillout', 'stream' => 'https://stream.antenne.de/chillout/stream/mp3', 'orf' => null, 'match' => ['chillout']],
-        'antenne_love'     => ['title' => 'Antenne Bayern Lovesongs', 'stream' => 'https://stream.antenne.de/lovesongs/stream/mp3', 'orf' => null, 'match' => ['lovesong']],
-        'antenne_top40'    => ['title' => 'Antenne Bayern Top 40',    'stream' => 'https://stream.antenne.de/top-40/stream/mp3', 'orf' => null, 'match' => ['antenne bayern top']],
-        'liferadio'        => ['title' => 'Life Radio',              'stream' => 'https://stream.liferadio.tirol/MUONLY/mp3-192/link', 'orf' => null, 'match' => ['life radio']],
+        'oe3'      => ['title' => 'Hitradio Ö3',            'stream' => 'https://orf-live.ors-shoutcast.at/oe3-q2a', 'orf' => 'oe3', 'logo' => 'https://tubestatic.orf.at/mojo/1_3/storyserver//tube/common/images/apple-icons/oe3.png', 'match' => ['oe3', 'hitradio ö3', 's8007']],
+        'fm4'      => ['title' => 'FM4',                    'stream' => 'https://orf-live.ors-shoutcast.at/fm4-q2a', 'orf' => 'fm4', 'logo' => 'https://tubestatic.orf.at/mojo/1_3/storyserver//tube/fm4/images/touch-icon-iphone-retina.png', 'match' => ['fm4', 'fm 4']],
+        'oe1'      => ['title' => 'Österreich 1',           'stream' => 'https://orf-live.ors-shoutcast.at/oe1-q2a', 'orf' => 'oe1', 'logo' => 'https://oe1.orf.at/static/img/logo_oe1.png', 'match' => ['oe1', 'österreich 1', 'ö1']],
+        'ooe'      => ['title' => 'Radio der Region',   'stream' => 'https://orf-live.ors-shoutcast.at/ooe-q2a', 'orf' => 'ooe', 'logo' => 'https://tubestatic.orf.at/mojo/1_3/storyserver//tube/common/images/apple-icons/ooe.png', 'match' => ['oberösterreich', 'ooe', 'radio oö']],
+        'kronehit' => ['title' => 'Kronehit',               'stream' => 'http://onair-ha1.krone.at/kronehit1058.mp3', 'orf' => null, 'logo' => 'http://www.kronehit.at/static/base/img/apple-touch-icon.f5c3420c154b.png', 'match' => ['kronehit', 'krone']],
+        'antenne'  => ['title' => 'Antenne Bayern',         'stream' => 'https://stream.antenne.de/antenne/stream/mp3', 'orf' => null, 'logo' => 'http://www.antenne.de/logos/station-antenne-bayern/apple-touch-icon.png', 'match' => ['antenne bayern 103', 'antenne bayern (', 'antenne bayern pop']],
+        'antenne_chillout' => ['title' => 'Antenne Bayern Chillout', 'stream' => 'https://stream.antenne.de/chillout/stream/mp3', 'orf' => null, 'logo' => 'http://www.antenne.de/logos/station-antenne-bayern/apple-touch-icon.png', 'match' => ['chillout']],
+        'antenne_love'     => ['title' => 'Antenne Bayern Lovesongs', 'stream' => 'https://stream.antenne.de/lovesongs/stream/mp3', 'orf' => null, 'logo' => 'http://www.antenne.de/logos/station-antenne-bayern/apple-touch-icon.png', 'match' => ['lovesong']],
+        'antenne_top40'    => ['title' => 'Antenne Bayern Top 40',    'stream' => 'https://stream.antenne.de/top-40/stream/mp3', 'orf' => null, 'logo' => 'http://www.antenne.de/logos/station-antenne-bayern/apple-touch-icon.png', 'match' => ['antenne bayern top']],
+        'liferadio'        => ['title' => 'Life Radio',              'stream' => 'https://stream.liferadio.tirol/MUONLY/mp3-192/link', 'orf' => null, 'logo' => 'https://liferadio.konsole-labs.com/img/live.png', 'match' => ['life radio']],
     ];
+
+    /** Sender-Logo-URL (Fallback-Cover bei Nachrichten/Wort). */
+    public static function logoOf(?string $stationKey): string
+    {
+        return $stationKey ? (string) (self::STATIONS[$stationKey]['logo'] ?? '') : '';
+    }
 
     /** Sender-Key aus einem Sonos-Sendernamen/URI erkennen (fuer die Now-Anzeige). */
     public static function detect(string $stationNameOrUri): ?string

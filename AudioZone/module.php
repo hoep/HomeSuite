@@ -870,7 +870,7 @@ class AudioZone extends EntityModule
             return ['ok' => true, 'cached' => true] + (array) $c['data'];
         }
         [$ip, $rin] = $this->resolveSpeaker();
-        $data = ['isRadio' => false, 'station' => '', 'key' => null, 'artist' => '', 'title' => '', 'cover' => '', 'isTalk' => true, 'reachable' => false];
+        $data = ['isRadio' => false, 'station' => '', 'key' => null, 'artist' => '', 'title' => '', 'cover' => '', 'logo' => '', 'coverIsLogo' => false, 'isTalk' => true, 'reachable' => false];
         if ($ip !== '') {
             try {
                 $drv = DriverFactory::create('sonos-upnp', ['host' => $ip, 'rincon' => $rin, 'timeout' => 2500]);
@@ -879,19 +879,27 @@ class AudioZone extends EntityModule
                     $data['reachable'] = true;
                     $data['isRadio']   = (bool) $info['isRadio'];
                     $data['station']   = (string) $info['station'];
-                    $data['key'] = RadioNow::detect($info['station'] . ' ' . $info['uri']);
-                    $song = ['artist' => '', 'title' => '', 'isTalk' => true];
-                    if (trim((string) $info['streamContent']) !== '') {
-                        $song = RadioNow::songParse((string) $info['streamContent'], (string) $info['station']);
-                    } elseif ($data['key'] !== null) {
+                    $data['key']  = RadioNow::detect($info['station'] . ' ' . $info['uri']);
+                    $data['logo'] = RadioNow::logoOf($data['key']);
+                    // Song aus dem Player-streamContent; wenn leer/Wort -> Direktstream-ICY als
+                    // Fallback (dort steht der Song oft, auch waehrend TuneIn-Luecken).
+                    $song = RadioNow::songParse((string) $info['streamContent'], (string) $info['station']);
+                    if ($song['isTalk'] && $data['key'] !== null) {
                         $n = RadioNow::now($data['key'], false);
-                        $song = ['artist' => $n['artist'], 'title' => $n['title'], 'isTalk' => $n['isTalk']];
+                        if (!$n['isTalk']) {
+                            $song = ['artist' => $n['artist'], 'title' => $n['title'], 'isTalk' => false];
+                        }
                     }
                     $data['artist'] = $song['artist'];
                     $data['title']  = $song['title'];
                     $data['isTalk'] = $song['isTalk'];
                     if (!$song['isTalk']) {
                         $data['cover'] = RadioNow::cover($song['artist'], $song['title']);
+                    }
+                    // Kein Song-Cover (Nachrichten/Wort ODER Song ohne Treffer) -> Sender-Logo.
+                    if ($data['cover'] === '' && $data['logo'] !== '') {
+                        $data['cover'] = $data['logo'];
+                        $data['coverIsLogo'] = true;
                     }
                 }
             } catch (\Throwable $e) {
