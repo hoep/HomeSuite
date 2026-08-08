@@ -79,6 +79,8 @@ $__hs_files = [
     'Engines/RadioNow.php',            // Radio "was laeuft" (ICY-Titel + Song-Cover, IPSSonos-frei)
     'Engines/MediaProviders.php',      // Registry/Factory der Inhalte-Provider (renderer-unabhaengig)
     'Media/AudiobookshelfProvider.php', // self-hosted Hoerbuecher (direkte Stream-URLs)
+    'Media/JellyfinProvider.php',      // self-hosted Medienserver (direkte Stream-URLs)
+    'Media/PlexProvider.php',          // Plex Media Server (direkte Stream-URLs)
     'ShadingProfiles.php',             // Beschattungs-Profiltypen (Schema) + Profil->Config-Mapper
     'Engines/ShadeKinematics.php',     // Positions-/Lamellen-Kinematik der Beschattung
 
