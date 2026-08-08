@@ -1,0 +1,12 @@
+{
+    "id": "{C4F2639D-2A87-453D-8175-B586BF605A38}",
+    "name": "AudioZone",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["AudioZone", "HSAU", "HomeSuite Audio"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSAU",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}
