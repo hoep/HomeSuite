@@ -1,0 +1,12 @@
+{
+    "id": "{B7E1C3A4-5D62-4F08-9A1E-2C7D6B4F0E93}",
+    "name": "LightDevice",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["LightDevice", "HSLT", "HomeSuite Licht"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSLT",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}

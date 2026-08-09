@@ -26,6 +26,7 @@ final class DriverFactory
         'generic-shutter'    => GenericVariableShutter::class,
         'generic-valve'      => GenericVariableValve::class,
         'generic-audio'      => GenericBoundAudioRenderer::class,
+        'generic-light'      => GenericBoundLight::class,
     ];
 
     private function __construct()

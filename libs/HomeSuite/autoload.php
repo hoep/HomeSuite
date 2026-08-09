@@ -44,6 +44,7 @@ $__hs_files = [
 
     // --- Value Objects: Audio-HAL (reine Datenhalter, vor den Interfaces/Treibern) ---
     'Drivers/Audio/types.php',         // AudioState, AudioCapabilities, AudioSourceRef, AudioBrowseResult, ContentRef
+    'Drivers/Light/types.php',         // LightState, LightCapabilities (Licht-HAL Value Objects)
     'Contracts/IMediaProvider.php',    // Quellen-Abstraktion (renderer-unabhaengig)
 
     // --- HAL: Interfaces (kernel-frei, zustandslos) ---
@@ -51,6 +52,7 @@ $__hs_files = [
     'HAL/IThermostat.php',             // Heizungs-HAL
     'HAL/IShutter.php',                // Beschattungs-HAL
     'HAL/IValve.php',                  // Bewaesserungs-HAL
+    'HAL/ILight.php',                  // Beleuchtungs-HAL (switch/dim/color/cct)
     'HAL/IAudioRenderer.php',          // Audio-HAL (Codec, Vertrag 3)
 
     // --- HAL: selbst-enthaltener CCU-Transport (kein ext-xmlrpc/Legacy) ---
@@ -61,6 +63,7 @@ $__hs_files = [
     'HAL/GenericVariableThermostat.php',
     'HAL/GenericVariableShutter.php',
     'HAL/GenericVariableValve.php',
+    'Drivers/Light/GenericBoundLight.php', // generischer Licht-Treiber (self-registriert 'generic-light' via Factory)
 
     // --- Audio-Treiber (generisch variablen-/skriptgebunden + native Vendor-Codecs) ---
     'Drivers/Audio/GenericBoundAudioRenderer.php',
