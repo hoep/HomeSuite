@@ -298,6 +298,8 @@ class HomeSuiteHub extends EntityModule
             'label' => 'Objektbaum aufraeumen (eine Wurzel, Geraete zu Raeumen)', 'destructive' => false, 'fields' => []]);
         $m->addManagementAction(['op' => 'detectContacts', 'verb' => 'detectContacts', 'target' => 'hub',
             'label' => 'Tuer-/Fensterkontakte erkennen (markenuebergreifend)', 'destructive' => false, 'fields' => []]);
+        $m->addManagementAction(['op' => 'detectSensors', 'verb' => 'detectSensors', 'target' => 'hub',
+            'label' => 'Bewegungs-/Anwesenheits-Sensoren erkennen', 'destructive' => false, 'fields' => []]);
         $m->addManagementAction(['op' => 'validate', 'verb' => 'validate', 'target' => 'hub',
             'label' => 'Bindungen pruefen (alle Entitaeten)', 'destructive' => false, 'fields' => []]);
 
@@ -430,6 +432,11 @@ class HomeSuiteHub extends EntityModule
             case 'detectContacts':
                 return ['ok' => true, 'contacts' => \Hoep\HomeSuite\Engines\Contacts::detect(
                     !isset($args['includeGates']) || (bool) $args['includeGates']
+                )];
+
+            case 'detectSensors':
+                return ['ok' => true, 'sensors' => \Hoep\HomeSuite\Engines\Contacts::detectSensors(
+                    (string) ($args['kind'] ?? 'motion')
                 )];
 
             case 'getSources':

@@ -80,4 +80,55 @@ final class Contacts
         });
         return $out;
     }
+
+    /**
+     * Markenuebergreifende Sensor-Erkennung fuer die Licht-Automatik.
+     * $kind='motion'  -> Bewegungs-/Praesenzmelder (bool): Profil ~Motion/~Presence,
+     *                    Ident MOTION/PRESENCE/OCCUPANCY, oder bool + Name/Instanz-Keyword.
+     * $kind='away'    -> Abwesend/Anwesend-Schalter (bool): Name/Ident abwesend/away/present/anwesend/urlaub.
+     * @return array<int,array{id:int,instance:string,var:string,profile:string,signal:string}>
+     */
+    public static function detectSensors(string $kind = 'motion'): array
+    {
+        if (!function_exists('IPS_GetVariableList')) {
+            return [];
+        }
+        $motionName = '/bewegungsmelder|bewegung|\bmotion\b|\bpir\b|praesenzmelder|präsenzmelder/i';
+        $awayName   = '/\babwesend\b|\banwesend\b|\baway\b|urlaub|holiday|geofenc/i';
+        $out = [];
+        foreach (@\IPS_GetVariableList() as $vid) {
+            $v = @\IPS_GetVariable($vid);
+            if (!$v || (int) $v['VariableType'] !== 0) {
+                continue; // nur boolsche Sensoren
+            }
+            $prof = ($v['VariableCustomProfile'] !== '') ? $v['VariableCustomProfile'] : $v['VariableProfile'];
+            $name = (string) @\IPS_GetName($vid);
+            $ident = (string) (@\IPS_GetObject($vid)['ObjectIdent'] ?? '');
+            if (preg_match(self::BLOCK_NAME, $name)) {
+                continue;
+            }
+            $par = (int) @\IPS_GetParent($vid);
+            $inst = $par > 0 ? (string) @\IPS_GetName($par) : $name;
+            $hay = $name . ' ' . $inst . ' ' . $ident;
+            if ($kind === 'away') {
+                if (!preg_match($awayName, $hay)) {
+                    continue;
+                }
+                $sig = 'away';
+            } else {
+                $byProf  = ($prof === '~Motion' || $prof === '~Presence' || (bool) preg_match('/motion|presence|bewegung|praesenz|präsenz/i', (string) $prof));
+                $byIdent = (bool) preg_match('/^(MOTION|PRESENCE|OCCUPANCY|PRESENCE_DETECTION_STATE)$/i', $ident);
+                $byName  = (bool) preg_match($motionName, $hay);
+                if (!($byProf || $byIdent || $byName)) {
+                    continue;
+                }
+                $sig = $byProf ? 'profile' : ($byIdent ? 'ident' : 'name');
+            }
+            $out[] = ['id' => (int) $vid, 'instance' => $inst, 'var' => $name, 'profile' => (string) $prof, 'signal' => $sig];
+        }
+        usort($out, static function ($a, $b) {
+            return strnatcasecmp($a['instance'], $b['instance']);
+        });
+        return $out;
+    }
 }
