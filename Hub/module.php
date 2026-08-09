@@ -544,6 +544,7 @@ class HomeSuiteHub extends EntityModule
             $set($iid, 'Power', $on);
             if ($on && (int) ($m['level'] ?? -1) >= 0) { $set($iid, 'Brightness', (int) $m['level']); }
             if ($on && (int) ($m['cct'] ?? 0) > 0)     { $set($iid, 'ColorTemp', (int) $m['cct']); }
+            if ($on && (int) ($m['color'] ?? -1) >= 0) { $set($iid, 'Color', (int) $m['color']); }
             $applied++;
         }
         return ['applied' => $applied, 'skipped' => $skipped];
@@ -922,7 +923,10 @@ class HomeSuiteHub extends EntityModule
                     ? ['sunrise' => (int) date('G', (int) $si['sunrise']) * 60 + (int) date('i', (int) $si['sunrise']),
                        'sunset'  => (int) date('G', (int) $si['sunset']) * 60 + (int) date('i', (int) $si['sunset'])]
                     : ['sunrise' => 360, 'sunset' => 1200];
-                return ['ok' => true, 'sun' => $sun] + $this->lightAutoCfg();
+                return ['ok' => true, 'sun' => $sun,
+                    'automationEnabled' => $this->automationEnabled(),
+                    'automationVar'     => (int) (@\IPS_GetObjectIDByIdent('AutomationEnabled', $this->InstanceID) ?: 0),
+                ] + $this->lightAutoCfg();
             case 'lightAutoSet':
                 $enabled = (bool) ($args['enabled'] ?? false);
                 $rules = is_array($args['rules'] ?? null) ? array_values($args['rules']) : [];

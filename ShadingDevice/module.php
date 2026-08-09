@@ -880,6 +880,18 @@ class ShadingDevice extends EntityModule
         $rt       = $this->readRt();
         $estKnown = !empty($rt['posKnown']);
         $armed    = (bool) ($cfg['armed'] ?? false);
+        // Umgebungs-Sensoren (aus config.env, sonst Standort-Defaults).
+        $env       = is_array($cfg['env'] ?? null) ? $cfg['env'] : [];
+        $envSunAz  = (int) ($env['sunAzId']  ?? self::SUN_AZ_ID);
+        $envSunEl  = (int) ($env['sunElId']  ?? self::SUN_EL_ID);
+        $envWind   = (int) ($env['windId']   ?? self::WIND_ID);
+        $envRain   = (int) ($env['rainId']   ?? self::RAIN_ID);
+        $envBright = (int) ($env['brightId'] ?? self::BRIGHT_ID);
+        // Sonnenzeit-Quelle: Location-Instanz ODER eigene Koordinaten.
+        $sunSource  = ((string) ($cfg['sunSource'] ?? 'location') === 'coords') ? 'coords' : 'location';
+        $locationId = (int) ($cfg['locationId'] ?? 0);
+        $lat        = (float) ($cfg['lat'] ?? 0.0);
+        $lon        = (float) ($cfg['lon'] ?? 0.0);
         $status   = 'Treiber: ' . ($active ? 'aktiv' : 'inaktiv')
             . ' · scharf: ' . ($armed ? 'JA (faehrt real)' : 'nein (Schatten-Modus)')
             . ' · Position: ' . ($estKnown ? ((int) ($rt['estPos'] ?? 0) . '% (geschaetzt)') : 'unbekannt (Referenzfahrt noetig)');
@@ -942,6 +954,50 @@ class ShadingDevice extends EntityModule
             ['type' => 'Button', 'caption' => 'Aussperr-Schutz uebernehmen', 'onClick' =>
                 'echo HSSH_Manage($id, json_encode(["op"=>"configureAutomation","args"=>["doorIds"=>'
                 . 'array_values(array_filter(array_map(function($r){return (int)$r["varId"];}, json_decode($cfgDoors,true)?:[])))]]));'],
+            ['type' => 'Label', 'caption' => '— Umgebungs-Sensoren (Sonne/Wind/Regen/Helligkeit fuer die Automatik) —'],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'SelectVariable', 'name' => 'cfgEnvSunAz', 'caption' => 'Sonnen-Azimut (Grad)',
+                    'value' => $envSunAz],
+                ['type' => 'SelectVariable', 'name' => 'cfgEnvSunEl', 'caption' => 'Sonnen-Elevation (Grad)',
+                    'value' => $envSunEl],
+            ]],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'SelectVariable', 'name' => 'cfgEnvWind', 'caption' => 'Wind (km/h)',
+                    'value' => $envWind],
+                ['type' => 'SelectVariable', 'name' => 'cfgEnvRain', 'caption' => 'Regen',
+                    'value' => $envRain],
+                ['type' => 'SelectVariable', 'name' => 'cfgEnvBright', 'caption' => 'Helligkeit',
+                    'value' => $envBright],
+            ]],
+            ['type' => 'Button', 'caption' => 'Umgebungs-Sensoren uebernehmen', 'onClick' =>
+                'echo HSSH_Manage($id, json_encode(["op"=>"configureAutomation","args"=>["env"=>['
+                . '"sunAzId"=>$cfgEnvSunAz,"sunElId"=>$cfgEnvSunEl,"windId"=>$cfgEnvWind,'
+                . '"rainId"=>$cfgEnvRain,"brightId"=>$cfgEnvBright]]]));'],
+            ['type' => 'Label', 'caption' => '— Sonnenzeit-Quelle (fuer Sonnen-Anker im Zeitplan) —'],
+            ['type' => 'Select', 'name' => 'cfgSunSource', 'caption' => 'Quelle',
+                'value' => $sunSource, 'options' => [
+                    ['caption' => 'Location-Instanz (Symcon-Standort)', 'value' => 'location'],
+                    ['caption' => 'Eigene Koordinaten', 'value' => 'coords'],
+                ]],
+            ['type' => 'SelectInstance', 'name' => 'cfgLocationId', 'caption' => 'Location-Instanz',
+                'value' => $locationId],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'NumberSpinner', 'name' => 'cfgLat', 'caption' => 'Breite (lat)',
+                    'value' => $lat, 'digits' => 5, 'minimum' => -90, 'maximum' => 90],
+                ['type' => 'NumberSpinner', 'name' => 'cfgLon', 'caption' => 'Laenge (lon)',
+                    'value' => $lon, 'digits' => 5, 'minimum' => -180, 'maximum' => 180],
+            ]],
+            ['type' => 'Button', 'caption' => 'Sonnenzeit-Quelle uebernehmen', 'onClick' =>
+                'echo HSSH_Manage($id, json_encode(["op"=>"configureAutomation","args"=>['
+                . '"sunSource"=>$cfgSunSource,"locationId"=>$cfgLocationId,"lat"=>$cfgLat,"lon"=>$cfgLon]]));'],
+            ['type' => 'Label', 'caption' => '— Scharfschalten —'],
+            ['type' => 'Label', 'caption' => 'Aktueller Zustand: ' . ($armed ? 'SCHARF (Automatik faehrt real)' : 'Schatten-Modus (Automatik rechnet/protokolliert nur)')],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'Button', 'caption' => 'Scharfschalten (faehrt real)', 'onClick' =>
+                    'echo HSSH_Manage($id, json_encode(["op"=>"setArmed","args"=>["armed"=>true]]));'],
+                ['type' => 'Button', 'caption' => 'Schatten-Modus (nur rechnen)', 'onClick' =>
+                    'echo HSSH_Manage($id, json_encode(["op"=>"setArmed","args"=>["armed"=>false]]));'],
+            ]],
             ['type' => 'Label', 'caption' => 'Achtung: Referenzfahrt faehrt das Rollo REAL in den Endanschlag (zum Kalibrieren). '
                 . 'Somfy: kein Positions-Feedback -> die Position wird aus den Fahrzeiten '
                 . 'geschaetzt. Erst nach einer Referenzfahrt (voll auf/zu) ist sie bekannt. Real gefahren wird nur bei '

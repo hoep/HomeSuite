@@ -147,6 +147,7 @@ class HeatingZone extends EntityModule
                 ['op' => 'renameEntity',      'label' => 'Umbenennen'],
                 ['op' => 'deleteEntity',      'label' => 'Loeschen'],
                 ['op' => 'configureDriver',   'label' => 'Treiber konfigurieren'],
+                ['op' => 'configureAutomation', 'label' => 'Automatik konfigurieren (Frostschutz)'],
                 ['op' => 'updateProfile',     'label' => 'Wochenprofil bearbeiten'],
                 ['op' => 'getSchedule',       'label' => 'Wochenplan lesen'],
                 ['op' => 'duplicateProfile',  'label' => 'Profil duplizieren'],
@@ -420,6 +421,13 @@ class HeatingZone extends EntityModule
             ['type' => 'Button', 'caption' => 'Bindung uebernehmen', 'onClick' =>
                 'echo HSHT_Manage($id, json_encode(["op"=>"configureDriver","args"=>['
                 . '"driver"=>$cfgDriver,"targetId"=>$cfgTargetId,"sensorId"=>$cfgSensorId]]));'],
+            ['type' => 'Label', 'caption' => 'Automatik — Frostschutz-Solltemperatur (Modus „Frost"). Bereich 3..15 °C.'],
+            ['type' => 'NumberSpinner', 'name' => 'cfgFrostTemp', 'caption' => 'Frostschutz-Solltemperatur (°C)',
+                'digits' => 1, 'minimum' => 3, 'maximum' => 15,
+                'value' => (float) ($cfg['frostTemp'] ?? self::FROST_DEFAULT)],
+            ['type' => 'Button', 'caption' => 'Frostschutz speichern', 'onClick' =>
+                'echo HSHT_Manage($id, json_encode(["op"=>"configureAutomation","args"=>['
+                . '"frostTemp"=>$cfgFrostTemp]]));'],
             ['type' => 'Label', 'caption' => 'Verwaltung/Zeitplaene laufen im LiveViewBuilder; hier nur die Geraete-Bindung.'],
         ]]);
     }
@@ -668,6 +676,8 @@ class HeatingZone extends EntityModule
         switch ($op) {
             case 'configureDriver':
                 return $this->mgmtConfigureDriver($args, $ctx);
+            case 'configureAutomation':
+                return $this->mgmtConfigureAutomation($args, $ctx);
             case 'updateProfile':
                 return $this->mgmtUpdateProfile($args, $ctx);
             case 'getSchedule':
@@ -960,5 +970,36 @@ class HeatingZone extends EntityModule
         }
 
         return ['ok' => true, 'config' => $config, 'scheduleMode' => $this->scheduleModeOf($driver), 'driverActive' => $active];
+    }
+
+    /**
+     * Automatik-Parameter setzen. Aktuell: config.frostTemp (Frostschutz-Solltemperatur).
+     * Wert plausibel geklemmt (3..15 °C). desiredSetpoint() nutzt frostTemp im Frost-Modus.
+     *
+     * @param array<string,mixed> $args {frostTemp}
+     * @param array<string,mixed> $ctx
+     * @return array<string,mixed>
+     */
+    private function mgmtConfigureAutomation(array $args, array $ctx): array
+    {
+        if (!array_key_exists('frostTemp', $args) || !is_numeric($args['frostTemp'])) {
+            throw new ContractException('frostTemp (Zahl) erwartet');
+        }
+        $frost = (float) $args['frostTemp'];
+        $frost = max(3.0, min(15.0, $frost)); // plausibel klemmen
+
+        if (!empty($ctx['dryrun'])) {
+            return ['ok' => true, 'dryrun' => true, 'frostTemp' => $frost];
+        }
+
+        $this->store()->set('config.frostTemp', $frost);
+
+        // Wenn gerade Frost-Modus aktiv ist, sofort neu nachfahren.
+        $drv = $this->driver();
+        if ($drv instanceof IThermostat) {
+            $this->reconcile($drv);
+        }
+
+        return ['ok' => true, 'frostTemp' => $frost];
     }
 }

@@ -158,6 +158,7 @@ class AudioZone extends EntityModule
                 ['op' => 'group',           'label' => 'Gruppieren'],
                 ['op' => 'ungroup',         'label' => 'Gruppe trennen'],
                 ['op' => 'setGroupVolume',  'label' => 'Gruppen-Lautstaerke'],
+                ['op' => 'seek',            'label' => 'Springen (Position %)'],
                 ['op' => 'playSource',      'label' => 'Quelle abspielen'],
                 ['op' => 'updateProfile',   'label' => 'Wochenplan bearbeiten'],
                 ['op' => 'getSchedule',     'label' => 'Wochenplan lesen'],
@@ -594,6 +595,8 @@ class AudioZone extends EntityModule
                 return $this->mgmtUngroup();
             case 'setGroupVolume':
                 return $this->mgmtSetGroupVolume($args);
+            case 'seek':
+                return $this->mgmtSeek($args);
             case 'playSource':
                 return $this->mgmtPlaySource($args);
             case 'updateProfile':
@@ -774,6 +777,18 @@ class AudioZone extends EntityModule
         }
         $drv->setGroupVolume($pct);
         return ['ok' => true, 'volume' => $pct];
+    }
+
+    /**
+     * Springen (Position in %) ueber die native RequestAction: bei scharfem Treiber
+     * uebersetzt applyControl die Prozent in Sekunden und ruft $drv->seek(); ohne
+     * (scharfen) Treiber wird nur die Position-Statusvariable optimistisch gesetzt.
+     */
+    private function mgmtSeek(array $args): array
+    {
+        $pct = max(0, min(100, (int) ($args['percent'] ?? 0)));
+        $this->RequestAction('Position', $pct);
+        return ['ok' => true, 'percent' => $pct, 'armed' => (bool) $this->cfgVal('armed', false)];
     }
 
     private function mgmtPlaySource(array $args): array
