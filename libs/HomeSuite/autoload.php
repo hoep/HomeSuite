@@ -78,6 +78,7 @@ $__hs_files = [
     // --- Engines ---
     'Engines/ProfileEngine.php',       // Anlegen/Bearbeiten/Zuweisen von Profilen (getrennt)
     'Engines/ScheduleEngine.php',      // Slot-/Geo-/Rule-Auswertung, Homematic-Wochenexport
+    'Engines/SceneEngine.php',         // Licht-Szenen (Haus-Ebene): CRUD im Hub-Store
     'Engines/SunTimes.php',            // Sonnen-Ereigniszeiten (date_sun_info) fuer verankerte Grenzen
     'Engines/RadioNow.php',            // Radio "was laeuft" (ICY-Titel + Song-Cover, IPSSonos-frei)
     'Engines/MediaProviders.php',      // Registry/Factory der Inhalte-Provider (renderer-unabhaengig)

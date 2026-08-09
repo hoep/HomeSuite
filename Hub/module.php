@@ -319,6 +319,20 @@ class HomeSuiteHub extends EntityModule
             $m->addManagementAction(['op' => $pa[0], 'verb' => $pa[0], 'target' => 'hub', 'label' => $pa[1], 'destructive' => ($pa[0] === 'profileDelete'), 'fields' => []]);
         }
 
+        // --- Licht-Szenen (Haus-Ebene, SceneEngine) ---
+        foreach ([
+            ['lightSceneList',    'Szenen auflisten'],
+            ['lightSceneGet',     'Szene lesen'],
+            ['lightSceneSave',    'Szene speichern (authored)'],
+            ['lightSceneCapture', 'Szene aus Ist-Zustand aufnehmen'],
+            ['lightSceneApply',   'Szene anwenden'],
+            ['lightSceneRename',  'Szene umbenennen'],
+            ['lightSceneDelete',  'Szene loeschen'],
+        ] as $sa) {
+            $m->addManagementAction(['op' => $sa[0], 'verb' => $sa[0], 'target' => 'hub',
+                'label' => $sa[1], 'destructive' => ($sa[0] === 'lightSceneDelete'), 'fields' => []]);
+        }
+
         // Globaler Automatik-Schalter (HomeSuite-weit). Jede Entitaet liest ihn ueber
         // EntityModule::automationEnabled(); Default true (seed in ApplyChanges).
         $m->addControl([
@@ -416,10 +430,137 @@ class HomeSuiteHub extends EntityModule
                 return $this->mgmtMediaResolve($args);
         }
 
+        if (strncmp($op, 'lightScene', 10) === 0) {
+            return $this->mgmtLightScene($op, $args, $ctx);
+        }
         if (strncmp($op, 'profile', 7) === 0) {
             return $this->mgmtProfile($op, $args);
         }
         return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
+    }
+
+    // ==================================================================
+    // Licht-Szenen (Haus-Ebene) — SceneEngine (Storage) + Capture/Apply (Kernel)
+    // ==================================================================
+
+    private const GUID_HSLT = '{B7E1C3A4-5D62-4F08-9A1E-2C7D6B4F0E93}';
+
+    private function scenes(): \Hoep\HomeSuite\Engines\SceneEngine
+    {
+        return new \Hoep\HomeSuite\Engines\SceneEngine($this->store());
+    }
+
+    /** Alle LightDevice-Instanzen. */
+    private function hsltList(): array
+    {
+        return array_map('intval', @\IPS_GetInstanceListByModuleID(self::GUID_HSLT) ?: []);
+    }
+
+    /** Ist-Zustand + Kontext eines Geraets. */
+    private function hsltState(int $iid): array
+    {
+        $rs = function_exists('HSLT_Manage')
+            ? json_decode((string) @\HSLT_Manage($iid, json_encode(['op' => 'readState'])), true) : null;
+        $st = is_array($rs['state'] ?? null) ? $rs['state'] : [];
+        $parent = (int) @\IPS_GetParent($iid);
+        $pIdent = $parent > 0 ? (string) (@\IPS_GetObject($parent)['ObjectIdent'] ?? '') : '';
+        $room = (strpos($pIdent, 'HSLT_FLOOR_') === 0) ? '' : (string) @\IPS_GetName($parent);
+        $floor = (strpos($pIdent, 'HSLT_FLOOR_') === 0)
+            ? (string) @\IPS_GetName($parent)
+            : ($parent > 0 ? (string) @\IPS_GetName((int) @\IPS_GetParent($parent)) : '');
+        return ['id' => $iid, 'name' => (string) @\IPS_GetName($iid),
+            'room' => $room, 'roomId' => $room !== '' ? $parent : 0, 'floor' => $floor,
+            'on' => (bool) ($st['on'] ?? false), 'level' => (int) ($st['level'] ?? -1),
+            'color' => (int) ($st['color'] ?? -1), 'cct' => (int) ($st['cct'] ?? 0),
+            'caps' => is_array($rs['caps'] ?? null) ? $rs['caps'] : []];
+    }
+
+    /** Geraete-IDs im Geltungsbereich einer Szene. */
+    private function scopeDevices(array $scope): array
+    {
+        $type = (string) ($scope['type'] ?? 'house');
+        $ref  = (string) ($scope['ref'] ?? '');
+        $ids  = [];
+        foreach ($this->hsltList() as $iid) {
+            $s = $this->hsltState($iid);
+            if ($type === 'house'
+                || ($type === 'floor' && $s['floor'] === $ref)
+                || ($type === 'room' && (string) $s['roomId'] === $ref)) {
+                $ids[] = $iid;
+            }
+        }
+        return $ids;
+    }
+
+    /** Szene anwenden: je Mitglied Power/Brightness/ColorTemp per RequestAction (Schatten-sicher). */
+    private function applyScene(array $scene): array
+    {
+        $applied = 0; $skipped = 0;
+        $set = function (int $iid, string $ident, $val) {
+            $vid = (int) (@\IPS_GetObjectIDByIdent($ident, $iid) ?: 0);
+            if ($vid <= 0 || !@\IPS_VariableExists($vid)) { return false; }
+            $v = @\IPS_GetVariable($vid);
+            if ((int) ($v['VariableAction'] ?? 0) > 0 || (int) ($v['VariableCustomAction'] ?? 0) > 0) {
+                @\RequestAction($vid, $val);
+            } else {
+                @\SetValue($vid, $val);
+            }
+            return true;
+        };
+        foreach ((array) ($scene['members'] ?? []) as $m) {
+            $iid = (int) ($m['device'] ?? 0);
+            if ($iid <= 0 || !@\IPS_InstanceExists($iid)) { $skipped++; continue; }
+            $on = (bool) ($m['on'] ?? false);
+            $set($iid, 'Power', $on);
+            if ($on && (int) ($m['level'] ?? -1) >= 0) { $set($iid, 'Brightness', (int) $m['level']); }
+            if ($on && (int) ($m['cct'] ?? 0) > 0)     { $set($iid, 'ColorTemp', (int) $m['cct']); }
+            $applied++;
+        }
+        return ['applied' => $applied, 'skipped' => $skipped];
+    }
+
+    private function mgmtLightScene(string $op, array $args, array $ctx): array
+    {
+        $eng = $this->scenes();
+        switch ($op) {
+            case 'lightSceneList':
+                return ['ok' => true, 'scenes' => $eng->list()];
+            case 'lightSceneGet':
+                $s = $eng->get((string) ($args['id'] ?? ''));
+                return $s ? ['ok' => true, 'scene' => $s] : ['ok' => false, 'error' => 'not_found'];
+            case 'lightSceneSave':
+                $sc = is_array($args['scene'] ?? null) ? $args['scene'] : $args;
+                return ['ok' => true, 'scene' => $eng->save($sc, time())];
+            case 'lightSceneRename':
+                return ['ok' => true, 'scene' => $eng->rename((string) ($args['id'] ?? ''), (string) ($args['newName'] ?? ''))];
+            case 'lightSceneDelete':
+                $eng->delete((string) ($args['id'] ?? ''));
+                return ['ok' => true];
+            case 'lightSceneCapture':
+                $scope = is_array($args['scope'] ?? null) ? $args['scope'] : ['type' => 'house', 'ref' => ''];
+                $members = [];
+                foreach ($this->scopeDevices($scope) as $iid) {
+                    $s = $this->hsltState($iid);
+                    $members[] = ['device' => $iid, 'on' => $s['on'],
+                        'level' => ($s['caps']['dim'] ?? false) ? $s['level'] : -1,
+                        'color' => $s['color'], 'cct' => $s['cct']];
+                }
+                $scene = $eng->save([
+                    'id'    => (string) ($args['id'] ?? ''),
+                    'name'  => (string) ($args['name'] ?? 'Neue Szene'),
+                    'icon'  => (string) ($args['icon'] ?? 'bulb'),
+                    'scope' => $scope,
+                    'transitionMs' => (int) ($args['transitionMs'] ?? 0),
+                    'members' => $members,
+                ], time());
+                return ['ok' => true, 'scene' => $scene, 'captured' => count($members)];
+            case 'lightSceneApply':
+                $s = $eng->get((string) ($args['id'] ?? ''));
+                if (!$s) { return ['ok' => false, 'error' => 'not_found']; }
+                return ['ok' => true] + $this->applyScene($s);
+            default:
+                return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
+        }
     }
 
     /** Quellen-Konfig (Medien-Provider) aus dem Store, inkl. Defaults je bekanntem Provider. */
