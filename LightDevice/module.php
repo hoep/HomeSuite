@@ -250,6 +250,7 @@ class LightDevice extends EntityModule
             case 'readState':
                 $drv = $this->driver();
                 return ['ok' => true, 'driverActive' => $drv instanceof ILight,
+                    'armed' => (bool) $this->cfgVal('armed', false),
                     'state' => ($drv instanceof ILight) ? $drv->readState()->toArray() : null,
                     'caps'  => $this->driverCaps()];
             case 'setPower':
