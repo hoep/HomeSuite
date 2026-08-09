@@ -867,6 +867,15 @@ class ShadingDevice extends EntityModule
     {
         $cfg = $this->store()->get('config', []);
         $cfg = is_array($cfg) ? $cfg : [];
+        // Aussperr-Schutz: markenuebergreifend erkannte Kontakte als Auswahl-Optionen.
+        $contacts = \Hoep\HomeSuite\Engines\Contacts::detect(true);
+        $copts = [['caption' => '— Kontakt waehlen —', 'value' => 0]];
+        foreach ($contacts as $c) {
+            $copts[] = ['caption' => $c['instance'] . ' · ' . $c['var'] . '  (#' . $c['id'] . ')', 'value' => (int) $c['id']];
+        }
+        $doorVals = array_map(static function ($id) {
+            return ['varId' => (int) $id];
+        }, array_values(array_map('intval', (array) ($cfg['doorIds'] ?? []))));
         $active   = $this->driver() instanceof IShutter;
         $rt       = $this->readRt();
         $estKnown = !empty($rt['posKnown']);
@@ -923,6 +932,16 @@ class ShadingDevice extends EntityModule
                 ['type' => 'Button', 'caption' => 'Bindung pruefen', 'onClick' =>
                     'echo HSSH_Manage($id, json_encode(["op"=>"validate"]));'],
             ]],
+            ['type' => 'Label', 'caption' => '— Aussperr-Schutz (Tuer-/Fensterkontakte) —'],
+            ['type' => 'Label', 'caption' => 'Bei OFFENEM Kontakt wird das ZUFAHREN blockiert (Auffahren + Sturm-Rueckzug bleiben erlaubt). '
+                . 'Kontakte werden markenuebergreifend erkannt (Homematic/HmIP, Z-Wave, Zigbee, Shelly …).'],
+            ['type' => 'List', 'name' => 'cfgDoors', 'caption' => 'Kontakte', 'rowCount' => 4, 'add' => true, 'delete' => true,
+                'columns' => [['caption' => 'Kontakt', 'name' => 'varId', 'width' => 'auto', 'add' => 0,
+                    'edit' => ['type' => 'Select', 'options' => $copts]]],
+                'values' => $doorVals],
+            ['type' => 'Button', 'caption' => 'Aussperr-Schutz uebernehmen', 'onClick' =>
+                'echo HSSH_Manage($id, json_encode(["op"=>"configureAutomation","args"=>["doorIds"=>'
+                . 'array_values(array_filter(array_map(function($r){return (int)$r["varId"];}, json_decode($cfgDoors,true)?:[])))]]));'],
             ['type' => 'Label', 'caption' => 'Achtung: Referenzfahrt faehrt das Rollo REAL in den Endanschlag (zum Kalibrieren). '
                 . 'Somfy: kein Positions-Feedback -> die Position wird aus den Fahrzeiten '
                 . 'geschaetzt. Erst nach einer Referenzfahrt (voll auf/zu) ist sie bekannt. Real gefahren wird nur bei '

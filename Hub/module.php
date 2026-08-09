@@ -296,6 +296,8 @@ class HomeSuiteHub extends EntityModule
         // Dead-Binding-Scan ueber alle Entitaeten (read-only Diagnose).
         $m->addManagementAction(['op' => 'organizeTree', 'verb' => 'organizeTree', 'target' => 'hub',
             'label' => 'Objektbaum aufraeumen (eine Wurzel, Geraete zu Raeumen)', 'destructive' => false, 'fields' => []]);
+        $m->addManagementAction(['op' => 'detectContacts', 'verb' => 'detectContacts', 'target' => 'hub',
+            'label' => 'Tuer-/Fensterkontakte erkennen (markenuebergreifend)', 'destructive' => false, 'fields' => []]);
         $m->addManagementAction(['op' => 'validate', 'verb' => 'validate', 'target' => 'hub',
             'label' => 'Bindungen pruefen (alle Entitaeten)', 'destructive' => false, 'fields' => []]);
 
@@ -424,6 +426,11 @@ class HomeSuiteHub extends EntityModule
 
             case 'organizeTree':
                 return $this->organizeTree();
+
+            case 'detectContacts':
+                return ['ok' => true, 'contacts' => \Hoep\HomeSuite\Engines\Contacts::detect(
+                    !isset($args['includeGates']) || (bool) $args['includeGates']
+                )];
 
             case 'getSources':
                 return ['ok' => true, 'op' => $op, 'sources' => $this->sourcesConfig(),
