@@ -78,6 +78,8 @@ class HomeSuiteHub extends EntityModule
 
     /** Timer-Ident des async Provision-Jobs. */
     private const TIMER_PROVISION = 'ProvisionJob';
+    private const TIMER_LIGHTAUTO = 'LightAuto';
+    private const LIGHTAUTO_TICK_MS = 60000;
 
     /** Intervall (ms), in dem der Provision-Timer die Queue abarbeitet. */
     private const PROVISION_TICK_MS = 500;
@@ -115,6 +117,11 @@ class HomeSuiteHub extends EntityModule
             self::TIMER_PROVISION,
             0,
             'HSH_RunTimer($_IPS[\'TARGET\'], "provision");'
+        );
+        $this->RegisterTimer(
+            self::TIMER_LIGHTAUTO,
+            0,
+            'HSH_RunTimer($_IPS[\'TARGET\'], "lightauto");'
         );
     }
 
@@ -332,6 +339,11 @@ class HomeSuiteHub extends EntityModule
             $m->addManagementAction(['op' => $sa[0], 'verb' => $sa[0], 'target' => 'hub',
                 'label' => $sa[1], 'destructive' => ($sa[0] === 'lightSceneDelete'), 'fields' => []]);
         }
+        foreach ([['lightAutoGet', 'Automatik-Regeln lesen'], ['lightAutoSet', 'Automatik-Regeln speichern'],
+                  ['lightAutoTick', 'Automatik jetzt auswerten (Test)']] as $la) {
+            $m->addManagementAction(['op' => $la[0], 'verb' => $la[0], 'target' => 'hub',
+                'label' => $la[1], 'destructive' => false, 'fields' => []]);
+        }
 
         // Globaler Automatik-Schalter (HomeSuite-weit). Jede Entitaet liest ihn ueber
         // EntityModule::automationEnabled(); Default true (seed in ApplyChanges).
@@ -357,6 +369,9 @@ class HomeSuiteHub extends EntityModule
             @$this->SetValue('AutomationEnabled', true);
             $this->store()->set('autoSeeded', true);
         }
+
+        // Licht-Automatik: Timer + Bewegungs-Messages entsprechend Konfig einrichten.
+        $this->lightAutoWire();
     }
 
     protected function applyControl(Control $c, $value, ActionContext $ctx): void
@@ -430,6 +445,9 @@ class HomeSuiteHub extends EntityModule
                 return $this->mgmtMediaResolve($args);
         }
 
+        if (strncmp($op, 'lightAuto', 9) === 0) {
+            return $this->mgmtLightAuto($op, $args, $ctx);
+        }
         if (strncmp($op, 'lightScene', 10) === 0) {
             return $this->mgmtLightScene($op, $args, $ctx);
         }
@@ -558,6 +576,245 @@ class HomeSuiteHub extends EntityModule
                 $s = $eng->get((string) ($args['id'] ?? ''));
                 if (!$s) { return ['ok' => false, 'error' => 'not_found']; }
                 return ['ok' => true] + $this->applyScene($s);
+            default:
+                return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
+        }
+    }
+
+    // ==================================================================
+    // Licht-Automatik (L7-L11) — Timer/MessageSink -> LightAutomation-Engine
+    // ==================================================================
+
+    private function lightAutoCfg(): array
+    {
+        $c = $this->store()->get('lightAuto', []);
+        $c = is_array($c) ? $c : [];
+        return ['enabled' => (bool) ($c['enabled'] ?? false),
+                'rules'   => is_array($c['rules'] ?? null) ? $c['rules'] : []];
+    }
+
+    /** Timer + Bewegungs-Messages gemaess Konfig einrichten (idempotent). */
+    private function lightAutoWire(): void
+    {
+        $cfg = $this->lightAutoCfg();
+        $active = $cfg['enabled'] && $cfg['rules'] !== [];
+        @$this->SetTimerInterval(self::TIMER_LIGHTAUTO, $active ? self::LIGHTAUTO_TICK_MS : 0);
+        // Bewegungssensoren fuer Event-Auswertung registrieren (VM_UPDATE = 10603).
+        foreach ($cfg['rules'] as $r) {
+            if (($r['type'] ?? '') === 'motion') {
+                $sid = (int) ($r['sensor'] ?? 0);
+                if ($sid > 0 && @\IPS_VariableExists($sid)) {
+                    @$this->RegisterMessage($sid, 10603 /* VM_UPDATE */);
+                }
+            }
+        }
+    }
+
+    /** Variable eines Geraets (per Ident) schatten-sicher schreiben (RequestAction/SetValue). */
+    private function setDeviceVar(int $iid, string $ident, $val): bool
+    {
+        $vid = (int) (@\IPS_GetObjectIDByIdent($ident, $iid) ?: 0);
+        if ($vid <= 0 || !@\IPS_VariableExists($vid)) {
+            return false;
+        }
+        $v = @\IPS_GetVariable($vid);
+        if ((int) ($v['VariableAction'] ?? 0) > 0 || (int) ($v['VariableCustomAction'] ?? 0) > 0) {
+            @\RequestAction($vid, $val);
+        } else {
+            @\SetValue($vid, $val);
+        }
+        return true;
+    }
+
+    private function autoSetDevice(int $iid, bool $on, int $level = -1, int $cct = 0): void
+    {
+        if (!@\IPS_InstanceExists($iid)) {
+            return;
+        }
+        $this->setDeviceVar($iid, 'Power', $on);
+        if ($on && $level >= 0) {
+            $this->setDeviceVar($iid, 'Brightness', $level);
+        }
+        if ($on && $cct > 0) {
+            $this->setDeviceVar($iid, 'ColorTemp', $cct);
+        }
+    }
+
+    /** Ist eine LightDevice-Zone gerade an? (fuer Circadian: nur an-Lampen nachfuehren) */
+    private function deviceOn(int $iid): bool
+    {
+        $vid = (int) (@\IPS_GetObjectIDByIdent('Power', $iid) ?: 0);
+        return $vid > 0 && @\IPS_VariableExists($vid) && (bool) @\GetValue($vid);
+    }
+
+    /** Zyklische Auswertung: Trigger (Zeit/Sonne), Circadian, Wecken, Anwesenheitssim. */
+    public function lightAutoTick(): void
+    {
+        $cfg = $this->lightAutoCfg();
+        if (!$cfg['enabled'] || $cfg['rules'] === []) {
+            return;
+        }
+        if (!$this->automationEnabled()) {
+            return; // globaler Automatik-Schalter aus
+        }
+        $rules = $cfg['rules'];
+        $now = time();
+        $nowMin = (int) date('G', $now) * 60 + (int) date('i', $now);
+        $weekday = (int) date('w', $now);
+
+        // Sonnenzeiten/-hoehe (best effort)
+        $coords = $this->sunCoords();
+        $lat = (float) ($coords['lat'] ?? 48.2082);
+        $lon = (float) ($coords['lon'] ?? 16.3738);
+        $si = @date_sun_info($now, $lat, $lon);
+        $srMin = is_array($si) ? (int) date('G', (int) $si['sunrise']) * 60 + (int) date('i', (int) $si['sunrise']) : 360;
+        $ssMin = is_array($si) ? (int) date('G', (int) $si['sunset']) * 60 + (int) date('i', (int) $si['sunset']) : 1200;
+        $sunMin = ['sunrise' => $srMin, 'sunset' => $ssMin];
+        $elev = 0.0;
+        if ($nowMin > $srMin && $nowMin < $ssMin && $ssMin > $srMin) {
+            $frac = ($nowMin - $srMin) / max(1, $ssMin - $srMin);
+            $elev = sin(M_PI * $frac) * 55.0; // Pseudo-Elevation fuer Circadian
+        }
+
+        $st = $this->store()->get('_lightAutoState', []);
+        $st = is_array($st) ? $st : [];
+        $prevMin = isset($st['prevMin']) ? (int) $st['prevMin'] : $nowMin;
+
+        // --- L7/L9: faellige Zeit-/Sonnen-Trigger + Wecken ---
+        foreach (\Hoep\HomeSuite\Engines\LightAutomation::dueTriggers($rules, $prevMin, $nowMin, $weekday, $sunMin) as $act) {
+            if (($act['kind'] ?? '') === 'applyScene') {
+                $sc = $this->scenes()->get((string) $act['sceneId']);
+                if ($sc) {
+                    $this->applyScene($sc);
+                }
+            } elseif (($act['kind'] ?? '') === 'wake') {
+                $this->applyWake($act['rule'] ?? []);
+            }
+        }
+
+        // --- L8: Circadian (nur eingeschaltete Lampen nachfuehren) ---
+        foreach ($rules as $r) {
+            if (($r['type'] ?? '') !== 'circadian') {
+                continue;
+            }
+            $t = \Hoep\HomeSuite\Engines\LightAutomation::circadian($r, $elev);
+            foreach ((array) ($r['devices'] ?? []) as $iid) {
+                $iid = (int) $iid;
+                if ($iid > 0 && $this->deviceOn($iid)) {
+                    $wantLevel = !empty($r['level']) ? (int) $t['level'] : -1;
+                    $this->autoSetDevice($iid, true, $wantLevel, (int) $t['cct']);
+                }
+            }
+        }
+
+        // --- L11: Anwesenheitssimulation ---
+        foreach ($rules as $ri => $r) {
+            if (($r['type'] ?? '') !== 'presence') {
+                continue;
+            }
+            $away = ((int) ($r['awayVar'] ?? 0) > 0) ? (bool) @\GetValue((int) $r['awayVar']) : false;
+            $devs = array_values(array_filter(array_map('intval', (array) ($r['devices'] ?? []))));
+            $lastKey = 'presLast_' . $ri;
+            $last = (int) ($st[$lastKey] ?? 0);
+            $sim = \Hoep\HomeSuite\Engines\LightAutomation::presenceSim($r, $away, $nowMin, $last, $now, count($devs));
+            if ($sim['fire']) {
+                $this->autoSetDevice($devs[$sim['index']], (bool) $sim['on']);
+                $st[$lastKey] = $now;
+            }
+        }
+
+        // --- L10: Bewegungs-"Aus" nach Haltezeit (das "An" macht MessageSink) ---
+        foreach ($rules as $ri => $r) {
+            if (($r['type'] ?? '') !== 'motion') {
+                continue;
+            }
+            $holdKey = 'motHold_' . $ri;
+            $hold = (int) ($st[$holdKey] ?? 0);
+            $sensorOn = ((int) ($r['sensor'] ?? 0) > 0) ? (bool) @\GetValue((int) $r['sensor']) : false;
+            $res = \Hoep\HomeSuite\Engines\LightAutomation::motion($r, $sensorOn, null, $hold, $now);
+            if ($res['action'] === 'off') {
+                foreach ((array) ($r['devices'] ?? []) as $iid) {
+                    $this->autoSetDevice((int) $iid, false);
+                }
+            }
+            $st[$holdKey] = $res['holdUntil'];
+        }
+
+        $st['prevMin'] = $nowMin;
+        $this->store()->set('_lightAutoState', $st);
+    }
+
+    /** Wecken (L9): Szene anwenden + optional Audio-Zone starten (koppelt an AudioZone). */
+    private function applyWake(array $rule): void
+    {
+        $sid = (string) ($rule['sceneId'] ?? '');
+        if ($sid !== '') {
+            $sc = $this->scenes()->get($sid);
+            if ($sc) {
+                $this->applyScene($sc);
+            }
+        }
+        $az = (int) ($rule['audioZone'] ?? 0);
+        if ($az > 0 && @\IPS_InstanceExists($az) && function_exists('HSAU_Manage')) {
+            $src = (string) ($rule['audioSource'] ?? '');
+            $op = $src !== '' ? ['op' => 'radioNow'] : ['op' => 'radioNow']; // Platzhalter: Weck-Quelle
+            // Bewusst konservativ: nur wenn eine Weck-Quelle konfiguriert ist, spielen.
+            if ($src !== '') {
+                @\HSAU_Manage($az, json_encode(['op' => 'playDirect', 'args' => ['station' => $src]]));
+            }
+        }
+    }
+
+    /** Motion-"An" event-getrieben (MessageSink) + Circadian/Trigger unveraendert ueber Timer. */
+    public function MessageSink($Timestamp, $Sender, $Message, $Data)
+    {
+        parent::MessageSink($Timestamp, $Sender, $Message, $Data);
+        if ((int) $Message !== 10603) { // VM_UPDATE
+            return;
+        }
+        $cfg = $this->lightAutoCfg();
+        if (!$cfg['enabled'] || !$this->automationEnabled()) {
+            return;
+        }
+        $st = $this->store()->get('_lightAutoState', []);
+        $st = is_array($st) ? $st : [];
+        $now = time();
+        $changed = false;
+        foreach ($cfg['rules'] as $ri => $r) {
+            if (($r['type'] ?? '') !== 'motion' || (int) ($r['sensor'] ?? 0) !== (int) $Sender) {
+                continue;
+            }
+            $sensorOn = (bool) @\GetValue((int) $Sender);
+            $lux = ((int) ($r['lux'] ?? 0) > 0) ? (float) @\GetValue((int) $r['lux']) : null;
+            $holdKey = 'motHold_' . $ri;
+            $res = \Hoep\HomeSuite\Engines\LightAutomation::motion($r, $sensorOn, $lux, (int) ($st[$holdKey] ?? 0), $now);
+            if ($res['action'] === 'on') {
+                foreach ((array) ($r['devices'] ?? []) as $iid) {
+                    $this->autoSetDevice((int) $iid, true, (int) ($r['level'] ?? -1));
+                }
+                $st[$holdKey] = $res['holdUntil'];
+                $changed = true;
+            }
+        }
+        if ($changed) {
+            $this->store()->set('_lightAutoState', $st);
+        }
+    }
+
+    private function mgmtLightAuto(string $op, array $args, array $ctx): array
+    {
+        switch ($op) {
+            case 'lightAutoGet':
+                return ['ok' => true] + $this->lightAutoCfg();
+            case 'lightAutoSet':
+                $enabled = (bool) ($args['enabled'] ?? false);
+                $rules = is_array($args['rules'] ?? null) ? array_values($args['rules']) : [];
+                $this->store()->set('lightAuto', ['enabled' => $enabled, 'rules' => $rules]);
+                $this->lightAutoWire();
+                return ['ok' => true, 'enabled' => $enabled, 'count' => count($rules)];
+            case 'lightAutoTick':
+                $this->lightAutoTick();
+                return ['ok' => true, 'ticked' => true];
             default:
                 return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
         }
@@ -1138,6 +1395,10 @@ class HomeSuiteHub extends EntityModule
      */
     public function __TimerCb(string $job): void
     {
+        if ($job === 'lightauto') {
+            $this->lightAutoTick();
+            return;
+        }
         if ($job !== 'provision') {
             return;
         }
