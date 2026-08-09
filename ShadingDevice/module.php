@@ -819,6 +819,7 @@ class ShadingDevice extends EntityModule
             'wouldMove'    => ($armed && $target !== null && $drift && !$d['blockedByDoor']),
             'doorOpen'     => $d['doorOpen'],
             'blockedByDoor' => $d['blockedByDoor'],
+            'doorIds'      => array_values(array_map('intval', (array) $this->cfgVal('doorIds', []))),
             'mode'         => $d['mode'],
             'variant'      => $d['variant'],
             'held'         => $d['held'],
