@@ -294,6 +294,8 @@ class HomeSuiteHub extends EntityModule
         ]);
 
         // Dead-Binding-Scan ueber alle Entitaeten (read-only Diagnose).
+        $m->addManagementAction(['op' => 'organizeTree', 'verb' => 'organizeTree', 'target' => 'hub',
+            'label' => 'Objektbaum aufraeumen (eine Wurzel, Geraete zu Raeumen)', 'destructive' => false, 'fields' => []]);
         $m->addManagementAction(['op' => 'validate', 'verb' => 'validate', 'target' => 'hub',
             'label' => 'Bindungen pruefen (alle Entitaeten)', 'destructive' => false, 'fields' => []]);
 
@@ -419,6 +421,9 @@ class HomeSuiteHub extends EntityModule
 
             case 'validate':
                 return $this->mgmtValidateAll();
+
+            case 'organizeTree':
+                return $this->organizeTree();
 
             case 'getSources':
                 return ['ok' => true, 'op' => $op, 'sources' => $this->sourcesConfig(),
@@ -579,6 +584,99 @@ class HomeSuiteHub extends EntityModule
             default:
                 return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
         }
+    }
+
+    // ==================================================================
+    // Objektbaum-Selbstorganisation — EINE Wurzel „HomeSuite", Geraete unter Raeumen
+    // ==================================================================
+
+    /** Stabile Wurzel „HomeSuite" (per Ident 'HomeSuiteRoot'); adoptiert vorhandene, legt sonst an. */
+    private function homeRoot(): int
+    {
+        foreach (@\IPS_GetChildrenIDs(0) as $c) {
+            if ((string) (@\IPS_GetObject($c)['ObjectIdent'] ?? '') === 'HomeSuiteRoot') {
+                return $c;
+            }
+        }
+        $root = 0;
+        foreach (@\IPS_GetChildrenIDs(0) as $c) {
+            $o = @\IPS_GetObject($c);
+            if ((int) ($o['ObjectType'] ?? -1) === 0 && (string) @\IPS_GetName($c) === 'HomeSuite') {
+                $root = $c;
+                break;
+            }
+        }
+        if ($root === 0) {
+            $root = @\IPS_CreateCategory();
+            @\IPS_SetName($root, 'HomeSuite');
+            @\IPS_SetParent($root, 0);
+        }
+        @\IPS_SetIdent($root, 'HomeSuiteRoot');
+        return $root;
+    }
+
+    /**
+     * Räumt den HomeSuite-Objektbaum idempotent auf (nach jedem Provisionieren automatisch):
+     *  - EINE Wurzel „HomeSuite" (Hub darunter)
+     *  - verstreute HomeSuite-/Bewaesserungs-Wurzelkategorien unter die Wurzel ziehen
+     *  - Domänen-Instanzen auf Wurzel-Ebene (parent 0) einsammeln (Sicherheitsnetz)
+     *  - Geräte per EXAKTEM Namenstreffer dem gleichnamigen Raum zuordnen (keine Rate-Zuordnung)
+     */
+    public function organizeTree(): array
+    {
+        $root  = $this->homeRoot();
+        $moved = [];
+        if ((int) @\IPS_GetParent($this->InstanceID) !== $root) {
+            @\IPS_SetParent($this->InstanceID, $root);
+            $moved[] = 'Hub';
+        }
+        // Verstreute HomeSuite-Wurzelkategorien einsammeln
+        foreach (@\IPS_GetChildrenIDs(0) as $c) {
+            if ($c === $root) {
+                continue;
+            }
+            if ((int) (@\IPS_GetObject($c)['ObjectType'] ?? -1) !== 0) {
+                continue; // nur Kategorien
+            }
+            $nm = (string) @\IPS_GetName($c);
+            if (stripos($nm, 'HomeSuite') === 0 || stripos($nm, 'Bewaesserung') === 0 || stripos($nm, 'Bewässerung') === 0) {
+                @\IPS_SetParent($c, $root);
+                $moved[] = $nm;
+            }
+        }
+        // Räume (HSSP) + Domänen-Instanzen
+        $HSSP  = '{5598F752-886D-475F-91CE-5813A3C581E5}';
+        $rooms = [];
+        foreach (@\IPS_GetInstanceListByModuleID($HSSP) ?: [] as $r) {
+            $rooms[(string) @\IPS_GetName($r)] = $r;
+        }
+        $domains = [
+            '{C4F2639D-2A87-453D-8175-B586BF605A38}', // Audio
+            '{053E7017-584E-4F62-A246-EBA6CE3DE034}', // AudioBridged
+            '{B7E1C3A4-5D62-4F08-9A1E-2C7D6B4F0E93}', // Light
+            '{D264A82B-DE31-45CC-8AF2-8F4C5D076508}', // Irrigation
+            '{A9645ED8-CB55-43B8-869B-BFF6ACFC8DC1}', // Shading
+            '{AC059357-088A-4DF8-ABBC-F8724BC78769}', // Heating
+        ];
+        foreach ($domains as $g) {
+            foreach (@\IPS_GetInstanceListByModuleID($g) ?: [] as $iid) {
+                $p = (int) @\IPS_GetParent($iid);
+                if ($p === 0) {                       // Sicherheitsnetz: nie auf Wurzel-Ebene liegen lassen
+                    @\IPS_SetParent($iid, $root);
+                    $moved[] = (string) @\IPS_GetName($iid);
+                    $p = $root;
+                }
+                if ($p > 0 && (string) (@\IPS_GetInstance($p)['ModuleInfo']['ModuleID'] ?? '') === $HSSP) {
+                    continue; // haengt bereits in einem Raum
+                }
+                $nm = (string) @\IPS_GetName($iid);
+                if (isset($rooms[$nm]) && $rooms[$nm] !== $p) {   // exakter Raum-Namenstreffer
+                    @\IPS_SetParent($iid, $rooms[$nm]);
+                    $moved[] = $nm . ' → Raum ' . $nm;
+                }
+            }
+        }
+        return ['ok' => true, 'root' => $root, 'moved' => count($moved), 'items' => $moved];
     }
 
     // ==================================================================
@@ -1791,7 +1889,7 @@ class HomeSuiteHub extends EntityModule
 
         try {
             $prov   = new Provisioner(0);
-            $parent = ((int) $job['parentId']) > 0 ? (int) $job['parentId'] : $prov->category('HomeSuite');
+            $parent = ((int) $job['parentId']) > 0 ? (int) $job['parentId'] : $this->homeRoot();
 
             $props = is_array($job['properties']) ? $job['properties'] : [];
             if (((int) $job['connectParentId']) > 0) {
@@ -1810,9 +1908,10 @@ class HomeSuiteHub extends EntityModule
             $this->LogMessage('HS.Provision FEHLER (' . $job['id'] . '): ' . $e->getMessage(), KL_ERROR);
         }
 
-        // Weitere Jobs? Timer weiterlaufen lassen, sonst stoppen.
+        // Weitere Jobs? Timer weiterlaufen lassen, sonst stoppen + Baum aufraeumen.
         if (count($this->readQueue()) === 0) {
             $this->SetTimerInterval(self::TIMER_PROVISION, 0);
+            try { $this->organizeTree(); } catch (\Throwable $e) { /* Aufraeumen nie fatal */ }
         }
     }
 
