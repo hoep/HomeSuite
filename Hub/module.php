@@ -601,7 +601,7 @@ class HomeSuiteHub extends EntityModule
         @$this->SetTimerInterval(self::TIMER_LIGHTAUTO, $active ? self::LIGHTAUTO_TICK_MS : 0);
         // Bewegungssensoren fuer Event-Auswertung registrieren (VM_UPDATE = 10603).
         foreach ($cfg['rules'] as $r) {
-            if (($r['type'] ?? '') === 'motion') {
+            if (($r['type'] ?? '') === 'motion' && ($r['enabled'] ?? true) !== false) {
                 $sid = (int) ($r['sensor'] ?? 0);
                 if ($sid > 0 && @\IPS_VariableExists($sid)) {
                     @$this->RegisterMessage($sid, 10603 /* VM_UPDATE */);
@@ -657,7 +657,10 @@ class HomeSuiteHub extends EntityModule
         if (!$this->automationEnabled()) {
             return; // globaler Automatik-Schalter aus
         }
-        $rules = $cfg['rules'];
+        $rules = array_values(array_filter($cfg['rules'], static fn($r) => ($r['enabled'] ?? true) !== false));
+        if ($rules === []) {
+            return;
+        }
         $now = time();
         $nowMin = (int) date('G', $now) * 60 + (int) date('i', $now);
         $weekday = (int) date('w', $now);
@@ -784,6 +787,9 @@ class HomeSuiteHub extends EntityModule
             if (($r['type'] ?? '') !== 'motion' || (int) ($r['sensor'] ?? 0) !== (int) $Sender) {
                 continue;
             }
+            if (($r['enabled'] ?? true) === false) {
+                continue;
+            }
             $sensorOn = (bool) @\GetValue((int) $Sender);
             $lux = ((int) ($r['lux'] ?? 0) > 0) ? (float) @\GetValue((int) $r['lux']) : null;
             $holdKey = 'motHold_' . $ri;
@@ -805,7 +811,13 @@ class HomeSuiteHub extends EntityModule
     {
         switch ($op) {
             case 'lightAutoGet':
-                return ['ok' => true] + $this->lightAutoCfg();
+                $co = $this->sunCoords();
+                $si = @date_sun_info(time(), (float) ($co['lat'] ?? 48.2082), (float) ($co['lon'] ?? 16.3738));
+                $sun = is_array($si)
+                    ? ['sunrise' => (int) date('G', (int) $si['sunrise']) * 60 + (int) date('i', (int) $si['sunrise']),
+                       'sunset'  => (int) date('G', (int) $si['sunset']) * 60 + (int) date('i', (int) $si['sunset'])]
+                    : ['sunrise' => 360, 'sunset' => 1200];
+                return ['ok' => true, 'sun' => $sun] + $this->lightAutoCfg();
             case 'lightAutoSet':
                 $enabled = (bool) ($args['enabled'] ?? false);
                 $rules = is_array($args['rules'] ?? null) ? array_values($args['rules']) : [];
