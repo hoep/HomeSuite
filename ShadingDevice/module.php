@@ -190,6 +190,7 @@ class ShadingDevice extends EntityModule
                 ['op' => 'importLegacy',       'label' => 'Aus IPSShadowing importieren'],
                 ['op' => 'configureAutomation', 'label' => 'Sonne/Sicherheit konfigurieren'],
                 ['op' => 'setArmed',           'label' => 'Scharfschalten / Schatten-Modus'],
+                ['op' => 'migrateConfig',      'label' => 'Config auf Properties migrieren (einmalig)'],
                 ['op' => 'driverProbe',        'label' => 'Treiber-Status (Diagnose)'],
                 ['op' => 'reconcileProbe',     'label' => 'Regel-Entscheidung (Trockenlauf)'],
                 ['op' => 'getConfig',          'label' => 'Konfiguration lesen (Diagnose)'],
@@ -218,11 +219,164 @@ class ShadingDevice extends EntityModule
         ];
     }
 
-    /** Konfigurierte driverId aus dem Store (ohne den Treiber zu bauen). */
+    /** Konfigurierte driverId (aus nativen Properties). */
     private function configuredDriverId(): string
     {
-        $cfg = $this->store()->get('config', []);
-        return is_array($cfg) ? (string) ($cfg['driver'] ?? '') : '';
+        return (string) $this->cfg()['driver'];
+    }
+
+    // ==================================================================
+    // Native Instanz-Properties (Symcon-Konzept). Flache Bindungs-/Sicherheits-
+    // felder sind Properties; komplexe/variable Strukturen (schedules, geoProfile,
+    // env, tempGate, dayBegin/dayEnd, doorIds, RtState) bleiben im FabricStore.
+    // ==================================================================
+    public function Create()
+    {
+        parent::Create();
+        $this->RegisterPropertyString('Driver', '');
+        $this->RegisterPropertyBoolean('Invert', false);
+        $this->RegisterPropertyInteger('PositionId', 0);
+        $this->RegisterPropertyInteger('AutomaticId', 0);
+        $this->RegisterPropertyInteger('SocketId', 0);
+        $this->RegisterPropertyInteger('Channel', 0);
+        $this->RegisterPropertyInteger('Repeat', 2);
+        $this->RegisterPropertyInteger('StopRepeat', 4);
+        $this->RegisterPropertyInteger('GapMs', 50);
+        $this->RegisterPropertyInteger('TimeOpening', 0);
+        $this->RegisterPropertyInteger('TimeClosing', 0);
+        $this->RegisterPropertyInteger('InstanceId', 0);
+        $this->RegisterPropertyInteger('LevelVarId', 0);
+        $this->RegisterPropertyFloat('WindStormKmh', 50.0);
+        $this->RegisterPropertyInteger('SafePos', 0);
+        $this->RegisterPropertyBoolean('RainClose', false);
+        $this->RegisterPropertyString('SunSource', 'location');
+        $this->RegisterPropertyInteger('LocationId', 0);
+        $this->RegisterPropertyFloat('Lat', 0.0);
+        $this->RegisterPropertyFloat('Lon', 0.0);
+        $this->RegisterPropertyBoolean('Armed', false);   // Schatten-Modus bis Cutover
+        $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
+    }
+
+    /**
+     * Konfiguration: flache Felder aus nativen Properties, KOMPLEXE Strukturen
+     * (geoProfile/env/tempGate/dayBegin/dayEnd/doorIds/…) weiterhin aus dem Store.
+     */
+    private function cfg(): array
+    {
+        $store = $this->store()->get('config', []);
+        $store = is_array($store) ? $store : [];
+        $props = [
+            'driver'       => $this->ReadPropertyString('Driver'),
+            'invert'       => $this->ReadPropertyBoolean('Invert'),
+            'positionId'   => $this->ReadPropertyInteger('PositionId'),
+            'automaticId'  => $this->ReadPropertyInteger('AutomaticId'),
+            'socketId'     => $this->ReadPropertyInteger('SocketId'),
+            'channel'      => $this->ReadPropertyInteger('Channel'),
+            'repeat'       => $this->ReadPropertyInteger('Repeat'),
+            'stopRepeat'   => $this->ReadPropertyInteger('StopRepeat'),
+            'gapMs'        => $this->ReadPropertyInteger('GapMs'),
+            'timeOpening'  => $this->ReadPropertyInteger('TimeOpening'),
+            'timeClosing'  => $this->ReadPropertyInteger('TimeClosing'),
+            'instanceId'   => $this->ReadPropertyInteger('InstanceId'),
+            'levelVarId'   => $this->ReadPropertyInteger('LevelVarId'),
+            'windStormKmh' => $this->ReadPropertyFloat('WindStormKmh'),
+            'safePos'      => $this->ReadPropertyInteger('SafePos'),
+            'rainClose'    => $this->ReadPropertyBoolean('RainClose'),
+            'sunSource'    => $this->ReadPropertyString('SunSource'),
+            'locationId'   => $this->ReadPropertyInteger('LocationId'),
+            'lat'          => $this->ReadPropertyFloat('Lat'),
+            'lon'          => $this->ReadPropertyFloat('Lon'),
+            'armed'        => $this->ReadPropertyBoolean('Armed'),
+        ];
+        return array_merge($store, $props); // Properties gewinnen fuer flache Keys; komplexe kommen aus dem Store
+    }
+
+    private function armed(): bool
+    {
+        return $this->ReadPropertyBoolean('Armed');
+    }
+
+    /** Map flache Config-Keys -> [PropertyName, Typ]. */
+    private const PROP_MAP = [
+        'driver'=>['Driver','s'], 'invert'=>['Invert','b'], 'positionId'=>['PositionId','i'],
+        'automaticId'=>['AutomaticId','i'], 'socketId'=>['SocketId','i'], 'channel'=>['Channel','i'],
+        'repeat'=>['Repeat','i'], 'stopRepeat'=>['StopRepeat','i'], 'gapMs'=>['GapMs','i'],
+        'timeOpening'=>['TimeOpening','i'], 'timeClosing'=>['TimeClosing','i'], 'instanceId'=>['InstanceId','i'],
+        'levelVarId'=>['LevelVarId','i'], 'windStormKmh'=>['WindStormKmh','f'], 'safePos'=>['SafePos','i'],
+        'rainClose'=>['RainClose','b'], 'sunSource'=>['SunSource','s'], 'locationId'=>['LocationId','i'],
+        'lat'=>['Lat','f'], 'lon'=>['Lon','f'], 'armed'=>['Armed','b'],
+    ];
+
+    private function castProp(string $type, $v)
+    {
+        switch ($type) { case 'i': return (int)$v; case 'f': return (float)$v; case 'b': return (bool)$v; default: return (string)$v; }
+    }
+
+    /**
+     * Schreibt gemischte Config: flache Keys -> Properties (IPS_SetProperty),
+     * komplexe Keys -> Store-Patch. $apply=true triggert IPS_ApplyChanges.
+     */
+    private function applyConfigProperties(array $c, bool $apply = true): void
+    {
+        $storePatch = [];
+        foreach ($c as $k => $v) {
+            if (isset(self::PROP_MAP[$k])) {
+                [$p, $t] = self::PROP_MAP[$k];
+                @\IPS_SetProperty($this->InstanceID, $p, $this->castProp($t, $v));
+            } else {
+                $storePatch[$k] = $v; // geoProfile/env/tempGate/dayBegin/dayEnd/doorIds …
+            }
+        }
+        if ($storePatch !== []) {
+            $this->store()->patch('config', $storePatch);
+        }
+        if ($apply) {
+            @\IPS_ApplyChanges($this->InstanceID);
+        }
+    }
+
+    /** Einmal-Migration: flache FabricStore-config -> native Properties (per RPC-Op). */
+    private function migrateConfig(): array
+    {
+        if ($this->ReadPropertyInteger('ConfigSchema') >= 1) {
+            return ['ok' => true, 'already' => true, 'config' => $this->cfg()];
+        }
+        $c = $this->store()->get('config', []);
+        $c = is_array($c) ? $c : [];
+        $flat = [];
+        foreach ($c as $k => $v) {
+            if (isset(self::PROP_MAP[$k])) {
+                [$p, $t] = self::PROP_MAP[$k];
+                @\IPS_SetProperty($this->InstanceID, $p, $this->castProp($t, $v));
+                $flat[] = $k;
+            }
+        }
+        @\IPS_SetProperty($this->InstanceID, 'ConfigSchema', 1);
+        @\IPS_ApplyChanges($this->InstanceID);
+        return ['ok' => true, 'migrated' => $flat, 'config' => $this->cfg()];
+    }
+
+    /** Bindungs-Links (Baum-Transparenz) treiberabhaengig + Sensoren/Tueren. */
+    protected function bindingTargets(): array
+    {
+        $cfg = $this->cfg();
+        $out = [];
+        $add = function (string $ident, string $name, int $id) use (&$out): void {
+            if ($id > 0 && function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($id)) {
+                $out[] = ['ident' => $ident, 'name' => $name, 'targetId' => $id];
+            }
+        };
+        $driver = (string) $cfg['driver'];
+        if ($driver === 'generic-shutter') { $add('bl_Position', 'Position', (int) $cfg['positionId']); }
+        elseif ($driver === 'somfy-rts')   { $add('bl_Socket', 'Somfy-Socket', (int) $cfg['socketId']); }
+        elseif ($driver === 'hm-shutter')  { $add('bl_Device', 'HM-Gerät', (int) $cfg['instanceId']); $add('bl_Level', 'Level', (int) $cfg['levelVarId']); }
+        $add('bl_Automatic', 'IPSShadowing-Automatik', (int) $cfg['automaticId']);
+        $env = is_array($cfg['env'] ?? null) ? $cfg['env'] : [];
+        $envLabels = ['sunAzId'=>'Sonnen-Azimut','sunElId'=>'Sonnen-Elevation','windId'=>'Wind','rainId'=>'Regen','brightId'=>'Helligkeit'];
+        foreach ($envLabels as $k => $lab) { $add('bl_env_' . $k, $lab, (int) ($env[$k] ?? 0)); }
+        $i = 0;
+        foreach ((array) ($cfg['doorIds'] ?? []) as $d) { $add('bl_Door' . $i, 'Tür-Kontakt', (int) $d); $i++; }
+        return $out;
     }
 
     /**
@@ -276,6 +430,13 @@ class ShadingDevice extends EntityModule
      */
     protected function applyControl(Control $c, $value, ActionContext $ctx): void
     {
+        // Schatten-Modus: KEIN reales Fahren/Bus-Telegramm bis armed=true (sonst
+        // Kollision mit IPSShadowing auf demselben Socket 45711). Optimistischer
+        // SetValue der Basis bleibt (Anzeige folgt), real passiert nichts.
+        if (!$this->armed()) {
+            $this->SendDebug('HSSH.shadow', $c->ident . '=' . (is_scalar($value) ? (string) $value : '?') . ' (Schatten-Modus)', 0);
+            return;
+        }
         $drv = $this->driver();
         if (!$drv instanceof IShutter) {
             return; // kein (Shutter-)Treiber gebunden -> Schatten-Modus
@@ -309,8 +470,7 @@ class ShadingDevice extends EntityModule
         $this->driverResolved = true;
         $this->driverInstance = null;
 
-        $cfg        = $this->store()->get('config', []);
-        $cfg        = is_array($cfg) ? $cfg : [];
+        $cfg        = $this->cfg();
         $driverId   = (string) ($cfg['driver'] ?? '');
         $positionId = (int) ($cfg['positionId'] ?? 0);
 
@@ -398,8 +558,9 @@ class ShadingDevice extends EntityModule
             case 'reconcileProbe':
                 return $this->mgmtReconcileProbe();
             case 'getConfig':
-                $cfg = $this->store()->get('config', []);
-                return ['ok' => true, 'config' => is_array($cfg) ? $cfg : []];
+                return ['ok' => true, 'config' => $this->cfg()];
+            case 'migrateConfig':
+                return $this->migrateConfig();
             case 'referenceRun':
                 return $this->mgmtReferenceRun($args);
             case 'validate':
@@ -475,14 +636,10 @@ class ShadingDevice extends EntityModule
             return ['ok' => true, 'dryrun' => true, 'config' => $config, 'scheduleMode' => 'controller'];
         }
 
-        $this->store()->patch('config', $config);
-        $this->driverResolved = false;
-        $this->driverInstance = null;
-        $this->syncReferences();
-        $this->updateHealth();
+        $this->applyConfigProperties($config, true); // Properties + ApplyChanges (Treiber/Links/Refs/Timer neu)
         $active = $this->driver() instanceof IShutter;
 
-        return ['ok' => true, 'config' => $config, 'scheduleMode' => 'controller', 'driverActive' => $active];
+        return ['ok' => true, 'config' => $this->cfg(), 'scheduleMode' => 'controller', 'driverActive' => $active];
     }
 
     /**
@@ -500,8 +657,7 @@ class ShadingDevice extends EntityModule
         foreach ($this->GetReferenceList() as $ref) {
             @$this->UnregisterReference($ref);
         }
-        $cfg = $this->store()->get('config', []);
-        $cfg = is_array($cfg) ? $cfg : [];
+        $cfg = $this->cfg();
         $driver = (string) ($cfg['driver'] ?? '');
         $ids = [];
         // Nur die vom AKTIVEN Treiber real genutzten Bindungen referenzieren:
@@ -619,8 +775,8 @@ class ShadingDevice extends EntityModule
         if (array_key_exists('lat', $args))        { $patch['lat'] = (float) $args['lat']; }
         if (array_key_exists('lon', $args))        { $patch['lon'] = (float) $args['lon']; }
         if ($patch !== []) {
-            $this->store()->patch('config', $patch);
-            $this->registerWatches($this->driver()); // env koennte Wind/Regen-IDs geaendert haben
+            // Flache Felder -> Properties, komplexe (geoProfile/env/tempGate/dayBegin/dayEnd/doorIds) -> Store.
+            $this->applyConfigProperties($patch, true); // ApplyChanges re-registriert Watches
         }
         return ['ok' => true, 'config' => $patch];
     }
@@ -771,13 +927,9 @@ class ShadingDevice extends EntityModule
         if (!empty($ctx['dryrun'])) {
             return ['ok' => true, 'dryrun' => true] + $summary;
         }
-        $this->store()->patch('config', $config);
-        if ($geo !== null) {
-            $this->store()->patch('config', ['geoProfile' => $geo]);
-        }
-        $this->driverResolved = false;
-        $this->driverInstance = null;
-        $this->registerWatches($this->driver());
+        $applyCfg = $config;
+        if ($geo !== null) { $applyCfg['geoProfile'] = $geo; }
+        $this->applyConfigProperties($applyCfg, true); // flach->Properties, geoProfile->Store, ApplyChanges
         if ($name !== '') {
             @\IPS_SetName($this->InstanceID, 'Beschattung ' . $name);
         }
@@ -791,8 +943,9 @@ class ShadingDevice extends EntityModule
     private function mgmtSetArmed(array $args): array
     {
         $armed = (bool) ($args['armed'] ?? false);
-        $this->store()->patch('config', ['armed' => $armed]);
-        return ['ok' => true, 'armed' => $armed];
+        @\IPS_SetProperty($this->InstanceID, 'Armed', $armed);
+        @\IPS_ApplyChanges($this->InstanceID);
+        return ['ok' => true, 'armed' => $this->armed()];
     }
 
     /**
@@ -865,8 +1018,7 @@ class ShadingDevice extends EntityModule
      */
     public function GetConfigurationForm()
     {
-        $cfg = $this->store()->get('config', []);
-        $cfg = is_array($cfg) ? $cfg : [];
+        $cfg = $this->cfg();
         // Aussperr-Schutz: markenuebergreifend erkannte Kontakte als Auswahl-Optionen.
         $contacts = \Hoep\HomeSuite\Engines\Contacts::detect(true);
         $copts = [['caption' => '— Kontakt waehlen —', 'value' => 0]];
@@ -1022,6 +1174,15 @@ class ShadingDevice extends EntityModule
         $pos = $drv->readPosition();
         if ($pos === IShutter::POS_UNKNOWN) {
             $pos = $this->estPos(); // travel-only: geschaetzte Lage spiegeln (oder UNKNOWN)
+        }
+        if ($pos === IShutter::POS_UNKNOWN) {
+            // Feedback-los (Somfy) und noch nicht kalibriert: echte Position der
+            // IPSShadowing-Positionsvariable read-only spiegeln (Schatten-Anzeige).
+            $legacyPos = (int) $this->cfgVal('positionId', 0);
+            if ($legacyPos > 0 && function_exists('IPS_VariableExists') && @\IPS_VariableExists($legacyPos)) {
+                $lp = @GetValue($legacyPos);
+                if (is_numeric($lp)) { $pos = (int) round((float) $lp); }
+            }
         }
         if ($pos !== IShutter::POS_UNKNOWN) {
             $this->setReflect('ActualPosition', $pos);
@@ -1215,8 +1376,7 @@ class ShadingDevice extends EntityModule
     private function mgmtValidate(): array
     {
         $h = $this->computeHealth();
-        $cfg = $this->store()->get('config', []);
-        return ['ok' => $h['ok'], 'health' => $h['text'], 'issues' => $h['issues'], 'config' => is_array($cfg) ? $cfg : []];
+        return ['ok' => $h['ok'], 'health' => $h['text'], 'issues' => $h['issues'], 'config' => $this->cfg()];
     }
 
     /**
@@ -1226,8 +1386,7 @@ class ShadingDevice extends EntityModule
      */
     private function computeHealth(): array
     {
-        $cfg = $this->store()->get('config', []);
-        $cfg = is_array($cfg) ? $cfg : [];
+        $cfg = $this->cfg();
         $drv = (string) ($cfg['driver'] ?? '');
         if ($drv === '') {
             return ['ok' => false, 'text' => 'inaktiv (kein Treiber)', 'issues' => ['kein Treiber']];
@@ -1553,8 +1712,7 @@ class ShadingDevice extends EntityModule
     /** Config-Wert (aus dem Store) mit Default. */
     private function cfgVal(string $key, $def)
     {
-        $cfg = $this->store()->get('config', []);
-        $cfg = is_array($cfg) ? $cfg : [];
+        $cfg = $this->cfg();
         return $cfg[$key] ?? $def;
     }
 
