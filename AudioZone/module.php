@@ -211,6 +211,7 @@ class AudioZone extends EntityModule
         $this->syncReferences();
         $this->syncBindingLinks(); // Baum-Transparenz: sichtbare bl_-Links (nur generic-audio)
         $this->updateHealth();
+        $this->ensureScheduleEvent(); // nativer Wochenplan (Aus/An) als Zeitplan-Wahrheit
     }
 
     // ==================================================================
@@ -433,12 +434,12 @@ class AudioZone extends EntityModule
             return;
         }
         $now  = time();
-        $val  = $this->scheduleValueAt($now, 'Standard');
-        $onNow = is_numeric($val) && (float) $val > 0;
+        // Zeitplan-Wahrheit = nativer Symcon-Wochenplan (Ereignis AudioSchedule, Aus/An).
+        $onNow = $this->scheduleOnAt($now);
         $rt   = $this->readRt();
         $prev = !empty($rt['schedOn']);
         if ($onNow && !$prev) {
-            $this->scheduleStart((int) $val, $sc);
+            $this->scheduleStart(1, $sc);
         } elseif (!$onNow && $prev) {
             $this->scheduleStop($sc);
         }
@@ -1122,11 +1123,82 @@ class AudioZone extends EntityModule
         return $this->ReadPropertyBoolean('Armed');
     }
 
-    /** Baum-Sichtbarkeit: Audio-Wochenplan/Wecken (config.schedule) als read-only JSON spiegeln. */
+    /** Baum-Sichtbarkeit: Programm-Parameter (Quelle/Volume/Ruhezeiten) als JSON; die Wochen-TIMING liegt im nativen Wochenplan-Ereignis. */
     protected function refreshMirrors(): void
     {
         $cfg = $this->cfg();
-        $this->mirrorVar('ScheduleJson', 'Audio-Zeitplan/Wecken (JSON, Anzeige)', $cfg['schedule'] ?? []);
+        $this->mirrorVar('ProgramJson', 'Audio-Programm/Wecken (JSON, Anzeige)', $cfg['schedule'] ?? []);
+    }
+
+    // ==================================================================
+    // Nativer Symcon-Wochenplan (Ereignis Typ 2) als Zeitplan-Wahrheit (Aus/An)
+    // ==================================================================
+    private function audioEventId(): int
+    {
+        $e = @$this->GetIDForIdent('AudioSchedule');
+        return (is_int($e) && $e > 0) ? $e : 0;
+    }
+
+    private function ensureScheduleEvent(): void
+    {
+        if (!function_exists('IPS_CreateEvent')) { return; }
+        $eid = $this->audioEventId();
+        $fresh = false;
+        if ($eid <= 0) {
+            $eid = @\IPS_CreateEvent(2);
+            if (!$eid) { return; }
+            @\IPS_SetParent($eid, $this->InstanceID);
+            @\IPS_SetIdent($eid, 'AudioSchedule');
+            @\IPS_SetName($eid, 'Audio-Zeitplan');
+            @\IPS_SetEventScheduleAction($eid, 0, 'Aus', 0x9AA5AD, '');
+            @\IPS_SetEventScheduleAction($eid, 1, 'An', 0x00CDAB, '');
+            @\IPS_SetEventActive($eid, true);
+            $fresh = true;
+        }
+        $e = @\IPS_GetEvent($eid);
+        $hasPoints = false;
+        foreach (($e['ScheduleGroups'] ?? []) as $g) { if (!empty($g['Points'])) { $hasPoints = true; break; } }
+        if ($fresh || !$hasPoints) { $this->migrateScheduleToEvent($eid); }
+    }
+
+    private function migrateScheduleToEvent(int $eid): void
+    {
+        $e = @\IPS_GetEvent($eid);
+        foreach (($e['ScheduleGroups'] ?? []) as $g) { @\IPS_SetEventScheduleGroup($eid, (int) $g['ID'], 0); }
+        for ($d = 0; $d < 7; $d++) {
+            @\IPS_SetEventScheduleGroup($eid, $d, (1 << $d));
+            $slots = $this->schedules()->getSlots('Standard', $d);
+            usort($slots, fn($a, $b) => (int) $a['end'] - (int) $b['end']);
+            $prev = 0; $pid = 0;
+            @\IPS_SetEventScheduleGroupPoint($eid, $d, $pid++, 0, 0, 0, 0);
+            foreach ($slots as $s) {
+                $start = (int) $prev; $act = ((float) ($s['val'] ?? 0) > 0) ? 1 : 0;
+                if ($start > 0) { @\IPS_SetEventScheduleGroupPoint($eid, $d, $pid++, intdiv($start, 60), $start % 60, 0, $act); }
+                else { @\IPS_SetEventScheduleGroupPoint($eid, $d, 0, 0, 0, 0, $act); }
+                $prev = (int) ($s['end'] ?? 1440);
+            }
+        }
+    }
+
+    private function scheduleOnAt(int $now): bool
+    {
+        $eid = $this->audioEventId();
+        if ($eid <= 0) { return false; }
+        $e = @\IPS_GetEvent($eid);
+        if (!is_array($e) || empty($e['EventActive'])) { return false; }
+        $dow = (int) date('N', $now) - 1;
+        $minNow = (int) date('G', $now) * 60 + (int) date('i', $now);
+        $act = 0;
+        foreach (($e['ScheduleGroups'] ?? []) as $g) {
+            if (!(((int) ($g['Days'] ?? 0)) & (1 << $dow))) { continue; }
+            $pts = $g['Points'] ?? [];
+            usort($pts, fn($a, $b) => (($a['Start']['Hour'] ?? 0) * 60 + ($a['Start']['Minute'] ?? 0)) - (($b['Start']['Hour'] ?? 0) * 60 + ($b['Start']['Minute'] ?? 0)));
+            foreach ($pts as $p) {
+                $m = (int) ($p['Start']['Hour'] ?? 0) * 60 + (int) ($p['Start']['Minute'] ?? 0);
+                if ($m <= $minNow) { $act = (int) ($p['ActionID'] ?? 0); }
+            }
+        }
+        return $act === 1;
     }
 
     /** Flache Keys -> Properties, verschachtelte -> Store; $apply triggert ApplyChanges. */
