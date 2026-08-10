@@ -122,6 +122,15 @@ class PoolController extends EntityModule
         $controls[] = $R('PHMinusDosing', 'pH-minus dosiert gerade', 0, '~Switch');
         $controls[] = $R('PHPlusDosing', 'pH-plus dosiert gerade', 0, '~Switch');
 
+        // --- Automatik-Schalter (schaltbar, gated) ---
+        $SW = function (string $ident, string $label) {
+            return ['ident' => $ident, 'type' => ControlContract::T_SWITCH, 'role' => 'pool:auto',
+                'label' => $label, 'varType' => 0, 'profile' => '~Switch', 'actionable' => true];
+        };
+        $controls[] = $SW('DosingClAuto', 'Dosierautomatik Redox');   // Geraete-Dosierung Cl/Redox ein/aus
+        $controls[] = $SW('DosingPHAuto', 'Dosierautomatik pH');      // Geraete-Dosierung pH-minus ein/aus
+        $controls[] = $SW('CircAuto', 'Umwaelzautomatik');            // automatische Filterzeit scharf
+
         // --- Relais: Ist-Zustand (reflect) + Modus Auto/Manuell Aus/Manuell Ein (schaltbar) ---
         $relayOpts = [
             ['value' => 0, 'caption' => 'Auto'],
@@ -239,6 +248,8 @@ class PoolController extends EntityModule
         $this->RegisterPropertyInteger('MaxStaleSeconds', 1800);
         // Umwälz-Wochenplan: welche TIMEC-Regel steuert die Filterpumpe
         $this->RegisterPropertyInteger('FilterRuleIndex', 0);
+        // Umwaelzautomatik: Startzeit des automatischen Filterfensters (Min ab Mitternacht)
+        $this->RegisterPropertyInteger('CircWindowStart', 480);
         // Scharfschalten (reale Schreibzugriffe)
         $this->RegisterPropertyBoolean('Armed', false);
     }
@@ -366,7 +377,10 @@ class PoolController extends EntityModule
         // --- Durchfluss-abhaengige TruePoolTemp-Fusion (Nutzer-Anforderung #2) ---
         $this->fuseWaterTemp($inline, $flowRate, $pumpOn);
 
-        // --- Wochenplan -> Controller zurueckschreiben (bei Aenderung, gated) ---
+        // --- Umwaelzautomatik: optimale Filterzeit berechnen + einstellen (gated) ---
+        $this->circAdjust();
+
+        // --- Wochenplan -> Controller zurueckschreiben (nur wenn Umwaelzautomatik AUS) ---
         $this->reconcileSchedule();
 
         // Empfohlene Umwaelzzeit aus der ECHTEN Wassertemperatur (kein Geraetezugriff).
@@ -398,9 +412,11 @@ class PoolController extends EntityModule
                 $phm = $cl->getDosageConfig(1);
                 if (!empty($rdx['ok'])) {
                     @$this->SetValue('RedoxTarget', $this->r2((float) ($rdx['config']['target'] ?? 0)));
+                    @$this->SetValue('DosingClAuto', (bool) ($rdx['config']['enabled'] ?? false));
                 }
                 if (!empty($phm['ok'])) {
                     @$this->SetValue('PHTarget', $this->r2((float) ($phm['config']['target'] ?? 0)));
+                    @$this->SetValue('DosingPHAuto', (bool) ($phm['config']['enabled'] ?? false));
                 }
                 $rt = $this->readRt();
                 $rt['dosTs'] = time();
@@ -600,6 +616,11 @@ class PoolController extends EntityModule
     /** Vergleicht Ereignis mit letztem geschriebenen Stand; schreibt bei Aenderung (nur armed). */
     private function reconcileSchedule(): void
     {
+        // Bei aktiver Umwaelzautomatik besitzt diese die Filter-Regel -> manueller
+        // Wochenplan-Rueckschreib pausiert (kein Schreib-Konflikt).
+        if ((bool) @$this->GetValue('CircAuto')) {
+            return;
+        }
         $eid = $this->scheduleEventId();
         if ($eid === 0) {
             return;
@@ -687,7 +708,74 @@ class PoolController extends EntityModule
             $this->applyRelayMode((int) $m[1], (int) $value);
             return;
         }
+        if ($c->ident === 'DosingClAuto') {
+            $this->applyDosingEnable(0, (bool) $value);
+            return;
+        }
+        if ($c->ident === 'DosingPHAuto') {
+            $this->applyDosingEnable(1, (bool) $value);
+            return;
+        }
+        if ($c->ident === 'CircAuto') {
+            // Reines Modul-Flag; die Automatik laeuft im Poll (circAdjust), nur bei armed.
+            $this->SendDebug('HSPC.circ', 'Umwaelzautomatik ' . ((bool) $value ? 'AN' : 'AUS'), 0);
+            return;
+        }
         $this->SendDebug('HSPC.apply', $c->ident . ' unbehandelt', 0);
+    }
+
+    /** Geraete-Dosierung ein/aus (type 0=Cl/Redox, 1=pH-). Liest Konfig, setzt enabled, schreibt (gated). */
+    private function applyDosingEnable(int $type, bool $on): void
+    {
+        if (!$this->writeAllowed('dosingEnable type=' . $type . ' ' . ($on ? 'on' : 'off'))) {
+            return;
+        }
+        $cl = $this->client();
+        if ($cl === null) {
+            return;
+        }
+        $cfg = $cl->getDosageConfig($type);
+        if (empty($cfg['ok'])) {
+            return;
+        }
+        $c = $cfg['config'];
+        $c['enabled'] = $on;
+        $this->writeGuarded('dosage', fn() => $cl->setDosageConfig($type, $c));
+        $this->SendDebug('HSPC.dosing', 'type ' . $type . ' enabled=' . ($on ? 1 : 0), 0);
+    }
+
+    /**
+     * Umwaelzautomatik: berechnet die optimale Filterzeit (TruePoolTemp) und STELLT sie
+     * am Controller ein (Filter-TIMEC-Regel), sobald CircAuto=an UND armed. Gedrosselt
+     * (max 1x/h). Solange aus/nicht scharf: passiert nichts.
+     */
+    private function circAdjust(): void
+    {
+        if (!(bool) @$this->GetValue('CircAuto') || !(bool) $this->cfgVal('armed', false)) {
+            return;
+        }
+        $rt = $this->readRt();
+        if (time() - (int) ($rt['circTs'] ?? 0) < 3600) {
+            return;
+        }
+        $opt = (int) @$this->GetValue('AutoCircOptimal');
+        if ($opt <= 0) {
+            return;
+        }
+        $start = (int) $this->ReadPropertyInteger('CircWindowStart');
+        $win = [[$start, min(1439, $start + $opt)]];
+        $rem = $opt - ($win[0][1] - $win[0][0]);
+        if ($rem > 30) {
+            $win[] = [0, min(1439, $rem)];
+        }
+        $res = $this->writeFilterRule(['days' => 127, 'windows' => $win]);
+        if (!empty($res['ok'])) {
+            $rt = $this->readRt();
+            $rt['circTs'] = time();
+            $this->writeRt($rt);
+            $this->SendDebug('HSPC.circ', 'Filterzeit gesetzt: ' . $opt . ' min ab '
+                . sprintf('%02d:%02d', intdiv($start, 60), $start % 60), 0);
+        }
     }
 
     /**
