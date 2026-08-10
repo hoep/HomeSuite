@@ -65,6 +65,9 @@ $__hs_files = [
     'HAL/GenericVariableValve.php',
     'Drivers/Light/GenericBoundLight.php', // generischer Licht-Treiber (self-registriert 'generic-light' via Factory)
 
+    // --- Pool-Controller (ProCon.IP) Client (selbst-enthalten, kein HAL-Interface noetig) ---
+    'Drivers/Pool/PoolClient.php',     // HTTP-Client GetState.csv/GetDos.csv (P0/P1 Lesepfad)
+
     // --- Audio-Treiber (generisch variablen-/skriptgebunden + native Vendor-Codecs) ---
     'Drivers/Audio/GenericBoundAudioRenderer.php',
     'Drivers/Audio/SonosUpnp.php',     // nativer Sonos-Codec (self-registriert 'sonos-upnp')

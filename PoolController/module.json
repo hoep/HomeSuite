@@ -1,0 +1,12 @@
+{
+    "id": "{878CA345-86D1-84FC-B196-5B3224C067CF}",
+    "name": "PoolController",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["PoolController", "HSPC", "HomeSuite Pool"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSPC",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}
