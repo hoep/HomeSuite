@@ -424,6 +424,13 @@ class HomeSuiteHub extends EntityModule
             'role' => 'hub:automation', 'label' => 'Automatik global', 'varType' => 0,
             'profile' => '~Switch', 'actionable' => true,
         ]);
+        // Nordausrichtung als aktionierbare Baum-Variable (Slider-bindbar); dreht beim
+        // Setzen alle Sonnenprofile (delegiert an die Property-Rotation in ApplyChanges).
+        $m->addControl([
+            'ident' => 'ShadeNorth', 'type' => \Hoep\HomeSuite\ControlContract::T_LEVEL,
+            'role' => 'hub:northdeg', 'label' => 'Nordausrichtung', 'varType' => 2,
+            'unit' => '°', 'min' => -180, 'max' => 180, 'step' => 0.1, 'actionable' => true,
+        ]);
 
         return $m->toArray();
     }
@@ -459,6 +466,8 @@ class HomeSuiteHub extends EntityModule
             $this->rotateSun($want - (float) $applied);
         }
         $this->WriteAttributeString('ShadeNorthApplied', (string) $want);
+        // Baum-Variable (Slider) mit der Property synchron halten.
+        if (@$this->GetIDForIdent('ShadeNorth')) { @$this->SetValue('ShadeNorth', $want); }
     }
 
     /**
@@ -493,7 +502,13 @@ class HomeSuiteHub extends EntityModule
 
     protected function applyControl(Control $c, $value, ActionContext $ctx): void
     {
-        // absichtlich leer — Hub wird nur ueber Statusvariablen/Manage gesteuert
+        // Nordausrichtung-Slider -> Property setzen + ApplyChanges (dort erfolgt die
+        // Rotation aller Sonnenprofile ueber den Baseline-Delta-Vergleich).
+        if ($c->ident === 'ShadeNorth') {
+            @\IPS_SetProperty($this->InstanceID, 'ShadeNorthDeg', (float) $value);
+            @\IPS_ApplyChanges($this->InstanceID);
+        }
+        // sonst: Hub wird nur ueber Statusvariablen/Manage gesteuert
     }
 
     /**
