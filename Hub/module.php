@@ -437,11 +437,81 @@ class HomeSuiteHub extends EntityModule
 
         // Licht-Automatik: Timer + Bewegungs-Messages entsprechend Konfig einrichten.
         $this->lightAutoWire();
+
+        // Baum-Transparenz: sichtbare bl_-Links + Loeschschutz auf alle vom Hub
+        // referenzierten physischen Objekte (globale Sensoren/Standort, Automatik-
+        // Regeln, Szenen-Mitglieder). syncBindingLinks() laeuft schon aus parent.
+        $this->syncHubReferences();
     }
 
     protected function applyControl(Control $c, $value, ActionContext $ctx): void
     {
         // absichtlich leer — Hub wird nur ueber Statusvariablen/Manage gesteuert
+    }
+
+    /**
+     * Alle vom Hub referenzierten physischen Objekte einsammeln (globale Sensoren/
+     * Standort aus Properties + Automatik-/Szenen-Geraete aus dem Store) -> sichtbare
+     * bl_-Links (Baum-Transparenz). Dedupliziert je Objekt-ID.
+     */
+    protected function bindingTargets(): array
+    {
+        $out = []; $seen = [];
+        $add = function (string $ident, string $name, $id) use (&$out, &$seen): void {
+            $id = (int) $id;
+            if ($id > 0 && !isset($seen[$id]) && function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($id)) {
+                $seen[$id] = true;
+                $out[] = ['ident' => $ident, 'name' => $name, 'targetId' => $id];
+            }
+        };
+        // Globale Sensoren/Standort (Properties)
+        $add('bl_LocationId', 'Standort', $this->ReadPropertyInteger('LocationId'));
+        $add('bl_ShadeWindId', 'Wind (global)', $this->ReadPropertyInteger('ShadeWindId'));
+        $add('bl_ShadeRainId', 'Regen (global)', $this->ReadPropertyInteger('ShadeRainId'));
+        $add('bl_ShadeBrightId', 'Helligkeit (global)', $this->ReadPropertyInteger('ShadeBrightId'));
+        $add('bl_ShadeSunAzId', 'Sonne Azimut', $this->ReadPropertyInteger('ShadeSunAzId'));
+        $add('bl_ShadeSunElId', 'Sonne Elevation', $this->ReadPropertyInteger('ShadeSunElId'));
+        $add('bl_IrrRainSensorId', 'Regensensor (global)', $this->ReadPropertyInteger('IrrRainSensorId'));
+        // Licht-Automatik-Regeln
+        $la = $this->store()->get('lightAuto', []);
+        $rules = (is_array($la) && is_array($la['rules'] ?? null)) ? $la['rules'] : [];
+        $ri = 0;
+        foreach ($rules as $r) {
+            $ri++;
+            if (!is_array($r)) { continue; }
+            foreach (['sensor' => 'Bewegung', 'lux' => 'Lux', 'awayVar' => 'Abwesenheit', 'audioZone' => 'Audio-Zone'] as $k => $lab) {
+                if (!empty($r[$k]) && is_numeric($r[$k])) { $add('bl_la' . $ri . '_' . $k, 'Auto ' . $ri . ': ' . $lab, $r[$k]); }
+            }
+            foreach ((array) ($r['devices'] ?? []) as $j => $d) { $add('bl_la' . $ri . '_dev' . $j, 'Auto ' . $ri . ': Gerät', $d); }
+        }
+        // Licht-Szenen (Mitglieder + Raum-Bezug)
+        $sc = $this->store()->get('lightScenes', []);
+        if (is_array($sc)) {
+            $si = 0;
+            foreach ($sc as $s) {
+                $si++;
+                if (!is_array($s)) { continue; }
+                $ref = $s['scope']['ref'] ?? null;
+                if (is_numeric($ref)) { $add('bl_sc' . $si . '_room', 'Szene ' . $si . ': Raum', $ref); }
+                foreach ((array) ($s['members'] ?? []) as $m => $mem) {
+                    if (is_array($mem) && !empty($mem['device'])) { $add('bl_sc' . $si . '_dev' . $m, 'Szene ' . $si . ': Gerät', $mem['device']); }
+                }
+            }
+        }
+        return $out;
+    }
+
+    /** Loeschschutz: alle bl_-Ziele zusaetzlich als Instanz-Referenzen registrieren. */
+    private function syncHubReferences(): void
+    {
+        if (!method_exists($this, 'GetReferenceList')) { return; }
+        foreach ($this->GetReferenceList() as $ref) { @$this->UnregisterReference($ref); }
+        foreach ($this->bindingTargets() as $t) {
+            $id = (int) $t['targetId'];
+            if ($id > 0 && function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($id)) {
+                @$this->RegisterReference($id);
+            }
+        }
     }
 
     // ==================================================================
