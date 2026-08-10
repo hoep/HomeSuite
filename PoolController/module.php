@@ -138,6 +138,7 @@ class PoolController extends EntityModule
 
         // --- Automatik / System / Fehler / Verbindung ---
         $controls[] = $R('AutoCircOptimal', 'Empf. Umwaelzzeit (Min)', 1);
+        $controls[] = $R('FilterRuntimeToday', 'Filterzeit heute (Min)', 1);
         $controls[] = $R('Firmware', 'Firmware', 3);
         $controls[] = $R('StatusFlag', 'Statusflag', 1);
         $controls[] = $R('ErrorCount', 'Fehleranzahl', 1);
@@ -372,6 +373,9 @@ class PoolController extends EntityModule
                 (float) $trueTemp, (float) ($cfg['poolSize'] ?? 0), (float) ($cfg['flowRate'] ?? 0)));
         }
 
+        // Filterzeit heute = EIN-Dauer des Pumpenrelais seit Mitternacht (aus Archiv).
+        @$this->SetValue('FilterRuntimeToday', $this->pumpOnMinutesToday());
+
         // Dosier-Sollwerte (pH/Redox) gedrosselt aus der Konfig lesen (alle 300 s).
         if (time() - (int) ($rt['dosTs'] ?? 0) > 300) {
             $cl = $this->client();
@@ -602,6 +606,60 @@ class PoolController extends EntityModule
             $this->writeRt($rt);
             $this->SendDebug('HSPC.schedule', 'Zeitplan an Controller geschrieben (' . count($st['windows']) . ' Fenster)', 0);
         }
+    }
+
+    // ==================================================================
+    // Filterzeit heute = EIN-Dauer des Pumpenrelais seit Mitternacht (Archiv).
+    // Portiert aus der abgeloesten Loesung (Skript #<ID> getLoggedValueDuration).
+    // ==================================================================
+
+    private function archiveId(): int
+    {
+        if (!function_exists('IPS_GetInstanceListByModuleID')) {
+            return 0;
+        }
+        $a = @\IPS_GetInstanceListByModuleID('{43192F0B-135B-4CE7-A0A7-1475603F3060}');
+        return is_array($a) && $a ? (int) $a[0] : 0;
+    }
+
+    private function pumpOnMinutesToday(): int
+    {
+        $aid = $this->archiveId();
+        $vid = (int) $this->pumpRelayVarId();
+        $last = (int) @$this->GetValue('FilterRuntimeToday');
+        if ($aid === 0 || $vid === 0 || !function_exists('AC_GetLoggedValues')) {
+            return $last;
+        }
+        $start = strtotime('today 00:00');
+        $data = @\AC_GetLoggedValues($aid, $vid, $start, time(), 0);
+        if (!is_array($data) || $data === []) {
+            return $last;
+        }
+        $data = array_reverse($data); // aeltester zuerst
+        $sum = 0;
+        $on = null;
+        foreach ($data as $d) {
+            if ((float) $d['Value'] == 1.0) {
+                $on = (int) $d['TimeStamp'];
+            } elseif ($on !== null) {
+                $sum += (int) $d['TimeStamp'] - $on;
+                $on = null;
+            }
+        }
+        // Falls die Pumpe aktuell noch laeuft: bis jetzt hinzurechnen.
+        $lastRow = end($data);
+        if ((float) $lastRow['Value'] == 1.0) {
+            $sum += time() - (int) $lastRow['TimeStamp'];
+        }
+        return (int) round($sum / 60);
+    }
+
+    /** Objekt-ID des Pumpenrelais (Relay<PumpRelayIndex>) fuers Archiv. */
+    private function pumpRelayVarId(): int
+    {
+        $idx = (int) $this->cfgVal('pumpRelayIndex', 0);
+        $vid = @$this->GetIDForIdent('Relay' . $idx);
+        return (is_int($vid) && $vid > 0) ? $vid : 0;
     }
 
     // ==================================================================
