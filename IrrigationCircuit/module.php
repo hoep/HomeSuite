@@ -175,6 +175,87 @@ class IrrigationCircuit extends EntityModule
         $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
         $this->syncReferences();
         $this->updateHealth();
+
+        // Nativer Symcon-Wochenplan (Ereignis Typ 2) als Zeitplan-Wahrheit anlegen +
+        // einmalig aus dem ScheduleEngine-Store migrieren (dann liest runSchedule das Ereignis).
+        $this->ensureScheduleEvent();
+    }
+
+    /** Ereignis-ID des nativen Bewaesserungs-Wochenplans (0 = keiner). */
+    private function wateringEventId(): int
+    {
+        $e = @$this->GetIDForIdent('WateringSchedule');
+        return (is_int($e) && $e > 0) ? $e : 0;
+    }
+
+    /** Legt den Wochenplan (Aus/An) an und migriert einmalig den ScheduleEngine-Plan hinein. */
+    private function ensureScheduleEvent(): void
+    {
+        if (!function_exists('IPS_CreateEvent')) { return; }
+        $eid = $this->wateringEventId();
+        $fresh = false;
+        if ($eid <= 0) {
+            $eid = @\IPS_CreateEvent(2); // 2 = Wochenplan
+            if (!$eid) { return; }
+            @\IPS_SetParent($eid, $this->InstanceID);
+            @\IPS_SetIdent($eid, 'WateringSchedule');
+            @\IPS_SetName($eid, 'Bewässerungsplan');
+            @\IPS_SetEventScheduleAction($eid, 0, 'Aus', 0x9AA5AD, '');
+            @\IPS_SetEventScheduleAction($eid, 1, 'An', 0x00CDAB, '');
+            @\IPS_SetEventActive($eid, true);
+            $fresh = true;
+        }
+        // Migrieren nur, wenn frisch angelegt ODER noch keine Punkte existieren.
+        $e = @\IPS_GetEvent($eid);
+        $hasPoints = false;
+        foreach (($e['ScheduleGroups'] ?? []) as $g) { if (!empty($g['Points'])) { $hasPoints = true; break; } }
+        if ($fresh || !$hasPoints) {
+            $this->migrateScheduleToEvent($eid);
+        }
+    }
+
+    /** ScheduleEngine 'Standard' (value-until-end) -> Wochenplan-Punkte (Punkt am Slot-Start). */
+    private function migrateScheduleToEvent(int $eid): void
+    {
+        // Bestehende Gruppen entfernen, 7 Tagesgruppen neu aufbauen.
+        $e = @\IPS_GetEvent($eid);
+        foreach (($e['ScheduleGroups'] ?? []) as $g) { @\IPS_SetEventScheduleGroup($eid, (int) $g['ID'], 0); }
+        for ($d = 0; $d < 7; $d++) {
+            @\IPS_SetEventScheduleGroup($eid, $d, (1 << $d)); // Tagesmaske Bit0=Mo..Bit6=So
+            $slots = $this->schedules()->getSlots('Standard', $d);
+            usort($slots, fn($a, $b) => (int) $a['end'] - (int) $b['end']);
+            $prev = 0; $pid = 0;
+            @\IPS_SetEventScheduleGroupPoint($eid, $d, $pid++, 0, 0, 0, 0); // Default 00:00 = Aus
+            foreach ($slots as $s) {
+                $start = (int) $prev; $act = ((float) ($s['val'] ?? 0) > 0) ? 1 : 0;
+                $h = intdiv($start, 60); $mi = $start % 60;
+                if ($start > 0) { @\IPS_SetEventScheduleGroupPoint($eid, $d, $pid++, $h, $mi, 0, $act); }
+                else { @\IPS_SetEventScheduleGroupPoint($eid, $d, 0, 0, 0, 0, $act); }
+                $prev = (int) ($s['end'] ?? 1440);
+            }
+        }
+    }
+
+    /** Liest den nativen Wochenplan: ist zur Zeit $now die Aktion 'An' (1) aktiv? */
+    private function scheduleOnAt(int $now): bool
+    {
+        $eid = $this->wateringEventId();
+        if ($eid <= 0) { return false; }
+        $e = @\IPS_GetEvent($eid);
+        if (!is_array($e) || empty($e['EventActive'])) { return false; }
+        $dow = (int) date('N', $now) - 1; // 0=Mo..6=So
+        $minNow = (int) date('G', $now) * 60 + (int) date('i', $now);
+        $act = 0;
+        foreach (($e['ScheduleGroups'] ?? []) as $g) {
+            if (!(( (int) ($g['Days'] ?? 0)) & (1 << $dow))) { continue; }
+            $pts = $g['Points'] ?? [];
+            usort($pts, fn($a, $b) => (($a['Start']['Hour'] ?? 0) * 60 + ($a['Start']['Minute'] ?? 0)) - (($b['Start']['Hour'] ?? 0) * 60 + ($b['Start']['Minute'] ?? 0)));
+            foreach ($pts as $p) {
+                $m = (int) ($p['Start']['Hour'] ?? 0) * 60 + (int) ($p['Start']['Minute'] ?? 0);
+                if ($m <= $minNow) { $act = (int) ($p['ActionID'] ?? 0); }
+            }
+        }
+        return $act === 1;
     }
 
     // ==================================================================
@@ -470,8 +551,8 @@ class IrrigationCircuit extends EntityModule
         // NORMALER An/Aus-Zeitplan (value-until-end via ScheduleEngine, Sonnen-Anker generisch
         // ueber scheduleValueAt). FLANKE 0->an startet einen Lauf ueber die effektive Dauer
         // (Basis x Temp x ET0), an->0 stoppt. So genuegt ein normaler Zeitplan (viele Schaltpunkte).
-        $val   = $this->programDue($prog, $now) ? $this->scheduleValueAt($now, 'Standard') : 0;
-        $onNow = is_numeric($val) && (float) $val > 0;
+        // Zeitplan-Wahrheit = nativer Symcon-Wochenplan (Ereignis); Programm-Filter (jeden n-ten Tag) bleibt.
+        $onNow = $this->programDue($prog, $now) && $this->scheduleOnAt($now);
         $rt    = $this->readRt();
         $prev  = !empty($rt['schedOn']);
         if ($onNow && !$prev) {
@@ -992,7 +1073,7 @@ class IrrigationCircuit extends EntityModule
     /** Baum-Sichtbarkeit: Bewaesserungs-Wochenplan + Klimaregeln als read-only JSON spiegeln. */
     protected function refreshMirrors(): void
     {
-        $this->mirrorVar('ScheduleJson', 'Bewässerungsplan (JSON, Anzeige)', $this->store()->get('schedule', []));
+        // Zeitplan ist jetzt der native Wochenplan (Ereignis WateringSchedule) -> kein JSON-Spiegel mehr.
         $climate = [];
         foreach (['temp', 'rain', 'evap'] as $k) {
             $v = $this->cfgVal($k, null);
