@@ -146,7 +146,8 @@ class PoolController extends EntityModule
         }
 
         // --- Automatik / System / Fehler / Verbindung ---
-        $controls[] = $R('AutoCircOptimal', 'Empf. Umwaelzzeit (Min)', 1);
+        $controls[] = $R('AutoCircOptimal', 'Optimale Filterzeit (Min)', 1);
+        $controls[] = $R('ProgFilterMin', 'Programmierte Filterzeit (Min)', 1);
         $controls[] = $R('FilterRuntimeToday', 'Filterzeit heute (Min)', 1);
         $controls[] = $R('CpuTemp', 'CPU-Temperatur', 2, '~Temperature');
         $controls[] = $R('OperatingHours', 'Betriebsstunden', 2);
@@ -279,6 +280,7 @@ class PoolController extends EntityModule
         $ms     = max(5000, (int) ($cfg['pollInterval'] ?? self::POLL_MS_DEF));
         $this->SetTimerInterval(self::TIMER_POLL, $active ? $ms : 0);
         $this->syncReferences();
+        $this->ensureRelayLogging();
 
         // Wochenplan-Baseline: adoptierten Ist-Stand als Referenz merken, damit er
         // nicht faelschlich als "pending" (zu schreiben) gilt.
@@ -323,7 +325,10 @@ class PoolController extends EntityModule
         @$this->SetValue('PH', $this->r2(PoolClient::colVal($st, $col('phCol', 7))));
         @$this->SetValue('Redox', $this->r2(PoolClient::colVal($st, $col('redoxCol', 6))));
         @$this->SetValue('Pressure', $this->r2(PoolClient::colVal($st, $col('pressureCol', 3))));
-        @$this->SetValue('FlowVolume', $this->r2(PoolClient::colVal($st, $col('flowVolCol', 4))));
+        // Durchfluss kann nie negativ sein -> Betrag (Rohwert wird bei Stillstand negativ,
+        // sonst liefe das Flussdiagramm rueckwaerts "aus dem Pool").
+        $fv = PoolClient::colVal($st, $col('flowVolCol', 4));
+        @$this->SetValue('FlowVolume', $this->r2($fv !== null ? abs($fv) : 0.0));
 
         $flowRate = PoolClient::colVal($st, $col('flowRateCol', 24));
         @$this->SetValue('FlowRate', $this->r2($flowRate));
@@ -402,6 +407,17 @@ class PoolController extends EntityModule
         if ($pumpOn && $now > $lastTick && ($now - $lastTick) < 3600) {
             $cur = (float) @$this->GetValue('OperatingHours');
             @$this->SetValue('OperatingHours', round($cur + ($now - $lastTick) / 3600.0, 2));
+        }
+
+        // Programmierte Filterzeit = Summe der Fenster der Filter-Regel (aus Wochenplan-Event).
+        $eidP = $this->scheduleEventId();
+        if ($eidP > 0) {
+            $stP = $this->ruleFromEvent($eidP);
+            $sumP = 0;
+            foreach (($stP['windows'] ?? []) as $wP) {
+                $sumP += max(0, (int) $wP[1] - (int) $wP[0]);
+            }
+            @$this->SetValue('ProgFilterMin', $sumP);
         }
 
         // Dosier-Sollwerte (pH/Redox) gedrosselt aus der Konfig lesen (alle 300 s).
@@ -647,6 +663,26 @@ class PoolController extends EntityModule
     // Filterzeit heute = EIN-Dauer des Pumpenrelais seit Mitternacht (Archiv).
     // Portiert aus der abgeloesten Loesung (Skript #<ID> getLoggedValueDuration).
     // ==================================================================
+
+    /** Archiv-Logging fuer alle Relais-Ist-Variablen sicherstellen (EIN/AUS-Historie). */
+    private function ensureRelayLogging(): void
+    {
+        $aid = $this->archiveId();
+        if ($aid === 0 || !function_exists('AC_SetLoggingStatus')) {
+            return;
+        }
+        $changed = false;
+        for ($i = 0; $i < 8; $i++) {
+            $vid = @$this->GetIDForIdent('Relay' . $i);
+            if ($vid && !@\AC_GetLoggingStatus($aid, $vid)) {
+                @\AC_SetLoggingStatus($aid, $vid, true);
+                $changed = true;
+            }
+        }
+        if ($changed && function_exists('IPS_ApplyChanges')) {
+            @\IPS_ApplyChanges($aid);
+        }
+    }
 
     private function archiveId(): int
     {
