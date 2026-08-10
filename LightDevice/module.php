@@ -86,6 +86,7 @@ class LightDevice extends EntityModule
                 ['op' => 'setColor',        'label' => 'Test-Farbe'],
                 ['op' => 'setCct',          'label' => 'Test-Farbtemperatur'],
                 ['op' => 'setArmed',        'label' => 'Scharfschalten / Schatten-Modus'],
+                ['op' => 'migrateConfig',   'label' => 'Config auf Properties migrieren (einmalig)'],
             ],
 
             'capabilities' => [
@@ -104,6 +105,52 @@ class LightDevice extends EntityModule
     // ==================================================================
     // Lebenszyklus
     // ==================================================================
+
+    // Native Instanz-Properties (Symcon-Konzept: Konfig im Instanz-Formular,
+    // NICHT im FabricStore-JSON). Alle frueheren Store-Keys sind jetzt Properties.
+    public function Create()
+    {
+        parent::Create();
+        $this->RegisterPropertyString('Driver', '');
+        $this->RegisterPropertyInteger('SwitchVarId', 0);
+        $this->RegisterPropertyBoolean('Invert', false);
+        $this->RegisterPropertyInteger('OnScriptId', 0);
+        $this->RegisterPropertyInteger('OffScriptId', 0);
+        $this->RegisterPropertyInteger('LevelVarId', 0);
+        $this->RegisterPropertyFloat('LevelMax', 100.0);
+        $this->RegisterPropertyInteger('ColorVarId', 0);
+        $this->RegisterPropertyString('ColorFormat', 'int');
+        $this->RegisterPropertyInteger('CctVarId', 0);
+        $this->RegisterPropertyString('CctFormat', 'kelvin');
+        $this->RegisterPropertyInteger('CctMin', self::CCT_MIN);
+        $this->RegisterPropertyInteger('CctMax', self::CCT_MAX);
+        $this->RegisterPropertyInteger('WattVarId', 0);
+        $this->RegisterPropertyFloat('WattRated', 0.0);
+        $this->RegisterPropertyInteger('Circuit', 0);
+        $this->RegisterPropertyBoolean('Armed', false);
+        // Migrations-Marker: 0 = alte FabricStore-Config, 1 = auf Properties migriert.
+        $this->RegisterPropertyInteger('ConfigSchema', 0);
+    }
+
+    /** Bindungs-Links (Baum-Transparenz) auf die gebundenen Quell-Variablen/Skripte — aus Properties. */
+    protected function bindingTargets(): array
+    {
+        $cfg = $this->cfg();
+        $out = [];
+        $add = function (string $ident, string $name, int $id) use (&$out): void {
+            if ($id > 0 && function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($id)) {
+                $out[] = ['ident' => $ident, 'name' => $name, 'targetId' => $id];
+            }
+        };
+        $add('bl_SwitchVarId', 'Schalter', (int) $cfg['switchVarId']);
+        $add('bl_LevelVarId', 'Helligkeit', (int) $cfg['levelVarId']);
+        $add('bl_ColorVarId', 'Farbe', (int) $cfg['colorVarId']);
+        $add('bl_CctVarId', 'Farbtemperatur', (int) $cfg['cctVarId']);
+        $add('bl_WattVarId', 'Leistung', (int) $cfg['wattVarId']);
+        $add('bl_OnScriptId', 'Ein-Skript', (int) $cfg['onScriptId']);
+        $add('bl_OffScriptId', 'Aus-Skript', (int) $cfg['offScriptId']);
+        return $out;
+    }
 
     protected function setupTimers(): void
     {
@@ -262,9 +309,11 @@ class LightDevice extends EntityModule
             case 'setCct':
                 return $this->mgmtTest(fn(ILight $d) => $d->setCct((int) ($args['kelvin'] ?? self::CCT_MIN)), $args);
             case 'setArmed':
-                $this->store()->patch('config', ['armed' => (bool) ($args['armed'] ?? false)]);
-                $this->updateHealth();
+                @\IPS_SetProperty($this->InstanceID, 'Armed', (bool) ($args['armed'] ?? false));
+                @\IPS_ApplyChanges($this->InstanceID);
                 return ['ok' => true, 'armed' => (bool) $this->cfgVal('armed', false)];
+            case 'migrateConfig':
+                return $this->migrateConfig();
             default:
                 return parent::mgmt($op, $args, $ctx);
         }
@@ -337,14 +386,10 @@ class LightDevice extends EntityModule
         if (!empty($ctx['dryrun'])) {
             return ['ok' => true, 'dryrun' => true, 'config' => $config];
         }
-        $this->store()->patch('config', $config);
-        $this->driverResolved = false;
-        $this->driverInstance = null;
-        $this->syncReferences();
-        $this->updateHealth();
+        // Native Properties schreiben (ApplyChanges triggert syncReferences/Links/Timer neu).
+        $this->applyConfigProperties($config, true);
         $active = $this->driver() instanceof ILight;
-        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
-        return ['ok' => true, 'config' => $config, 'driverActive' => $active, 'caps' => $this->driverCaps()];
+        return ['ok' => true, 'config' => $this->cfg(), 'driverActive' => $active, 'caps' => $this->driverCaps()];
     }
 
     private function mgmtDriverProbe(): array
@@ -434,89 +479,140 @@ class LightDevice extends EntityModule
 
     public function GetConfigurationForm()
     {
-        $cfg   = $this->cfg();
-        $armed = (bool) ($cfg['armed'] ?? false);
-        $h     = $this->computeHealth();
-        return json_encode(['elements' => [
-            ['type' => 'Label', 'caption' => 'Licht — Aktor-Bindung (reale Variablen/Skripte). '
-                . 'Gruppen/Szenen/Automatik laufen im LiveViewBuilder.'],
-            ['type' => 'Label', 'caption' => '— An/Aus (Variable ODER Skript) —'],
-            ['type' => 'SelectVariable', 'name' => 'cfgSwitchVarId', 'caption' => 'Schalt-Variable (bool)',
-                'value' => (int) ($cfg['switchVarId'] ?? 0)],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'SelectScript', 'name' => 'cfgOnScriptId', 'caption' => 'Ein-Skript',
-                    'value' => (int) ($cfg['onScriptId'] ?? 0)],
-                ['type' => 'SelectScript', 'name' => 'cfgOffScriptId', 'caption' => 'Aus-Skript',
-                    'value' => (int) ($cfg['offScriptId'] ?? 0)],
-                ['type' => 'CheckBox', 'name' => 'cfgInvert', 'caption' => 'Invertieren',
-                    'value' => (bool) ($cfg['invert'] ?? false)],
-            ]],
-            ['type' => 'Label', 'caption' => '— Helligkeit / Farbe / Farbtemperatur (optional) —'],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'SelectVariable', 'name' => 'cfgLevelVarId', 'caption' => 'Helligkeit',
-                    'value' => (int) ($cfg['levelVarId'] ?? 0)],
-                ['type' => 'NumberSpinner', 'name' => 'cfgLevelMax', 'caption' => 'Voll-Wert (100/255/1)',
-                    'value' => (int) ($cfg['levelMax'] ?? 100), 'minimum' => 1, 'maximum' => 255],
-            ]],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'SelectVariable', 'name' => 'cfgColorVarId', 'caption' => 'Farbe (RGB)',
-                    'value' => (int) ($cfg['colorVarId'] ?? 0)],
-                ['type' => 'Select', 'name' => 'cfgColorFormat', 'caption' => 'Farb-Format',
-                    'value' => (string) ($cfg['colorFormat'] ?? 'int'), 'options' => [
-                        ['caption' => 'Integer 0xRRGGBB', 'value' => 'int'],
-                        ['caption' => 'Hex "#RRGGBB"', 'value' => 'hex'],
+        // Native Symcon-Konfiguration: Felder sind an Instanz-Properties gebunden
+        // (name == Property) und werden bei "Aenderungen uebernehmen" gespeichert.
+        // Buttons unter "actions" sind Laufzeit-Aktionen (RPC), keine Konfig.
+        $h = $this->computeHealth();
+        $form = [
+            'elements' => [
+                ['type' => 'Label', 'caption' => 'Licht — Aktor-Bindung (reale Variablen/Skripte). Gruppen/Szenen/Automatik laufen im LiveViewBuilder.'],
+                ['type' => 'Select', 'name' => 'Driver', 'caption' => 'Treiber', 'options' => [
+                    ['caption' => '— keiner (Schatten-Modus) —', 'value' => ''],
+                    ['caption' => 'Generisch (Variable/Skript)', 'value' => 'generic-light'],
+                ]],
+                ['type' => 'ExpansionPanel', 'caption' => 'An/Aus (Variable ODER Skript)', 'expanded' => true, 'items' => [
+                    ['type' => 'SelectVariable', 'name' => 'SwitchVarId', 'caption' => 'Schalt-Variable (bool)'],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'SelectScript', 'name' => 'OnScriptId', 'caption' => 'Ein-Skript'],
+                        ['type' => 'SelectScript', 'name' => 'OffScriptId', 'caption' => 'Aus-Skript'],
+                        ['type' => 'CheckBox', 'name' => 'Invert', 'caption' => 'Invertieren'],
                     ]],
-            ]],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'SelectVariable', 'name' => 'cfgCctVarId', 'caption' => 'Farbtemperatur',
-                    'value' => (int) ($cfg['cctVarId'] ?? 0)],
-                ['type' => 'Select', 'name' => 'cfgCctFormat', 'caption' => 'CCT-Format',
-                    'value' => (string) ($cfg['cctFormat'] ?? 'kelvin'), 'options' => [
-                        ['caption' => 'Kelvin', 'value' => 'kelvin'],
-                        ['caption' => 'Mired', 'value' => 'mired'],
-                        ['caption' => 'Prozent 0..100 (warm→kalt)', 'value' => 'percent'],
+                ]],
+                ['type' => 'ExpansionPanel', 'caption' => 'Helligkeit (optional)', 'items' => [
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'SelectVariable', 'name' => 'LevelVarId', 'caption' => 'Helligkeit'],
+                        ['type' => 'NumberSpinner', 'name' => 'LevelMax', 'caption' => 'Voll-Wert (100/255/1)', 'digits' => 0, 'minimum' => 1, 'maximum' => 255],
                     ]],
-            ]],
-            ['type' => 'Label', 'caption' => '— Leistung (optional) —'],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'SelectVariable', 'name' => 'cfgWattVarId', 'caption' => 'Leistung gemessen (W)',
-                    'value' => (int) ($cfg['wattVarId'] ?? 0)],
-                ['type' => 'NumberSpinner', 'name' => 'cfgWattRated', 'caption' => 'Nennleistung (W)',
-                    'value' => (int) ($cfg['wattRated'] ?? 0), 'minimum' => 0, 'maximum' => 5000],
-                ['type' => 'NumberSpinner', 'name' => 'cfgCircuit', 'caption' => 'Stromkreis',
-                    'value' => (int) ($cfg['circuit'] ?? 0), 'minimum' => 0, 'maximum' => 99],
-            ]],
-            ['type' => 'Button', 'caption' => 'Bindung uebernehmen', 'onClick' =>
-                'echo HSLT_Manage($id, json_encode(["op"=>"configureDriver","args"=>['
-                . '"driver"=>"generic-light","invert"=>$cfgInvert,'
-                . '"switchVarId"=>$cfgSwitchVarId,"onScriptId"=>$cfgOnScriptId,"offScriptId"=>$cfgOffScriptId,'
-                . '"levelVarId"=>$cfgLevelVarId,"levelMax"=>$cfgLevelMax,'
-                . '"colorVarId"=>$cfgColorVarId,"colorFormat"=>$cfgColorFormat,'
-                . '"cctVarId"=>$cfgCctVarId,"cctFormat"=>$cfgCctFormat,'
-                . '"wattVarId"=>$cfgWattVarId,"wattRated"=>$cfgWattRated,"circuit"=>$cfgCircuit]]));'],
-            ['type' => 'Label', 'caption' => 'Status: ' . $h['text'] . ' · scharf: ' . ($armed ? 'JA (schaltet real)' : 'nein (Schatten-Modus)')],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'Button', 'caption' => 'Test: An', 'onClick' =>
-                    'echo HSLT_Manage($id, json_encode(["op"=>"setPower","args"=>["on"=>true]]));'],
-                ['type' => 'Button', 'caption' => 'Test: Aus', 'onClick' =>
-                    'echo HSLT_Manage($id, json_encode(["op"=>"setPower","args"=>["on"=>false]]));'],
-                ['type' => 'Button', 'caption' => 'Ist-Zustand', 'onClick' =>
-                    'echo HSLT_Manage($id, json_encode(["op"=>"readState"]));'],
-                ['type' => 'Button', 'caption' => 'Bindung pruefen', 'onClick' =>
-                    'echo HSLT_Manage($id, json_encode(["op"=>"validate"]));'],
-            ]],
-            ['type' => 'Label', 'caption' => 'Achtung: real geschaltet wird nur bei "scharf" (armed). Vorher wird nur protokolliert/gespiegelt.'],
-        ]]);
+                ]],
+                ['type' => 'ExpansionPanel', 'caption' => 'Farbe / Farbtemperatur (optional)', 'items' => [
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'SelectVariable', 'name' => 'ColorVarId', 'caption' => 'Farbe (RGB)'],
+                        ['type' => 'Select', 'name' => 'ColorFormat', 'caption' => 'Farb-Format', 'options' => [
+                            ['caption' => 'Integer 0xRRGGBB', 'value' => 'int'],
+                            ['caption' => 'Hex "#RRGGBB"', 'value' => 'hex'],
+                        ]],
+                    ]],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'SelectVariable', 'name' => 'CctVarId', 'caption' => 'Farbtemperatur'],
+                        ['type' => 'Select', 'name' => 'CctFormat', 'caption' => 'CCT-Format', 'options' => [
+                            ['caption' => 'Kelvin', 'value' => 'kelvin'],
+                            ['caption' => 'Mired', 'value' => 'mired'],
+                            ['caption' => 'Prozent 0..100 (warm→kalt)', 'value' => 'percent'],
+                        ]],
+                    ]],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'NumberSpinner', 'name' => 'CctMin', 'caption' => 'CCT min (K)', 'minimum' => 1000, 'maximum' => 10000],
+                        ['type' => 'NumberSpinner', 'name' => 'CctMax', 'caption' => 'CCT max (K)', 'minimum' => 1000, 'maximum' => 10000],
+                    ]],
+                ]],
+                ['type' => 'ExpansionPanel', 'caption' => 'Leistung (optional)', 'items' => [
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'SelectVariable', 'name' => 'WattVarId', 'caption' => 'Leistung gemessen (W)'],
+                        ['type' => 'NumberSpinner', 'name' => 'WattRated', 'caption' => 'Nennleistung (W)', 'digits' => 0, 'minimum' => 0, 'maximum' => 5000],
+                        ['type' => 'NumberSpinner', 'name' => 'Circuit', 'caption' => 'Stromkreis', 'minimum' => 0, 'maximum' => 99],
+                    ]],
+                ]],
+                ['type' => 'CheckBox', 'name' => 'Armed', 'caption' => 'Scharf — schaltet real (sonst Schatten-Modus: nur protokollieren/spiegeln)'],
+                ['type' => 'Label', 'caption' => 'Status: ' . $h['text']],
+            ],
+            'actions' => [
+                ['type' => 'RowLayout', 'items' => [
+                    ['type' => 'Button', 'caption' => 'Test: An', 'onClick' => 'echo HSLT_Manage($id, json_encode(["op"=>"setPower","args"=>["on"=>true]]));'],
+                    ['type' => 'Button', 'caption' => 'Test: Aus', 'onClick' => 'echo HSLT_Manage($id, json_encode(["op"=>"setPower","args"=>["on"=>false]]));'],
+                    ['type' => 'Button', 'caption' => 'Ist-Zustand', 'onClick' => 'echo HSLT_Manage($id, json_encode(["op"=>"readState"]));'],
+                    ['type' => 'Button', 'caption' => 'Bindung pruefen', 'onClick' => 'echo HSLT_Manage($id, json_encode(["op"=>"validate"]));'],
+                ]],
+                ['type' => 'Label', 'caption' => 'Real geschaltet wird nur bei "scharf" (Armed).'],
+            ],
+        ];
+        return json_encode($form);
     }
 
     // ==================================================================
     // Helfer
     // ==================================================================
 
+    /** Konfiguration aus nativen Instanz-Properties (Symcon-Konzept). */
     private function cfg(): array
     {
+        return [
+            'driver'      => $this->ReadPropertyString('Driver'),
+            'switchVarId' => $this->ReadPropertyInteger('SwitchVarId'),
+            'invert'      => $this->ReadPropertyBoolean('Invert'),
+            'onScriptId'  => $this->ReadPropertyInteger('OnScriptId'),
+            'offScriptId' => $this->ReadPropertyInteger('OffScriptId'),
+            'levelVarId'  => $this->ReadPropertyInteger('LevelVarId'),
+            'levelMax'    => $this->ReadPropertyFloat('LevelMax'),
+            'colorVarId'  => $this->ReadPropertyInteger('ColorVarId'),
+            'colorFormat' => $this->ReadPropertyString('ColorFormat'),
+            'cctVarId'    => $this->ReadPropertyInteger('CctVarId'),
+            'cctFormat'   => $this->ReadPropertyString('CctFormat'),
+            'cctMin'      => $this->ReadPropertyInteger('CctMin'),
+            'cctMax'      => $this->ReadPropertyInteger('CctMax'),
+            'wattVarId'   => $this->ReadPropertyInteger('WattVarId'),
+            'wattRated'   => $this->ReadPropertyFloat('WattRated'),
+            'circuit'     => $this->ReadPropertyInteger('Circuit'),
+            'armed'       => $this->ReadPropertyBoolean('Armed'),
+        ];
+    }
+
+    /** Schreibt Config-Felder in die nativen Properties (Teilmenge erlaubt). */
+    private function applyConfigProperties(array $c, bool $apply = true): void
+    {
+        $S = fn(string $p, $v) => @\IPS_SetProperty($this->InstanceID, $p, $v);
+        if (array_key_exists('driver', $c))      $S('Driver', (string) $c['driver']);
+        if (array_key_exists('switchVarId', $c)) $S('SwitchVarId', (int) $c['switchVarId']);
+        if (array_key_exists('invert', $c))      $S('Invert', (bool) $c['invert']);
+        if (array_key_exists('onScriptId', $c))  $S('OnScriptId', (int) $c['onScriptId']);
+        if (array_key_exists('offScriptId', $c)) $S('OffScriptId', (int) $c['offScriptId']);
+        if (array_key_exists('levelVarId', $c))  $S('LevelVarId', (int) $c['levelVarId']);
+        if (array_key_exists('levelMax', $c))    $S('LevelMax', (float) $c['levelMax']);
+        if (array_key_exists('colorVarId', $c))  $S('ColorVarId', (int) $c['colorVarId']);
+        if (array_key_exists('colorFormat', $c)) $S('ColorFormat', (string) $c['colorFormat']);
+        if (array_key_exists('cctVarId', $c))    $S('CctVarId', (int) $c['cctVarId']);
+        if (array_key_exists('cctFormat', $c))   $S('CctFormat', (string) $c['cctFormat']);
+        if (array_key_exists('cctMin', $c))      $S('CctMin', (int) $c['cctMin']);
+        if (array_key_exists('cctMax', $c))      $S('CctMax', (int) $c['cctMax']);
+        if (array_key_exists('wattVarId', $c))   $S('WattVarId', (int) $c['wattVarId']);
+        if (array_key_exists('wattRated', $c))   $S('WattRated', (float) $c['wattRated']);
+        if (array_key_exists('circuit', $c))     $S('Circuit', (int) $c['circuit']);
+        if ($apply) {
+            @\IPS_ApplyChanges($this->InstanceID);
+        }
+    }
+
+    /** Einmal-Migration: alte FabricStore-config -> native Properties (per RPC ausgeloest). */
+    private function migrateConfig(): array
+    {
+        if ($this->ReadPropertyInteger('ConfigSchema') >= 1) {
+            return ['ok' => true, 'already' => true, 'config' => $this->cfg()];
+        }
         $c = $this->store()->get('config', []);
-        return is_array($c) ? $c : [];
+        $c = is_array($c) ? $c : [];
+        $this->applyConfigProperties($c, false);      // gebuendelt, ApplyChanges gleich unten
+        @\IPS_SetProperty($this->InstanceID, 'ConfigSchema', 1);
+        @\IPS_ApplyChanges($this->InstanceID);
+        return ['ok' => true, 'migrated' => array_keys($c), 'config' => $this->cfg()];
     }
 
     private function cfgVal(string $key, $def)
