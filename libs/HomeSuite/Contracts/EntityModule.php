@@ -84,6 +84,11 @@ abstract class EntityModule extends \IPSModule
         $this->controlCache = null;
         $this->registerControls();
 
+        // Baum-Transparenz: sichtbare Links auf die gebundenen Quell-Variablen/
+        // Aktoren anlegen/pflegen, damit im Symcon-Objektbaum nachvollziehbar ist,
+        // was die Entitaet liest/schaltet (generisch aus der Store-Konfig).
+        $this->syncBindingLinks();
+
         // Falls Kernel bereits laeuft, Ready-Hook sofort ausloesen.
         if (function_exists('IPS_GetKernelRunlevel') && IPS_GetKernelRunlevel() === KR_READY) {
             $this->onKernelReady();
@@ -434,6 +439,108 @@ abstract class EntityModule extends \IPSModule
             return true;
         }
         return @\GetValue($vid) === false ? false : true;
+    }
+
+    // ==================================================================
+    // Baum-Transparenz: sichtbare Links auf gebundene Quell-Objekte
+    // (generisch aus der Store-Konfig; kein modul-spezifischer Code noetig).
+    // ==================================================================
+
+    /** Lesbare Labels bekannter Bindungs-Konfigschluessel (Fallback: prettify). */
+    private const BIND_LABELS = [
+        'switchVarId' => 'Schalter', 'levelVarId' => 'Helligkeit', 'colorVarId' => 'Farbe',
+        'cctVarId' => 'Farbtemperatur', 'wattVarId' => 'Leistung', 'onScriptId' => 'Ein-Skript',
+        'offScriptId' => 'Aus-Skript', 'trealSourceVarId' => 'Wassertemperatur extern',
+        'positionVarId' => 'Position', 'slatVarId' => 'Lamelle', 'setpointVarId' => 'Sollwert',
+        'airTempVarId' => 'Ist-Temperatur', 'humidityVarId' => 'Luftfeuchte', 'presenceVarId' => 'Praesenz',
+        'valveVarId' => 'Ventil', 'powerVarId' => 'Leistung', 'startScriptId' => 'Start-Skript',
+        'stopScriptId' => 'Stop-Skript', 'sourceVarId' => 'Quelle',
+    ];
+
+    /**
+     * Sammelt gebundene Quell-Objekte aus der Store-Konfig. Erkennt Schluessel mit
+     * Suffix *VarId/*VariableID/*VariablenID/*ScriptId (Wert = existierende Objekt-ID).
+     * Domaenen koennen dies ueberschreiben/ergaenzen.
+     *
+     * @return array<int,array{ident:string,name:string,targetId:int}>
+     */
+    protected function bindingTargets(): array
+    {
+        $cfg = $this->store()->get('config', []);
+        if (!is_array($cfg)) {
+            return [];
+        }
+        $out = [];
+        $scan = function (array $arr, string $prefix) use (&$scan, &$out): void {
+            foreach ($arr as $k => $v) {
+                if (is_array($v)) {
+                    $scan($v, $prefix . $k . '_');
+                    continue;
+                }
+                $key = (string) $k;
+                if (!preg_match('/(VarId|VariableID|VariablenID|ScriptId|ScriptID)$/', $key)) {
+                    continue;
+                }
+                $id = is_numeric($v) ? (int) $v : 0;
+                if ($id <= 0 || !(function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($id))) {
+                    continue;
+                }
+                $out[] = [
+                    'ident'    => 'bl_' . $prefix . $key,
+                    'name'     => self::BIND_LABELS[$key] ?? $this->prettifyBindKey($key),
+                    'targetId' => $id,
+                ];
+            }
+        };
+        $scan($cfg, '');
+        return $out;
+    }
+
+    private function prettifyBindKey(string $key): string
+    {
+        $key = (string) preg_replace('/(VarId|VariableID|VariablenID|ScriptId|ScriptID)$/', '', $key);
+        $key = (string) preg_replace('/([a-z0-9])([A-Z])/', '$1 $2', $key);
+        return ucfirst(trim($key)) ?: 'Bindung';
+    }
+
+    /** Legt/pflegt sichtbare Links (ObjectType 6) auf die gebundenen Quell-Objekte (idempotent). */
+    protected function syncBindingLinks(): void
+    {
+        if (!function_exists('IPS_CreateLink') || !function_exists('IPS_GetChildrenIDs')) {
+            return;
+        }
+        $wanted = [];
+        foreach ($this->bindingTargets() as $t) {
+            $ident = (string) preg_replace('/[^A-Za-z0-9_]/', '', (string) $t['ident']);
+            if ($ident !== '') {
+                $wanted[$ident] = $t;
+            }
+        }
+        // Von UNS verwaltete Links (ident-Prefix bl_) einsammeln; verwaiste entfernen.
+        foreach ((array) @\IPS_GetChildrenIDs($this->InstanceID) as $cid) {
+            $o = @\IPS_GetObject($cid);
+            if (!is_array($o) || (int) ($o['ObjectType'] ?? 0) !== 6) {
+                continue;
+            }
+            $id = (string) ($o['ObjectIdent'] ?? '');
+            if (strncmp($id, 'bl_', 3) === 0 && !isset($wanted[$id])) {
+                @\IPS_DeleteLink($cid);
+            }
+        }
+        // Anlegen/aktualisieren.
+        foreach ($wanted as $ident => $t) {
+            $lid = @$this->GetIDForIdent($ident);
+            if (!(is_int($lid) && $lid > 0)) {
+                $lid = @\IPS_CreateLink();
+                if (!$lid) {
+                    continue;
+                }
+                @\IPS_SetParent($lid, $this->InstanceID);
+                @\IPS_SetIdent($lid, $ident);
+            }
+            @\IPS_SetName($lid, (string) $t['name']);
+            @\IPS_SetLinkTargetID($lid, (int) $t['targetId']);
+        }
     }
 
     // ==================================================================
