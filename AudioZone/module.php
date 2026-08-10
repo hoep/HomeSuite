@@ -154,6 +154,7 @@ class AudioZone extends EntityModule
                 ['op' => 'validate',        'label' => 'Bindung pruefen (Diagnose)'],
                 ['op' => 'driverProbe',     'label' => 'Treiber-Status (Diagnose)'],
                 ['op' => 'setArmed',        'label' => 'Scharfschalten / Schatten-Modus'],
+                ['op' => 'migrateConfig',   'label' => 'Config auf Properties migrieren (einmalig)'],
                 ['op' => 'importLegacy',    'label' => 'Aus IPSSonos importieren'],
                 ['op' => 'group',           'label' => 'Gruppieren'],
                 ['op' => 'ungroup',         'label' => 'Gruppe trennen'],
@@ -208,6 +209,7 @@ class AudioZone extends EntityModule
         $active = $this->driver() instanceof IAudioRenderer;
         $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
         $this->syncReferences();
+        $this->syncBindingLinks(); // Baum-Transparenz: sichtbare bl_-Links (nur generic-audio)
         $this->updateHealth();
     }
 
@@ -584,9 +586,11 @@ class AudioZone extends EntityModule
             case 'driverProbe':
                 return $this->mgmtDriverProbe();
             case 'setArmed':
-                $this->store()->patch('config', ['armed' => (bool) ($args['armed'] ?? false)]);
-                $this->updateHealth();
-                return ['ok' => true, 'armed' => (bool) $this->cfgVal('armed', false)];
+                @\IPS_SetProperty($this->InstanceID, 'Armed', (bool) ($args['armed'] ?? false));
+                @\IPS_ApplyChanges($this->InstanceID);
+                return ['ok' => true, 'armed' => $this->armed()];
+            case 'migrateConfig':
+                return $this->migrateConfig();
             case 'importLegacy':
                 return $this->mgmtImportLegacy($args);
             case 'group':
@@ -650,11 +654,7 @@ class AudioZone extends EntityModule
         if (!empty($ctx['dryrun'])) {
             return ['ok' => true, 'dryrun' => true, 'config' => $config];
         }
-        $this->store()->patch('config', $config);
-        $this->driverResolved = false;
-        $this->driverInstance = null;
-        $this->syncReferences();
-        $this->updateHealth();
+        $this->applyConfigProperties($config, true); // driver->Property, Rest->Store; ApplyChanges zieht Treiber/Refs/Links neu
         return ['ok' => true, 'config' => $this->cfg(), 'driverActive' => $this->driver() instanceof IAudioRenderer];
     }
 
@@ -721,11 +721,7 @@ class AudioZone extends EntityModule
                 'masterNameVarId'  => (int) ($args['masterNameVarId'] ?? 36753),
             ],
         ];
-        $this->store()->patch('config', $config);
-        $this->driverResolved = false;
-        $this->driverInstance = null;
-        $this->syncReferences();
-        $this->updateHealth();
+        $this->applyConfigProperties($config, true); // driver->Property, Rest->Store; ApplyChanges zieht Treiber/Refs/Links neu
         return ['ok' => true, 'roomInstanceId' => $room, 'transportVarId' => $transport,
             'driverActive' => $this->driver() instanceof IAudioRenderer, 'armed' => false];
     }
@@ -1090,10 +1086,118 @@ class AudioZone extends EntityModule
     // Helfer
     // ==================================================================
 
+    // ==================================================================
+    // Native Instanz-Properties (Symcon-Konzept). Nur die flachen Top-Level-
+    // Felder (driver/armed) sind Properties; die tief verschachtelte Bindung
+    // (bind/reflect/power/group/caps/schedule) bleibt im FabricStore.
+    // ==================================================================
+    public function Create()
+    {
+        parent::Create();
+        $this->RegisterPropertyString('Driver', '');
+        $this->RegisterPropertyBoolean('Armed', false);
+        $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
+    }
+
+    private const PROP_MAP = ['driver' => ['Driver', 's'], 'armed' => ['Armed', 'b']];
+
+    private function castProp(string $type, $v)
+    {
+        switch ($type) { case 'i': return (int)$v; case 'f': return (float)$v; case 'b': return (bool)$v; default: return (string)$v; }
+    }
+
+    /** Flache Felder (driver/armed) aus Properties, alles andere aus dem Store. */
     protected function cfg(): array
     {
+        $store = $this->store()->get('config', []);
+        $store = is_array($store) ? $store : [];
+        return array_merge($store, [
+            'driver' => $this->ReadPropertyString('Driver'),
+            'armed'  => $this->ReadPropertyBoolean('Armed'),
+        ]);
+    }
+
+    private function armed(): bool
+    {
+        return $this->ReadPropertyBoolean('Armed');
+    }
+
+    /** Flache Keys -> Properties, verschachtelte -> Store; $apply triggert ApplyChanges. */
+    private function applyConfigProperties(array $c, bool $apply = true): void
+    {
+        $storePatch = [];
+        foreach ($c as $k => $v) {
+            if (isset(self::PROP_MAP[$k])) {
+                [$p, $t] = self::PROP_MAP[$k];
+                @\IPS_SetProperty($this->InstanceID, $p, $this->castProp($t, $v));
+            } else {
+                $storePatch[$k] = $v; // bind/reflect/power/group/caps/schedule …
+            }
+        }
+        if ($storePatch !== []) {
+            $this->store()->patch('config', $storePatch);
+        }
+        if ($apply) {
+            @\IPS_ApplyChanges($this->InstanceID);
+        }
+    }
+
+    /** Einmal-Migration: flache FabricStore-config -> native Properties (per RPC-Op). */
+    private function migrateConfig(): array
+    {
+        if ($this->ReadPropertyInteger('ConfigSchema') >= 1) {
+            return ['ok' => true, 'already' => true, 'config' => $this->cfg()];
+        }
         $c = $this->store()->get('config', []);
-        return is_array($c) ? $c : [];
+        $c = is_array($c) ? $c : [];
+        $flat = [];
+        foreach ($c as $k => $v) {
+            if (isset(self::PROP_MAP[$k])) {
+                [$p, $t] = self::PROP_MAP[$k];
+                @\IPS_SetProperty($this->InstanceID, $p, $this->castProp($t, $v));
+                $flat[] = $k;
+            }
+        }
+        @\IPS_SetProperty($this->InstanceID, 'ConfigSchema', 1);
+        @\IPS_ApplyChanges($this->InstanceID);
+        return ['ok' => true, 'migrated' => $flat, 'config' => $this->cfg()];
+    }
+
+    /**
+     * Baum-Transparenz: bl_-Links auf die vom Zonen-Aktor GESTEUERTEN Symcon-
+     * Objekte. NUR fuer generic-audio moeglich (bindet an Variablen); sonos-upnp
+     * (IP/RINCON) und heos (PID) binden an Netzwerk-Adressen -> keine Objekt-Links.
+     */
+    protected function bindingTargets(): array
+    {
+        $cfg = $this->cfg();
+        if ((string) ($cfg['driver'] ?? '') !== 'generic-audio') {
+            return [];
+        }
+        $out = [];
+        $add = function (string $ident, string $name, $id) use (&$out): void {
+            $id = (int) $id;
+            if ($id > 0 && function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($id)) {
+                $out[] = ['ident' => $ident, 'name' => $name, 'targetId' => $id];
+            }
+        };
+        $bind = is_array($cfg['bind'] ?? null) ? $cfg['bind'] : [];
+        foreach (['transport'=>'Transport','volume'=>'Lautstärke','mute'=>'Stumm','repeat'=>'Repeat','shuffle'=>'Shuffle','position'=>'Position'] as $k => $lab) {
+            $add('bl_' . $k, $lab, $bind[$k]['varId'] ?? 0);
+        }
+        $src = is_array($bind['source'] ?? null) ? $bind['source'] : [];
+        foreach (['favorite'=>'Favorit','radio'=>'Radio','playlist'=>'Playlist'] as $k => $lab) {
+            $add('bl_src_' . $k, $lab, $src[$k]['varId'] ?? 0);
+        }
+        $pow = is_array($cfg['power'] ?? null) ? $cfg['power'] : [];
+        $add('bl_power', 'Ein/Aus', $pow['varId'] ?? 0);
+        $add('bl_powerOn', 'Ein-Skript', $pow['scriptOn'] ?? 0);
+        $add('bl_powerOff', 'Aus-Skript', $pow['scriptOff'] ?? 0);
+        $grp = is_array($cfg['group'] ?? null) ? $cfg['group'] : [];
+        foreach (['scriptId'=>'Gruppen-Skript','rinconVarId'=>'RINCON','masterVarId'=>'Master','slaveVarId'=>'Slave'] as $k => $lab) {
+            $add('bl_grp_' . strtolower($k), $lab, $grp[$k] ?? 0);
+        }
+        return $out;
     }
 
     protected function cfgVal(string $key, $def)
