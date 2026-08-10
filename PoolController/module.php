@@ -192,6 +192,60 @@ class PoolController extends EntityModule
     // Lebenszyklus
     // ==================================================================
 
+    // ==================================================================
+    // Native Instanz-Properties (Symcon-Konzept: Konfig im Instanz-Formular,
+    // NICHT im FabricStore-JSON). Alle frueheren Store-Keys sind jetzt Properties.
+    // ==================================================================
+
+    public function Create()
+    {
+        parent::Create();
+        // Verbindung
+        $this->RegisterPropertyString('Host', '');
+        $this->RegisterPropertyString('User', 'admin');
+        $this->RegisterPropertyString('Password', '');
+        $this->RegisterPropertyInteger('Port', 80);
+        $this->RegisterPropertyInteger('Timeout', 10);
+        $this->RegisterPropertyInteger('ConnectTimeout', 5);
+        $this->RegisterPropertyBoolean('UseHTTPS', false);
+        $this->RegisterPropertyInteger('PollInterval', self::POLL_MS_DEF);
+        // Spaltenzuordnung
+        $this->RegisterPropertyInteger('PoolTempCol', 8);
+        $this->RegisterPropertyInteger('OutsideCol', 9);
+        $this->RegisterPropertyInteger('SolarCol', 10);
+        $this->RegisterPropertyInteger('ReturnCol', 11);
+        $this->RegisterPropertyInteger('PumpTempCol', 12);
+        $this->RegisterPropertyInteger('RedoxCol', 6);
+        $this->RegisterPropertyInteger('PhCol', 7);
+        $this->RegisterPropertyInteger('PressureCol', 3);
+        $this->RegisterPropertyInteger('FlowVolCol', 4);
+        $this->RegisterPropertyInteger('FlowRateCol', 24);
+        $this->RegisterPropertyInteger('PumpRelayIndex', 0);
+        $this->RegisterPropertyFloat('FlowThreshold', 0.5);
+        $this->RegisterPropertyInteger('FlowSettleSeconds', 120);
+        // Umwaelz-Berechnung
+        $this->RegisterPropertyFloat('PoolSize', 0.0);
+        $this->RegisterPropertyFloat('CircFlowRate', 0.0);
+        // TReal (echte Wassertemperatur)
+        $this->RegisterPropertyBoolean('TrealEnabled', false);
+        $this->RegisterPropertyInteger('TrealSourceVarId', 0);
+        $this->RegisterPropertyFloat('MinPlausible', 0.0);
+        $this->RegisterPropertyFloat('MaxPlausible', 45.0);
+        $this->RegisterPropertyInteger('MaxStaleSeconds', 1800);
+        // Scharfschalten (reale Schreibzugriffe)
+        $this->RegisterPropertyBoolean('Armed', false);
+    }
+
+    /** Bindungs-Link (Baum-Transparenz) auf den externen In-Pool-Sensor. */
+    protected function bindingTargets(): array
+    {
+        $vid = (int) $this->cfgVal('trealSourceVarId', 0);
+        if ($vid > 0 && function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($vid)) {
+            return [['ident' => 'bl_TrealSourceVarId', 'name' => 'Wassertemperatur extern', 'targetId' => $vid]];
+        }
+        return [];
+    }
+
     protected function setupTimers(): void
     {
         $this->RegisterTimer(self::TIMER_POLL, 0, 'HSPC_Poll($_IPS[\'TARGET\']);');
@@ -582,78 +636,87 @@ class PoolController extends EntityModule
                 return $this->mgmtSetSensorConfig($args);
 
             case 'setArmed':
-                $this->store()->patch('config', ['armed' => (bool) ($args['armed'] ?? false)]);
+                $this->setProps(['Armed' => (bool) ($args['armed'] ?? false)]);
                 return ['ok' => true, 'armed' => (bool) $this->cfgVal('armed', false)];
             default:
                 return parent::mgmt($op, $args, $ctx);
         }
     }
 
+    /** Properties setzen + uebernehmen (native Symcon-Persistenz). */
+    private function setProps(array $map): void
+    {
+        foreach ($map as $prop => $val) {
+            @\IPS_SetProperty($this->InstanceID, $prop, $val);
+        }
+        @\IPS_ApplyChanges($this->InstanceID);
+    }
+
     private function mgmtConfigureConnection(array $args, array $ctx): array
     {
-        $patch = [
-            'host'           => trim((string) ($args['host'] ?? $this->cfgVal('host', ''))),
-            'user'           => (string) ($args['user'] ?? $this->cfgVal('user', 'admin')),
-            'port'           => (int) ($args['port'] ?? $this->cfgVal('port', 80)),
-            'timeout'        => max(2, (int) ($args['timeout'] ?? $this->cfgVal('timeout', 10))),
-            'connectTimeout' => max(1, (int) ($args['connectTimeout'] ?? $this->cfgVal('connectTimeout', 5))),
-            'useHttps'       => (bool) ($args['useHttps'] ?? $this->cfgVal('useHttps', false)),
-            'pollInterval'   => max(5000, (int) ($args['pollInterval'] ?? $this->cfgVal('pollInterval', self::POLL_MS_DEF))),
+        $map = [
+            'Host'           => trim((string) ($args['host'] ?? $this->cfgVal('host', ''))),
+            'User'           => (string) ($args['user'] ?? $this->cfgVal('user', 'admin')),
+            'Port'           => (int) ($args['port'] ?? $this->cfgVal('port', 80)),
+            'Timeout'        => max(2, (int) ($args['timeout'] ?? $this->cfgVal('timeout', 10))),
+            'ConnectTimeout' => max(1, (int) ($args['connectTimeout'] ?? $this->cfgVal('connectTimeout', 5))),
+            'UseHTTPS'       => (bool) ($args['useHttps'] ?? $this->cfgVal('useHttps', false)),
+            'PollInterval'   => max(5000, (int) ($args['pollInterval'] ?? $this->cfgVal('pollInterval', self::POLL_MS_DEF))),
         ];
-        // Passwort nur setzen, wenn ein nicht-leerer Wert kommt (leeres Feld = unveraendert).
         if (isset($args['pass']) && (string) $args['pass'] !== '') {
-            $patch['pass'] = (string) $args['pass'];
+            $map['Password'] = (string) $args['pass'];
         }
         if (!empty($ctx['dryrun'])) {
-            unset($patch['pass']);
-            return ['ok' => true, 'dryrun' => true, 'config' => $patch];
+            unset($map['Password']);
+            return ['ok' => true, 'dryrun' => true, 'props' => $map];
         }
-        $this->store()->patch('config', $patch);
-        $this->ApplyChanges();
+        $this->setProps($map);
         return ['ok' => true, 'probe' => ($this->client() ? $this->client()->ping() : ['ok' => false])];
     }
 
     private function mgmtConfigureMapping(array $args, array $ctx): array
     {
-        $keys = ['poolTempCol', 'outsideCol', 'solarCol', 'returnCol', 'pumpTempCol', 'redoxCol',
-            'phCol', 'pressureCol', 'flowVolCol', 'flowRateCol', 'pumpRelayIndex', 'flowSettleSeconds'];
-        $patch = [];
-        foreach ($keys as $k) {
+        $intMap = ['poolTempCol' => 'PoolTempCol', 'outsideCol' => 'OutsideCol', 'solarCol' => 'SolarCol',
+            'returnCol' => 'ReturnCol', 'pumpTempCol' => 'PumpTempCol', 'redoxCol' => 'RedoxCol',
+            'phCol' => 'PhCol', 'pressureCol' => 'PressureCol', 'flowVolCol' => 'FlowVolCol',
+            'flowRateCol' => 'FlowRateCol', 'pumpRelayIndex' => 'PumpRelayIndex', 'flowSettleSeconds' => 'FlowSettleSeconds'];
+        $floatMap = ['flowThreshold' => 'FlowThreshold', 'poolSize' => 'PoolSize', 'flowRate' => 'CircFlowRate'];
+        $map = [];
+        foreach ($intMap as $k => $prop) {
             if (isset($args[$k])) {
-                $patch[$k] = (int) $args[$k];
+                $map[$prop] = (int) $args[$k];
             }
         }
-        foreach (['flowThreshold', 'poolSize', 'flowRate'] as $fk) {
-            if (isset($args[$fk])) {
-                $patch[$fk] = (float) $args[$fk];
+        foreach ($floatMap as $k => $prop) {
+            if (isset($args[$k])) {
+                $map[$prop] = (float) $args[$k];
             }
         }
         if (!empty($ctx['dryrun'])) {
-            return ['ok' => true, 'dryrun' => true, 'config' => $patch];
+            return ['ok' => true, 'dryrun' => true, 'props' => $map];
         }
-        $this->store()->patch('config', $patch);
-        return ['ok' => true, 'config' => $patch];
+        $this->setProps($map);
+        return ['ok' => true, 'props' => $map];
     }
 
     private function mgmtConfigureTReal(array $args, array $ctx): array
     {
-        $vid = (int) ($args['trealSourceVarId'] ?? 0);
+        $vid = (int) ($args['trealSourceVarId'] ?? $this->cfgVal('trealSourceVarId', 0));
         if ($vid > 0 && function_exists('IPS_VariableExists') && !@\IPS_VariableExists($vid)) {
             return ['ok' => false, 'error' => 'variable_not_found', 'vid' => $vid];
         }
-        $patch = [
-            'trealEnabled'    => (bool) ($args['trealEnabled'] ?? $this->cfgVal('trealEnabled', false)),
-            'trealSourceVarId' => $vid,
-            'minPlausible'    => (float) ($args['minPlausible'] ?? $this->cfgVal('minPlausible', 0.0)),
-            'maxPlausible'    => (float) ($args['maxPlausible'] ?? $this->cfgVal('maxPlausible', 45.0)),
-            'maxStaleSeconds' => max(0, (int) ($args['maxStaleSeconds'] ?? $this->cfgVal('maxStaleSeconds', 1800))),
+        $map = [
+            'TrealEnabled'    => (bool) ($args['trealEnabled'] ?? $this->cfgVal('trealEnabled', false)),
+            'TrealSourceVarId' => $vid,
+            'MinPlausible'    => (float) ($args['minPlausible'] ?? $this->cfgVal('minPlausible', 0.0)),
+            'MaxPlausible'    => (float) ($args['maxPlausible'] ?? $this->cfgVal('maxPlausible', 45.0)),
+            'MaxStaleSeconds' => max(0, (int) ($args['maxStaleSeconds'] ?? $this->cfgVal('maxStaleSeconds', 1800))),
         ];
         if (!empty($ctx['dryrun'])) {
-            return ['ok' => true, 'dryrun' => true, 'config' => $patch];
+            return ['ok' => true, 'dryrun' => true, 'props' => $map];
         }
-        $this->store()->patch('config', $patch);
-        $this->syncReferences();
-        return ['ok' => true, 'config' => $patch];
+        $this->setProps($map);
+        return ['ok' => true, 'props' => $map];
     }
 
     private function mgmtSetRelayMode(array $args): array
@@ -859,11 +922,40 @@ class PoolController extends EntityModule
         }
     }
 
+    /** Konfiguration aus nativen Instanz-Properties (Symcon-Konzept). */
     private function cfg(): array
     {
-        $c = $this->store()->get('config', []);
-        $c = is_array($c) ? $c : [];
-        return $c + self::DEF;
+        return [
+            'host'              => $this->ReadPropertyString('Host'),
+            'user'              => $this->ReadPropertyString('User'),
+            'pass'              => $this->ReadPropertyString('Password'),
+            'port'              => $this->ReadPropertyInteger('Port'),
+            'timeout'           => $this->ReadPropertyInteger('Timeout'),
+            'connectTimeout'    => $this->ReadPropertyInteger('ConnectTimeout'),
+            'useHttps'          => $this->ReadPropertyBoolean('UseHTTPS'),
+            'pollInterval'      => $this->ReadPropertyInteger('PollInterval'),
+            'armed'             => $this->ReadPropertyBoolean('Armed'),
+            'poolTempCol'       => $this->ReadPropertyInteger('PoolTempCol'),
+            'outsideCol'        => $this->ReadPropertyInteger('OutsideCol'),
+            'solarCol'          => $this->ReadPropertyInteger('SolarCol'),
+            'returnCol'         => $this->ReadPropertyInteger('ReturnCol'),
+            'pumpTempCol'       => $this->ReadPropertyInteger('PumpTempCol'),
+            'redoxCol'          => $this->ReadPropertyInteger('RedoxCol'),
+            'phCol'             => $this->ReadPropertyInteger('PhCol'),
+            'pressureCol'       => $this->ReadPropertyInteger('PressureCol'),
+            'flowVolCol'        => $this->ReadPropertyInteger('FlowVolCol'),
+            'flowRateCol'       => $this->ReadPropertyInteger('FlowRateCol'),
+            'pumpRelayIndex'    => $this->ReadPropertyInteger('PumpRelayIndex'),
+            'flowThreshold'     => $this->ReadPropertyFloat('FlowThreshold'),
+            'flowSettleSeconds' => $this->ReadPropertyInteger('FlowSettleSeconds'),
+            'poolSize'          => $this->ReadPropertyFloat('PoolSize'),
+            'flowRate'          => $this->ReadPropertyFloat('CircFlowRate'),
+            'trealEnabled'      => $this->ReadPropertyBoolean('TrealEnabled'),
+            'trealSourceVarId'  => $this->ReadPropertyInteger('TrealSourceVarId'),
+            'minPlausible'      => $this->ReadPropertyFloat('MinPlausible'),
+            'maxPlausible'      => $this->ReadPropertyFloat('MaxPlausible'),
+            'maxStaleSeconds'   => $this->ReadPropertyInteger('MaxStaleSeconds'),
+        ];
     }
 
     private function cfgVal(string $key, $def)
@@ -884,150 +976,119 @@ class PoolController extends EntityModule
 
     public function GetConfigurationForm()
     {
-        $cfg   = $this->cfg();
-        $armed = (bool) ($cfg['armed'] ?? false);
-        $host  = (string) ($cfg['host'] ?? '');
+        // Native Symcon-Konfiguration: Felder sind an Instanz-Properties gebunden
+        // (name == Property) und werden bei "Aenderungen uebernehmen" gespeichert.
+        // Buttons unter "actions" sind Laufzeit-Aktionen (RPC), keine Konfig.
+        $armed = (bool) $this->cfgVal('armed', false);
+        $host  = (string) $this->cfgVal('host', '');
 
-        return json_encode(['elements' => [
-            ['type' => 'Label', 'caption' => 'Pool-Controller (ProCon.IP). Verwaltung/Bedienung spaeter im LiveViewBuilder; '
-                . 'hier Erstkonfiguration + Diagnose. Schreibbetrieb (Relais/Dosierung) erst ab spaeteren Phasen und nur bei "scharf".'],
+        $form = [
+            'elements' => [
+                ['type' => 'ExpansionPanel', 'caption' => 'Verbindung', 'expanded' => ($host === ''), 'items' => [
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'ValidationTextBox', 'name' => 'Host', 'caption' => 'Host/IP'],
+                        ['type' => 'NumberSpinner', 'name' => 'Port', 'caption' => 'Port'],
+                        ['type' => 'CheckBox', 'name' => 'UseHTTPS', 'caption' => 'HTTPS'],
+                    ]],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'ValidationTextBox', 'name' => 'User', 'caption' => 'Benutzer'],
+                        ['type' => 'PasswordTextBox', 'name' => 'Password', 'caption' => 'Passwort'],
+                    ]],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'NumberSpinner', 'name' => 'Timeout', 'caption' => 'Timeout (s)'],
+                        ['type' => 'NumberSpinner', 'name' => 'ConnectTimeout', 'caption' => 'Connect-Timeout (s)'],
+                        ['type' => 'NumberSpinner', 'name' => 'PollInterval', 'caption' => 'Poll-Intervall (ms)', 'minimum' => 5000],
+                    ]],
+                ]],
 
-            ['type' => 'ExpansionPanel', 'caption' => 'Verbindung', 'expanded' => ($host === ''), 'items' => [
-                ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'ValidationTextBox', 'name' => 'cfgHost', 'caption' => 'Host/IP', 'value' => $host],
-                    ['type' => 'NumberSpinner', 'name' => 'cfgPort', 'caption' => 'Port', 'value' => (int) ($cfg['port'] ?? 80)],
-                    ['type' => 'CheckBox', 'name' => 'cfgHttps', 'caption' => 'HTTPS', 'value' => (bool) ($cfg['useHttps'] ?? false)],
+                ['type' => 'ExpansionPanel', 'caption' => 'Echte Wassertemperatur (TReal) — externer In-Pool-Sensor', 'items' => [
+                    ['type' => 'Label', 'caption' => 'Inline-Sensoren messen nur bei laufender Pumpe korrekt. Bei Stillstand nutzt das '
+                        . 'Modul den externen In-Pool-Sensor als echte Wassertemperatur (TruePoolTemp). Kein Geraete-Rueckschreiben.'],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'CheckBox', 'name' => 'TrealEnabled', 'caption' => 'Aktiv'],
+                        ['type' => 'SelectVariable', 'name' => 'TrealSourceVarId', 'caption' => 'In-Pool-Sensor (Variable)'],
+                    ]],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'NumberSpinner', 'name' => 'MinPlausible', 'caption' => 'Plausibel min (°C)', 'digits' => 1],
+                        ['type' => 'NumberSpinner', 'name' => 'MaxPlausible', 'caption' => 'Plausibel max (°C)', 'digits' => 1],
+                        ['type' => 'NumberSpinner', 'name' => 'MaxStaleSeconds', 'caption' => 'Max. Alter (s)'],
+                    ]],
                 ]],
-                ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'ValidationTextBox', 'name' => 'cfgUser', 'caption' => 'Benutzer', 'value' => (string) ($cfg['user'] ?? 'admin')],
-                    ['type' => 'PasswordTextBox', 'name' => 'cfgPass', 'caption' => 'Passwort (leer = unveraendert)', 'value' => ''],
-                ]],
-                ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'NumberSpinner', 'name' => 'cfgTimeout', 'caption' => 'Timeout (s)', 'value' => (int) ($cfg['timeout'] ?? 10)],
-                    ['type' => 'NumberSpinner', 'name' => 'cfgConnTimeout', 'caption' => 'Connect-Timeout (s)', 'value' => (int) ($cfg['connectTimeout'] ?? 5)],
-                    ['type' => 'NumberSpinner', 'name' => 'cfgPoll', 'caption' => 'Poll-Intervall (ms)', 'value' => (int) ($cfg['pollInterval'] ?? self::POLL_MS_DEF), 'minimum' => 5000],
-                ]],
-                ['type' => 'Button', 'caption' => 'Verbindung speichern & testen', 'onClick' =>
-                    'echo HSPC_Manage($id, json_encode(["op"=>"configureConnection","args"=>['
-                    . '"host"=>$cfgHost,"port"=>$cfgPort,"useHttps"=>$cfgHttps,"user"=>$cfgUser,"pass"=>$cfgPass,'
-                    . '"timeout"=>$cfgTimeout,"connectTimeout"=>$cfgConnTimeout,"pollInterval"=>$cfgPoll]]));'],
-            ]],
 
-            ['type' => 'ExpansionPanel', 'caption' => 'Echte Wassertemperatur (TReal) — externer In-Pool-Sensor', 'items' => [
-                ['type' => 'Label', 'caption' => 'Die Inline-Sensoren messen nur bei laufender Pumpe korrekt. Bei stehender Pumpe '
-                    . 'nutzt das Modul den externen In-Pool-Sensor als echte Wassertemperatur (TruePoolTemp). Kein Geraete-Rueckschreiben.'],
-                ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'CheckBox', 'name' => 'cfgTrealEnabled', 'caption' => 'Aktiv', 'value' => (bool) ($cfg['trealEnabled'] ?? false)],
-                    ['type' => 'SelectVariable', 'name' => 'cfgTrealVar', 'caption' => 'In-Pool-Sensor (Variable)', 'value' => (int) ($cfg['trealSourceVarId'] ?? 0)],
+                ['type' => 'ExpansionPanel', 'caption' => 'Spaltenzuordnung & Umwaelz-Berechnung (Standard passt fuer ProCon.IP)', 'items' => [
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'NumberSpinner', 'name' => 'PoolTempCol', 'caption' => 'Pool-Temp Spalte'],
+                        ['type' => 'NumberSpinner', 'name' => 'OutsideCol', 'caption' => 'Aussen'],
+                        ['type' => 'NumberSpinner', 'name' => 'SolarCol', 'caption' => 'Solar'],
+                        ['type' => 'NumberSpinner', 'name' => 'ReturnCol', 'caption' => 'Ruecklauf'],
+                        ['type' => 'NumberSpinner', 'name' => 'PumpTempCol', 'caption' => 'Pumpe'],
+                    ]],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'NumberSpinner', 'name' => 'PhCol', 'caption' => 'pH'],
+                        ['type' => 'NumberSpinner', 'name' => 'RedoxCol', 'caption' => 'Redox'],
+                        ['type' => 'NumberSpinner', 'name' => 'PressureCol', 'caption' => 'Druck'],
+                        ['type' => 'NumberSpinner', 'name' => 'FlowVolCol', 'caption' => 'Durchfluss (Vol.)'],
+                        ['type' => 'NumberSpinner', 'name' => 'FlowRateCol', 'caption' => 'Anstroemung'],
+                    ]],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'NumberSpinner', 'name' => 'PumpRelayIndex', 'caption' => 'Pumpen-Relais Index'],
+                        ['type' => 'NumberSpinner', 'name' => 'FlowThreshold', 'caption' => 'Durchfluss-Schwelle (cm/s)', 'digits' => 2],
+                        ['type' => 'NumberSpinner', 'name' => 'FlowSettleSeconds', 'caption' => 'Settle-Zeit (s)'],
+                    ]],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'NumberSpinner', 'name' => 'PoolSize', 'caption' => 'Poolvolumen (m³, 0=Standardformel)', 'digits' => 1],
+                        ['type' => 'NumberSpinner', 'name' => 'CircFlowRate', 'caption' => 'Umwaelzleistung (m³/h)', 'digits' => 1],
+                    ]],
                 ]],
-                ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'NumberSpinner', 'name' => 'cfgTrealMin', 'caption' => 'Plausibel min (°C)', 'value' => (float) ($cfg['minPlausible'] ?? 0), 'digits' => 1],
-                    ['type' => 'NumberSpinner', 'name' => 'cfgTrealMax', 'caption' => 'Plausibel max (°C)', 'value' => (float) ($cfg['maxPlausible'] ?? 45), 'digits' => 1],
-                    ['type' => 'NumberSpinner', 'name' => 'cfgTrealStale', 'caption' => 'Max. Alter (s)', 'value' => (int) ($cfg['maxStaleSeconds'] ?? 1800)],
-                ]],
-                ['type' => 'Button', 'caption' => 'TReal speichern', 'onClick' =>
-                    'echo HSPC_Manage($id, json_encode(["op"=>"configureTReal","args"=>['
-                    . '"trealEnabled"=>$cfgTrealEnabled,"trealSourceVarId"=>$cfgTrealVar,'
-                    . '"minPlausible"=>$cfgTrealMin,"maxPlausible"=>$cfgTrealMax,"maxStaleSeconds"=>$cfgTrealStale]]));'],
-            ]],
 
-            ['type' => 'ExpansionPanel', 'caption' => 'Spaltenzuordnung & Durchfluss (Standard passt fuer ProCon.IP)', 'items' => [
-                ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'NumberSpinner', 'name' => 'mapPool', 'caption' => 'Pool-Temp Spalte', 'value' => (int) ($cfg['poolTempCol'] ?? 8)],
-                    ['type' => 'NumberSpinner', 'name' => 'mapPh', 'caption' => 'pH Spalte', 'value' => (int) ($cfg['phCol'] ?? 7)],
-                    ['type' => 'NumberSpinner', 'name' => 'mapRedox', 'caption' => 'Redox Spalte', 'value' => (int) ($cfg['redoxCol'] ?? 6)],
-                    ['type' => 'NumberSpinner', 'name' => 'mapFlowRate', 'caption' => 'Anstroemung Spalte', 'value' => (int) ($cfg['flowRateCol'] ?? 24)],
-                ]],
-                ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'NumberSpinner', 'name' => 'mapPumpRelay', 'caption' => 'Pumpen-Relais Index', 'value' => (int) ($cfg['pumpRelayIndex'] ?? 0)],
-                    ['type' => 'NumberSpinner', 'name' => 'mapFlowThr', 'caption' => 'Durchfluss-Schwelle (cm/s)', 'value' => (float) ($cfg['flowThreshold'] ?? 0.5), 'digits' => 2],
-                    ['type' => 'NumberSpinner', 'name' => 'mapSettle', 'caption' => 'Settle-Zeit (s)', 'value' => (int) ($cfg['flowSettleSeconds'] ?? 120)],
-                ]],
-                ['type' => 'Label', 'caption' => '— Umwaelz-Berechnung (mit echter Wassertemperatur) —'],
-                ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'NumberSpinner', 'name' => 'mapPoolSize', 'caption' => 'Poolvolumen (m³, 0=Standardformel)', 'value' => (float) ($cfg['poolSize'] ?? 0), 'digits' => 1],
-                    ['type' => 'NumberSpinner', 'name' => 'mapFlowRate2', 'caption' => 'Umwaelzleistung (m³/h)', 'value' => (float) ($cfg['flowRate'] ?? 0), 'digits' => 1],
-                ]],
-                ['type' => 'Button', 'caption' => 'Zuordnung speichern', 'onClick' =>
-                    'echo HSPC_Manage($id, json_encode(["op"=>"configureMapping","args"=>['
-                    . '"poolTempCol"=>$mapPool,"phCol"=>$mapPh,"redoxCol"=>$mapRedox,"flowRateCol"=>$mapFlowRate,'
-                    . '"pumpRelayIndex"=>$mapPumpRelay,"flowThreshold"=>$mapFlowThr,"flowSettleSeconds"=>$mapSettle,'
-                    . '"poolSize"=>$mapPoolSize,"flowRate"=>$mapFlowRate2]]));'],
-            ]],
+                ['type' => 'CheckBox', 'name' => 'Armed', 'caption' => 'Scharf: reale Schreibzugriffe (Relais/Dosierung) erlauben — sonst nur Schatten-Modus'],
+            ],
 
-            ['type' => 'ExpansionPanel', 'caption' => 'Steuerung & Test (schreibt nur bei "scharf")', 'items' => [
-                ['type' => 'Label', 'caption' => 'Scharfschalten aktiviert reale Schreibzugriffe (Relais/Dosierung). Im Schatten-Modus wird nur protokolliert.'],
+            'actions' => [
+                ['type' => 'Label', 'caption' => 'Status: ' . ($host === '' ? 'nicht konfiguriert' : ('Host ' . $host))
+                    . ' · scharf: ' . ($armed ? 'JA (schaltet real)' : 'nein (Schatten-Modus)')],
                 ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'Button', 'caption' => ($armed ? 'Scharf: AN — jetzt entschaerfen' : 'Scharf schalten'), 'onClick' =>
-                        'echo HSPC_Manage($id, json_encode(["op"=>"setArmed","args"=>["armed"=>' . ($armed ? 'false' : 'true') . ']]));'],
+                    ['type' => 'Button', 'caption' => 'Verbindung testen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"probe"]));'],
+                    ['type' => 'Button', 'caption' => 'Jetzt abfragen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"poll"]));'],
+                    ['type' => 'Button', 'caption' => 'Rohdaten lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"readRaw"]));'],
+                    ['type' => 'Button', 'caption' => 'Geraeteuhr stellen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"setDeviceTime"]));'],
                 ]],
-                ['type' => 'Label', 'caption' => '— Relais Auto/Manuell —'],
+                ['type' => 'Label', 'caption' => '— Relais Auto/Manuell (nur bei "scharf") —'],
                 ['type' => 'RowLayout', 'items' => [
                     ['type' => 'NumberSpinner', 'name' => 'relIdx', 'caption' => 'Relais-Index (0..15)', 'value' => 0, 'minimum' => 0, 'maximum' => 15],
                     ['type' => 'Select', 'name' => 'relMode', 'caption' => 'Modus', 'value' => 0, 'options' => [
-                        ['caption' => 'Auto', 'value' => 0],
-                        ['caption' => 'Manuell Aus', 'value' => 1],
-                        ['caption' => 'Manuell Ein', 'value' => 2],
+                        ['caption' => 'Auto', 'value' => 0], ['caption' => 'Manuell Aus', 'value' => 1], ['caption' => 'Manuell Ein', 'value' => 2],
                     ]],
                     ['type' => 'Button', 'caption' => 'Relais setzen', 'onClick' =>
                         'echo HSPC_Manage($id, json_encode(["op"=>"setRelayMode","args"=>["index"=>$relIdx,"mode"=>$relMode]]));'],
                 ]],
-                ['type' => 'Label', 'caption' => '— Manuelle Dosierung (Sekunden) —'],
+                ['type' => 'Label', 'caption' => '— Manuelle Dosierung / Sollwerte (nur bei "scharf") —'],
                 ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'Select', 'name' => 'dosType', 'caption' => 'Mittel', 'value' => 0, 'options' => [
-                        ['caption' => 'Chlor/Redox', 'value' => 0],
-                        ['caption' => 'pH-minus', 'value' => 1],
-                        ['caption' => 'pH-plus', 'value' => 2],
+                    ['type' => 'Select', 'name' => 'dosType', 'caption' => 'Regler', 'value' => 0, 'options' => [
+                        ['caption' => 'Chlor/Redox', 'value' => 0], ['caption' => 'pH-minus', 'value' => 1], ['caption' => 'pH-plus', 'value' => 2],
                     ]],
-                    ['type' => 'NumberSpinner', 'name' => 'dosSec', 'caption' => 'Dauer (s, 0=Stop)', 'value' => 0, 'minimum' => 0, 'maximum' => 600],
+                    ['type' => 'NumberSpinner', 'name' => 'dosSec', 'caption' => 'Dosierdauer (s, 0=Stop)', 'value' => 0, 'minimum' => 0, 'maximum' => 600],
                     ['type' => 'Button', 'caption' => 'Dosieren', 'onClick' =>
                         'echo HSPC_Manage($id, json_encode(["op"=>"doDosage","args"=>["type"=>$dosType,"seconds"=>$dosSec]]));'],
-                ]],
-                ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'Button', 'caption' => 'Fehlerlog lesen', 'onClick' =>
-                        'echo HSPC_Manage($id, json_encode(["op"=>"readErrors"]));'],
-                    ['type' => 'Button', 'caption' => 'Fehlerlog loeschen', 'onClick' =>
-                        'echo HSPC_Manage($id, json_encode(["op"=>"clearErrors"]));'],
-                ]],
-                ['type' => 'Label', 'caption' => '— Sollwerte (Dosierung) —'],
-                ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'Select', 'name' => 'dcType', 'caption' => 'Regler', 'value' => 1, 'options' => [
-                        ['caption' => 'Chlor/Redox (mV)', 'value' => 0],
-                        ['caption' => 'pH-minus', 'value' => 1],
-                        ['caption' => 'pH-plus', 'value' => 2],
-                    ]],
                     ['type' => 'NumberSpinner', 'name' => 'dcTarget', 'caption' => 'Sollwert', 'value' => 7.2, 'digits' => 2],
                     ['type' => 'NumberSpinner', 'name' => 'dcLow', 'caption' => 'Min', 'value' => 6.6, 'digits' => 2],
                     ['type' => 'NumberSpinner', 'name' => 'dcHigh', 'caption' => 'Max', 'value' => 7.6, 'digits' => 2],
                     ['type' => 'Button', 'caption' => 'Sollwerte setzen', 'onClick' =>
-                        'echo HSPC_Manage($id, json_encode(["op"=>"setDosageConfig","args"=>["type"=>$dcType,'
+                        'echo HSPC_Manage($id, json_encode(["op"=>"setDosageConfig","args"=>["type"=>$dosType,'
                         . '"config"=>["enabled"=>true,"target"=>$dcTarget,"lowerLimit"=>$dcLow,"upperLimit"=>$dcHigh]]]));'],
                 ]],
-                ['type' => 'Label', 'caption' => 'Hinweis: setzt Sollwert/Min/Max des gewaehlten Reglers. Weitere Dosier-Parameter zuvor mit "Dosier-Konfiguration lesen" pruefen.'],
                 ['type' => 'RowLayout', 'items' => [
-                    ['type' => 'Button', 'caption' => 'Geraeteuhr stellen (jetzt)', 'onClick' =>
-                        'echo HSPC_Manage($id, json_encode(["op"=>"setDeviceTime"]));'],
-                    ['type' => 'Button', 'caption' => 'Umwaelzzeit berechnen', 'onClick' =>
-                        'echo HSPC_Manage($id, json_encode(["op"=>"computeCirculation"]));'],
-                    ['type' => 'Button', 'caption' => 'Netzwerk lesen', 'onClick' =>
-                        'echo HSPC_Manage($id, json_encode(["op"=>"getNetwork"]));'],
-                    ['type' => 'Button', 'caption' => 'Sensor-Konfig lesen', 'onClick' =>
-                        'echo HSPC_Manage($id, json_encode(["op"=>"getSensorConfig"]));'],
+                    ['type' => 'Button', 'caption' => 'Fehlerlog lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"readErrors"]));'],
+                    ['type' => 'Button', 'caption' => 'Fehlerlog loeschen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"clearErrors"]));'],
+                    ['type' => 'Button', 'caption' => 'Umwaelzzeit berechnen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"computeCirculation"]));'],
+                    ['type' => 'Button', 'caption' => 'Netzwerk lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getNetwork"]));'],
+                    ['type' => 'Button', 'caption' => 'Sensor-Konfig lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getSensorConfig"]));'],
                 ]],
-            ]],
+            ],
 
-            ['type' => 'Label', 'caption' => 'Status: ' . ($host === '' ? 'nicht konfiguriert' : ('Host ' . $host))
-                . ' · scharf: ' . ($armed ? 'JA' : 'nein (Schatten-Modus)')],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'Button', 'caption' => 'Verbindung testen', 'onClick' =>
-                    'echo HSPC_Manage($id, json_encode(["op"=>"probe"]));'],
-                ['type' => 'Button', 'caption' => 'Jetzt abfragen', 'onClick' =>
-                    'echo HSPC_Manage($id, json_encode(["op"=>"poll"]));'],
-                ['type' => 'Button', 'caption' => 'Konfiguration lesen', 'onClick' =>
-                    'echo HSPC_Manage($id, json_encode(["op"=>"getConfig"]));'],
-                ['type' => 'Button', 'caption' => 'Rohdaten lesen', 'onClick' =>
-                    'echo HSPC_Manage($id, json_encode(["op"=>"readRaw"]));'],
-            ]],
-        ]]);
+            'status' => [],
+        ];
+
+        return json_encode($form, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     }
 }
