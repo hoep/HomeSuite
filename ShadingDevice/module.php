@@ -151,6 +151,24 @@ class ShadingDevice extends EntityModule
                         ['value' => 1, 'label' => 'Winter'],
                     ],
                 ],
+                // Sonnenprofil je Zone als echte, editierbare Baum-Variablen (Quelle der
+                // Wahrheit; evalGeo liest sie, Nordausrichtung dreht sie). Ersetzt das
+                // frueher im FabricStore versteckte geoProfile.
+                [
+                    'ident' => 'SunAzBgn', 'type' => ControlContract::T_LEVEL,
+                    'role' => 'shading:sunAzBgn', 'label' => 'Sonne Azimut von',
+                    'varType' => 1, 'unit' => '°', 'min' => 0, 'max' => 360, 'step' => 5, 'actionable' => true,
+                ],
+                [
+                    'ident' => 'SunAzEnd', 'type' => ControlContract::T_LEVEL,
+                    'role' => 'shading:sunAzEnd', 'label' => 'Sonne Azimut bis',
+                    'varType' => 1, 'unit' => '°', 'min' => 0, 'max' => 360, 'step' => 5, 'actionable' => true,
+                ],
+                [
+                    'ident' => 'SunElev', 'type' => ControlContract::T_LEVEL,
+                    'role' => 'shading:sunElev', 'label' => 'Sonne Elevation-Schwelle',
+                    'varType' => 1, 'unit' => '°', 'min' => -10, 'max' => 90, 'step' => 1, 'actionable' => true,
+                ],
                 [
                     'ident' => 'Online', 'type' => ControlContract::T_REFLECT,
                     'role' => 'shading:online', 'label' => 'Online',
@@ -798,6 +816,8 @@ class ShadingDevice extends EntityModule
         if ($patch !== []) {
             // Flache Felder -> Properties, komplexe (geoProfile/env/tempGate/dayBegin/dayEnd/doorIds) -> Store.
             $this->applyConfigProperties($patch, true); // ApplyChanges re-registriert Watches
+            // Sonnenprofil-Edit -> Baum-Variablen (Wahrheit) nachziehen.
+            if (isset($patch['geoProfile']) && is_array($patch['geoProfile'])) { $this->seedGeoVars($patch['geoProfile']); }
         }
         return ['ok' => true, 'config' => $patch];
     }
@@ -969,19 +989,41 @@ class ShadingDevice extends EntityModule
         return ['ok' => true, 'armed' => $this->armed()];
     }
 
-    /** Dreht das Raum-Sonnenprofil (geoProfile azimuthBgn/End) um deltaDeg (Nordausrichtung, vom Hub gerufen). */
+    /** Sonnenprofil dieser Zone aus den BAUM-VARIABLEN (Quelle der Wahrheit); Fallback Store. */
+    private function geoProfile(): ?array
+    {
+        if (@$this->GetIDForIdent('SunAzBgn')) {
+            $bgn = (int) @$this->GetValue('SunAzBgn');
+            $end = (int) @$this->GetValue('SunAzEnd');
+            $el  = (int) @$this->GetValue('SunElev');
+            if ($bgn !== 0 || $end !== 0 || $el !== 0) {
+                $st = $this->cfgVal('geoProfile', null); $st = is_array($st) ? $st : [];
+                return ['azimuthBgn' => $bgn, 'azimuthEnd' => $end, 'elevation' => $el,
+                        'closePct' => (int) ($st['closePct'] ?? 100), 'brightnessMin' => (int) ($st['brightnessMin'] ?? 0)];
+            }
+        }
+        $st = $this->cfgVal('geoProfile', null);
+        return is_array($st) ? $st : null;
+    }
+
+    /** Setzt das Sonnenprofil in die Baum-Variablen (Seed aus Store bzw. Editor-Write). */
+    private function seedGeoVars(array $gp): void
+    {
+        if (!@$this->GetIDForIdent('SunAzBgn')) { return; }
+        @$this->SetValue('SunAzBgn', (int) ($gp['azimuthBgn'] ?? 0));
+        @$this->SetValue('SunAzEnd', (int) ($gp['azimuthEnd'] ?? 0));
+        @$this->SetValue('SunElev', (int) ($gp['elevation'] ?? 0));
+    }
+
+    /** Dreht das Zonen-Sonnenprofil (Baum-Variablen SunAzBgn/End) um deltaDeg (Nordausrichtung). */
     private function mgmtRotateGeo(array $args): array
     {
         $delta = (float) ($args['deltaDeg'] ?? 0);
-        $gp = $this->cfgVal('geoProfile', null);
-        if (!is_array($gp)) {
-            return ['ok' => true, 'skipped' => 'no geoProfile'];
-        }
+        if (!@$this->GetIDForIdent('SunAzBgn')) { return ['ok' => true, 'skipped' => 'no controls']; }
         $rot = function ($v) use ($delta) { $n = fmod(((float) $v + $delta), 360.0); if ($n < 0) { $n += 360.0; } return (int) round($n); };
-        if (isset($gp['azimuthBgn'])) { $gp['azimuthBgn'] = $rot($gp['azimuthBgn']); }
-        if (isset($gp['azimuthEnd'])) { $gp['azimuthEnd'] = $rot($gp['azimuthEnd']); }
-        $this->store()->patch('config', ['geoProfile' => $gp]);
-        return ['ok' => true, 'geoProfile' => $gp];
+        @$this->SetValue('SunAzBgn', $rot((int) @$this->GetValue('SunAzBgn')));
+        @$this->SetValue('SunAzEnd', $rot((int) @$this->GetValue('SunAzEnd')));
+        return ['ok' => true, 'azimuthBgn' => (int) @$this->GetValue('SunAzBgn'), 'azimuthEnd' => (int) @$this->GetValue('SunAzEnd')];
     }
 
     /**
@@ -1018,7 +1060,7 @@ class ShadingDevice extends EntityModule
             'schedTarget'  => $d['schedTarget'],
             'inputs'       => $d['inp'],
             'sunEvents'    => $this->sunEvents(time()),
-            'geoProfile'   => $this->cfgVal('geoProfile', null),
+            'geoProfile'   => $this->geoProfile(),
         ];
     }
 
@@ -1044,6 +1086,16 @@ class ShadingDevice extends EntityModule
         $this->registerWatches($drv);
         $this->syncReferences();
         $this->updateHealth();
+
+        // Uebergang Store->Baum: Sonnenprofil-Variablen aus dem (bereits korrigierten)
+        // Store einmalig seeden, solange sie leer sind. Danach sind die Variablen die Wahrheit.
+        if (@$this->GetIDForIdent('SunAzBgn')) {
+            $b = (int) @$this->GetValue('SunAzBgn'); $e = (int) @$this->GetValue('SunAzEnd'); $l = (int) @$this->GetValue('SunElev');
+            if ($b === 0 && $e === 0 && $l === 0) {
+                $st = $this->cfgVal('geoProfile', null);
+                if (is_array($st)) { $this->seedGeoVars($st); }
+            }
+        }
     }
 
     /**
@@ -1549,7 +1601,7 @@ class ShadingDevice extends EntityModule
         $inp  = $this->readInputs();
 
         // Sonne: Sonnenstandsvergleich gegen das Raum-Sonnenprofil (evalGeo) + Min-Dwell.
-        $geo = $this->cfgVal('geoProfile', null);
+        $geo = $this->geoProfile(); // Baum-Variablen = Wahrheit
         $rawSun = (is_array($geo) && $inp['el'] !== null)
             ? $this->schedules()->evalGeo((float) ($inp['az'] ?? 0), (float) $inp['el'], (float) ($inp['bright'] ?? 0), $geo)
             : null;
