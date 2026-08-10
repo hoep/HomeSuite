@@ -305,17 +305,24 @@ final class PoolClient
         ]);
     }
 
-    /** Fehler-/Ereignislog lesen (/log/error.log). Rueckgabe: Liste getrimmter Zeilen. */
+    /**
+     * Fehler-/Ereignislog lesen (/log/error.log). Zaehlt NUR echte Fehlereintraege
+     * (Zeilen `E<code>=<ts>,<cause>`), nicht den HTML-Wrapper. "Rescue Control" =>
+     * keine Fehler. (Alt-Bug behoben: es wurden HTML-Zeilen mitgezaehlt.)
+     */
     public function getErrors(): array
     {
         $body = $this->raw('log/error.log');
         if ($body === null) {
-            return ['ok' => false, 'error' => 'unreachable', 'lines' => []];
+            return ['ok' => false, 'error' => 'unreachable', 'lines' => [], 'count' => 0];
+        }
+        if (preg_match('/Rescue Control/i', $body)) {
+            return ['ok' => true, 'lines' => [], 'count' => 0];
         }
         $lines = [];
-        foreach (preg_split('/\r?\n/', trim($body)) ?: [] as $ln) {
-            $ln = trim($ln);
-            if ($ln !== '') {
+        foreach (preg_split('/\r?\n/', $body) ?: [] as $ln) {
+            $ln = trim(strip_tags($ln));
+            if ($ln !== '' && preg_match('/^E\d+\s*=/', $ln)) {
                 $lines[] = $ln;
             }
         }

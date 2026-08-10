@@ -139,6 +139,8 @@ class PoolController extends EntityModule
         // --- Automatik / System / Fehler / Verbindung ---
         $controls[] = $R('AutoCircOptimal', 'Empf. Umwaelzzeit (Min)', 1);
         $controls[] = $R('FilterRuntimeToday', 'Filterzeit heute (Min)', 1);
+        $controls[] = $R('CpuTemp', 'CPU-Temperatur', 2, '~Temperature');
+        $controls[] = $R('OperatingHours', 'Betriebsstunden', 2);
         $controls[] = $R('Firmware', 'Firmware', 3);
         $controls[] = $R('StatusFlag', 'Statusflag', 1);
         $controls[] = $R('ErrorCount', 'Fehleranzahl', 1);
@@ -347,6 +349,7 @@ class PoolController extends EntityModule
         // System
         @$this->SetValue('Firmware', (string) ($st['firmware'] ?? ''));
         @$this->SetValue('StatusFlag', (int) ($st['statusFlag'] ?? 0));
+        @$this->SetValue('CpuTemp', $this->r2(PoolClient::colVal($st, PoolClient::COL_CPUTEMP)));
 
         // Fehlerlog (gedrosselt: hoechstens alle 300 s, SD-Schonung)
         $rt = $this->readRt();
@@ -375,6 +378,17 @@ class PoolController extends EntityModule
 
         // Filterzeit heute = EIN-Dauer des Pumpenrelais seit Mitternacht (aus Archiv).
         @$this->SetValue('FilterRuntimeToday', $this->pumpOnMinutesToday());
+
+        // Betriebsstunden = laufender Zaehler der Pumpen-EIN-Zeit (persistent).
+        $now = time();
+        $rt = $this->readRt();
+        $lastTick = (int) ($rt['opTick'] ?? $now);
+        $rt['opTick'] = $now;
+        $this->writeRt($rt);
+        if ($pumpOn && $now > $lastTick && ($now - $lastTick) < 3600) {
+            $cur = (float) @$this->GetValue('OperatingHours');
+            @$this->SetValue('OperatingHours', round($cur + ($now - $lastTick) / 3600.0, 2));
+        }
 
         // Dosier-Sollwerte (pH/Redox) gedrosselt aus der Konfig lesen (alle 300 s).
         if (time() - (int) ($rt['dosTs'] ?? 0) > 300) {
@@ -787,7 +801,15 @@ class PoolController extends EntityModule
                 return ['ok' => true, 'state' => $cl->getState(), 'dos' => $cl->getDos()];
             case 'readErrors':
                 $cl = $this->client();
-                return $cl === null ? ['ok' => false, 'error' => 'not_configured'] : $cl->getErrors();
+                if ($cl === null) {
+                    return ['ok' => false, 'error' => 'not_configured'];
+                }
+                $e = $cl->getErrors();
+                if (!empty($e['ok'])) {
+                    @$this->SetValue('ErrorCount', (int) ($e['count'] ?? 0));
+                    @$this->SetValue('ErrorText', implode("\n", array_slice($e['lines'] ?? [], -20)));
+                }
+                return $e;
             case 'clearErrors':
                 if (!$this->writeAllowed('clearErrors')) {
                     return ['ok' => true, 'shadow' => true];
