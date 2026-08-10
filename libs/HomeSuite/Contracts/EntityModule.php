@@ -441,6 +441,53 @@ abstract class EntityModule extends \IPSModule
         return @\GetValue($vid) === false ? false : true;
     }
 
+    /** InstanzID des zentralen HomeSuite-Hub (0 wenn keiner). */
+    protected function hubInstanceId(): int
+    {
+        if (!function_exists('IPS_GetInstanceListByModuleID')) {
+            return 0;
+        }
+        $hubs = @\IPS_GetInstanceListByModuleID('{A0C082B4-9E74-430E-BD97-F9CEBB364257}');
+        return (is_array($hubs) && $hubs !== []) ? (int) $hubs[0] : 0;
+    }
+
+    /**
+     * Globale (domaenenweite) Einstellung aus dem zentralen Hub-Config-Formular
+     * (native Hub-Property, extern via IPS_GetProperty lesbar). Liefert $default,
+     * wenn kein Hub existiert oder die Property (noch) fehlt. So teilen sich alle
+     * Instanzen einer Domaene EINE Einstellung, statt sie pro Instanz zu duplizieren.
+     */
+    protected function hubProp(string $name, $default)
+    {
+        $hid = $this->hubInstanceId();
+        if ($hid <= 0 || !function_exists('IPS_GetProperty')) {
+            return $default;
+        }
+        $v = @\IPS_GetProperty($hid, $name);
+        return $v === false ? $default : $v;
+    }
+
+    /** Wie hubProp, aber bool-sicher (unterscheidet echtes false vom fehlenden Property nicht -> nach Hub-Reload korrekt). */
+    protected function hubPropBool(string $name, bool $default): bool
+    {
+        $hid = $this->hubInstanceId();
+        if ($hid <= 0 || !function_exists('IPS_GetProperty')) {
+            return $default;
+        }
+        $v = @\IPS_GetProperty($hid, $name);
+        return is_bool($v) ? $v : $default;
+    }
+
+    /** Globale Objekt-ID mit Instanz-Override: Instanzwert>0 gewinnt, sonst Hub-Global, sonst $default. */
+    protected function globalId(int $instanceVal, string $hubProp, int $default = 0): int
+    {
+        if ($instanceVal > 0) {
+            return $instanceVal;
+        }
+        $g = (int) $this->hubProp($hubProp, 0);
+        return $g > 0 ? $g : $default;
+    }
+
     // ==================================================================
     // Baum-Transparenz: sichtbare Links auf gebundene Quell-Objekte
     // (generisch aus der Store-Konfig; kein modul-spezifischer Code noetig).
@@ -648,15 +695,20 @@ abstract class EntityModule extends \IPSModule
     // Sonnen-verankerte Zeitplan-Grenzen (universell, jede controller-Domaene)
     // ==================================================================
 
-    /** Lat/Lon fuer Sonnenzeiten: config.sunSource='coords' -> lat/lon; sonst Location-Instanz. */
+    /** Lat/Lon fuer Sonnenzeiten: ZENTRALER Standort am Hub (globales Config-Formular); Fallback Hauskoords. */
     protected function sunCoords(): array
     {
-        $cfg = $this->store()->get('config', []);
-        $cfg = is_array($cfg) ? $cfg : [];
-        if (($cfg['sunSource'] ?? 'location') === 'coords') {
-            return [(float) ($cfg['lat'] ?? 48.2082), (float) ($cfg['lon'] ?? 16.3738)];
+        if ((string) $this->hubProp('SunSource', 'location') === 'coords') {
+            $lat = (float) $this->hubProp('Lat', 0.0);
+            $lon = (float) $this->hubProp('Lon', 0.0);
+            if ($lat != 0.0 || $lon != 0.0) {
+                return [$lat, $lon];
+            }
         }
-        $lid = (int) ($cfg['locationId'] ?? 13098);
+        $lid = (int) $this->hubProp('LocationId', 0);
+        if ($lid <= 0) {
+            $lid = 13098; // bekannte Location-Instanz als Fallback
+        }
         if ($lid > 0 && function_exists('IPS_InstanceExists') && @\IPS_InstanceExists($lid)) {
             $c   = json_decode((string) @\IPS_GetConfiguration($lid), true);
             $loc = is_array($c) ? json_decode((string) ($c['Location'] ?? 'null'), true) : null;

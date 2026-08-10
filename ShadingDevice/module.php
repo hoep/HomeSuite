@@ -288,7 +288,23 @@ class ShadingDevice extends EntityModule
             'lon'          => $this->ReadPropertyFloat('Lon'),
             'armed'        => $this->ReadPropertyBoolean('Armed'),
         ];
-        return array_merge($store, $props); // Properties gewinnen fuer flache Keys; komplexe kommen aus dem Store
+        $merged = array_merge($store, $props); // Properties gewinnen fuer flache Keys; komplexe kommen aus dem Store
+
+        // --- Globale (haus-weite) Defaults vom Hub (zentrales Config-Formular). Hub gewinnt,
+        //     wenn gesetzt; sonst Instanz/Store-Fallback. So teilen sich alle Rollos EINEN
+        //     Sensorsatz/Standort/Sturmschwelle statt Duplikat je Instanz. ---
+        $hw = (float) $this->hubProp('ShadeWindStormKmh', 0);
+        if ($hw > 0) { $merged['windStormKmh'] = $hw; }
+        $hs = (int) $this->hubProp('ShadeSafePos', 0);
+        if ($hs > 0) { $merged['safePos'] = $hs; }
+        $merged['rainClose'] = $this->hubPropBool('ShadeRainClose', (bool) ($merged['rainClose'] ?? true));
+        $env = is_array($merged['env'] ?? null) ? $merged['env'] : [];
+        foreach (['sunAzId'=>'ShadeSunAzId','sunElId'=>'ShadeSunElId','windId'=>'ShadeWindId','rainId'=>'ShadeRainId','brightId'=>'ShadeBrightId'] as $k => $hp) {
+            $g = (int) $this->hubProp($hp, 0);
+            if ($g > 0) { $env[$k] = $g; } // Hub-Sensor gewinnt
+        }
+        $merged['env'] = $env;
+        return $merged;
     }
 
     private function armed(): bool

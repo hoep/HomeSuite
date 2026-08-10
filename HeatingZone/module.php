@@ -612,8 +612,9 @@ class HeatingZone extends EntityModule
     /** Gewuenschter Sollwert je Modus (Auto/Boost aus Plan, Frost fix). */
     private function desiredSetpoint(int $mode): ?float
     {
-        if ($mode === 3) {                            // Frostschutz
-            return (float) $this->ReadPropertyFloat('FrostTemp');
+        if ($mode === 3) {                            // Frostschutz (haus-weit vom Hub, sonst Instanz)
+            $hf = (float) $this->hubProp('HeatFrostTemp', 0);
+            return $hf > 0 ? $hf : (float) $this->ReadPropertyFloat('FrostTemp');
         }
         // Auto (0) und Boost (2, vorerst wie Auto) -> aus dem Wochenplan.
         $variant = $this->activeVariant();

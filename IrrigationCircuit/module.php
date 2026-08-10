@@ -977,7 +977,11 @@ class IrrigationCircuit extends EntityModule
         foreach (self::PROP_MAP as $key => [$p, $t]) {
             $props[$key] = $this->castProp($t, @$this->{'ReadProperty' . ($t==='i'?'Integer':($t==='f'?'Float':($t==='b'?'Boolean':'String')))}($p));
         }
-        return array_merge($store, $props);
+        $merged = array_merge($store, $props);
+        // Globaler Regensensor vom Hub (grundstuecksweit), Hub gewinnt wenn gesetzt.
+        $g = (int) $this->hubProp('IrrRainSensorId', 0);
+        if ($g > 0) { $merged['sensorId'] = $g; }
+        return $merged;
     }
 
     private function armed(): bool

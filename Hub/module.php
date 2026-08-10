@@ -101,6 +101,28 @@ class HomeSuiteHub extends EntityModule
 
         // Async-Provision-Warteschlange (persistente Job-Liste, resumable).
         $this->RegisterAttributeString(self::ATTR_QUEUE, '[]');
+
+        // --- Globale, domaenenweite Einstellungen (zentrales Config-Formular) ---
+        // Alle Instanzen einer Domaene teilen sich diese Werte (statt Duplikat je
+        // Instanz). Childs lesen sie via EntityModule::hubProp() mit Instanz-Override.
+        // Standort/Sonne (alle Domaenen)
+        $this->RegisterPropertyString('SunSource', 'location');
+        $this->RegisterPropertyInteger('LocationId', 0);
+        $this->RegisterPropertyFloat('Lat', 0.0);
+        $this->RegisterPropertyFloat('Lon', 0.0);
+        // Beschattung — Sensoren + Sicherheit
+        $this->RegisterPropertyInteger('ShadeWindId', 0);
+        $this->RegisterPropertyInteger('ShadeRainId', 0);
+        $this->RegisterPropertyInteger('ShadeBrightId', 0);
+        $this->RegisterPropertyInteger('ShadeSunAzId', 0);
+        $this->RegisterPropertyInteger('ShadeSunElId', 0);
+        $this->RegisterPropertyFloat('ShadeWindStormKmh', 50.0);
+        $this->RegisterPropertyBoolean('ShadeRainClose', true);
+        $this->RegisterPropertyInteger('ShadeSafePos', 0);
+        // Heizung — Frostschutz (haus-weit)
+        $this->RegisterPropertyFloat('HeatFrostTemp', 8.0);
+        // Bewaesserung — Regensensor (grundstuecksweit)
+        $this->RegisterPropertyInteger('IrrRainSensorId', 0);
     }
 
     /**
@@ -209,6 +231,43 @@ class HomeSuiteHub extends EntityModule
         $items[] = ['type' => 'Button', 'caption' => 'Spotify-Login-Link erzeugen',
             'onClick' => 'echo HSH_Manage($id, json_encode(["op"=>"spotifyAuthUrl"]));'];
         $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Medienquellen (Audio-Provider)', 'items' => $items];
+
+        // --- Globale, domaenenweite Einstellungen (property-gebunden; Childs lesen via hubProp) ---
+        $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Standort & Sonne (alle Domänen)', 'items' => [
+            ['type' => 'Label', 'caption' => 'Ein Standort fürs ganze Haus (Sonnenzeiten/Sonnenautomatik aller Domänen).'],
+            ['type' => 'Select', 'name' => 'SunSource', 'caption' => 'Quelle', 'options' => [
+                ['caption' => 'Location-Instanz', 'value' => 'location'],
+                ['caption' => 'Eigene Koordinaten', 'value' => 'coords'],
+            ]],
+            ['type' => 'SelectInstance', 'name' => 'LocationId', 'caption' => 'Location-Instanz'],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'NumberSpinner', 'name' => 'Lat', 'caption' => 'Breite (Lat)', 'digits' => 5],
+                ['type' => 'NumberSpinner', 'name' => 'Lon', 'caption' => 'Länge (Lon)', 'digits' => 5],
+            ]],
+        ]];
+        $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Beschattung — Wetter/Sonne/Sicherheit (global)', 'items' => [
+            ['type' => 'Label', 'caption' => 'Gilt für alle Rollos. Einzelne Rollos können per Instanz-Property abweichen (Instanzwert > 0 gewinnt).'],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'SelectVariable', 'name' => 'ShadeWindId', 'caption' => 'Wind (km/h)'],
+                ['type' => 'SelectVariable', 'name' => 'ShadeRainId', 'caption' => 'Regen'],
+                ['type' => 'SelectVariable', 'name' => 'ShadeBrightId', 'caption' => 'Helligkeit'],
+            ]],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'SelectVariable', 'name' => 'ShadeSunAzId', 'caption' => 'Sonne Azimut'],
+                ['type' => 'SelectVariable', 'name' => 'ShadeSunElId', 'caption' => 'Sonne Elevation'],
+            ]],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'NumberSpinner', 'name' => 'ShadeWindStormKmh', 'caption' => 'Sturm-Schwelle (km/h)', 'digits' => 0],
+                ['type' => 'NumberSpinner', 'name' => 'ShadeSafePos', 'caption' => 'Sichere Position (%)', 'minimum' => 0, 'maximum' => 100],
+                ['type' => 'CheckBox', 'name' => 'ShadeRainClose', 'caption' => 'Bei Regen schließen'],
+            ]],
+        ]];
+        $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Heizung — Frostschutz (global)', 'items' => [
+            ['type' => 'NumberSpinner', 'name' => 'HeatFrostTemp', 'caption' => 'Frostschutz-Solltemperatur (°C)', 'digits' => 1, 'minimum' => 3, 'maximum' => 15],
+        ]];
+        $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Bewässerung — Klima (global)', 'items' => [
+            ['type' => 'SelectVariable', 'name' => 'IrrRainSensorId', 'caption' => 'Regensensor (mm)'],
+        ]];
 
         $json = json_encode($form, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         return $json === false ? '{"elements":[]}' : $json;
