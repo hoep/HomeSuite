@@ -126,6 +126,7 @@ class IrrigationCircuit extends EntityModule
                 ['op' => 'runNow',         'label' => 'Jetzt bewaessern'],
                 ['op' => 'stopNow',        'label' => 'Stoppen'],
                 ['op' => 'setArmed',       'label' => 'Scharfschalten / Schatten-Modus'],
+                ['op' => 'migrateConfig',  'label' => 'Config auf Properties migrieren (einmalig)'],
                 ['op' => 'configureAutomation', 'label' => 'Regeln (Regen/Temperatur/Evaporation)'],
                 ['op' => 'computeProbe',   'label' => 'Dauer/Gate-Berechnung (Trockenlauf)'],
                 ['op' => 'updateProfile',  'label' => 'Wochenplan bearbeiten'],
@@ -542,9 +543,11 @@ class IrrigationCircuit extends EntityModule
             case 'computeProbe':
                 return $this->mgmtComputeProbe();
             case 'setArmed':
-                $this->store()->patch('config', ['armed' => (bool) ($args['armed'] ?? false)]);
-                $this->updateHealth();
-                return ['ok' => true, 'armed' => (bool) $this->cfgVal('armed', false)];
+                @\IPS_SetProperty($this->InstanceID, 'Armed', (bool) ($args['armed'] ?? false));
+                @\IPS_ApplyChanges($this->InstanceID);
+                return ['ok' => true, 'armed' => $this->armed()];
+            case 'migrateConfig':
+                return $this->migrateConfig();
             case 'updateProfile':
                 return $this->mgmtUpdateProfile($args, $ctx);
             case 'getSchedule':
@@ -608,12 +611,8 @@ class IrrigationCircuit extends EntityModule
         if (!empty($ctx['dryrun'])) {
             return ['ok' => true, 'dryrun' => true, 'config' => $config];
         }
-        $this->store()->patch('config', $config);
-        $this->driverResolved = false;
-        $this->driverInstance = null;
-        $this->syncReferences();
-        $this->updateHealth();
-        return ['ok' => true, 'config' => $config, 'driverActive' => $this->driver() instanceof IValve];
+        $this->applyConfigProperties($config, true); // Properties + ApplyChanges (Treiber/Links/Refs neu)
+        return ['ok' => true, 'config' => $this->cfg(), 'driverActive' => $this->driver() instanceof IValve];
     }
 
     /**
@@ -639,11 +638,7 @@ class IrrigationCircuit extends EntityModule
             'sensorId' => (int) ($args['sensorId'] ?? 0),
             'maxRuntimeMin' => self::DEF_MAXRUNTIME, 'armed' => false,
         ];
-        $this->store()->patch('config', $config);
-        $this->driverResolved = false;
-        $this->driverInstance = null;
-        $this->syncReferences();
-        $this->updateHealth();
+        $this->applyConfigProperties($config, true);
         return ['ok' => true, 'linkTapId' => $lt, 'startVarId' => $start, 'stopVarId' => $stop,
             'feedbackVarId' => $fb, 'driverActive' => $this->driver() instanceof IValve];
     }
@@ -935,10 +930,124 @@ class IrrigationCircuit extends EntityModule
     // Helfer
     // ==================================================================
 
+    // ==================================================================
+    // Native Instanz-Properties (Symcon-Konzept). Flache Bindungsfelder sind
+    // Properties; komplexe Strukturen (temp/rain/evap) + Zeitplan (ScheduleEngine)
+    // + Laufzeit (readRt/writeRt) bleiben im Store.
+    // ==================================================================
+    public function Create()
+    {
+        parent::Create();
+        $this->RegisterPropertyString('Driver', '');
+        $this->RegisterPropertyString('Mode', 'switch');
+        $this->RegisterPropertyInteger('SwitchVarId', 0);
+        $this->RegisterPropertyInteger('StartVarId', 0);
+        $this->RegisterPropertyInteger('StopVarId', 0);
+        $this->RegisterPropertyInteger('OnScriptId', 0);
+        $this->RegisterPropertyInteger('OffScriptId', 0);
+        $this->RegisterPropertyInteger('DurationVarId', 0);
+        $this->RegisterPropertyInteger('FeedbackVarId', 0);
+        $this->RegisterPropertyInteger('FlowVarId', 0);
+        $this->RegisterPropertyInteger('SensorId', 0);
+        $this->RegisterPropertyInteger('MaxRuntimeMin', self::DEF_MAXRUNTIME);
+        $this->RegisterPropertyBoolean('Invert', false);
+        $this->RegisterPropertyBoolean('Armed', false);   // Schatten-Modus bis Cutover
+        $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
+    }
+
+    private const PROP_MAP = [
+        'driver'=>['Driver','s'], 'mode'=>['Mode','s'], 'switchVarId'=>['SwitchVarId','i'],
+        'startVarId'=>['StartVarId','i'], 'stopVarId'=>['StopVarId','i'], 'onScriptId'=>['OnScriptId','i'],
+        'offScriptId'=>['OffScriptId','i'], 'durationVarId'=>['DurationVarId','i'], 'feedbackVarId'=>['FeedbackVarId','i'],
+        'flowVarId'=>['FlowVarId','i'], 'sensorId'=>['SensorId','i'], 'maxRuntimeMin'=>['MaxRuntimeMin','i'],
+        'invert'=>['Invert','b'], 'armed'=>['Armed','b'],
+    ];
+
+    private function castProp(string $type, $v)
+    {
+        switch ($type) { case 'i': return (int)$v; case 'f': return (float)$v; case 'b': return (bool)$v; default: return (string)$v; }
+    }
+
+    /** Flache Config-Felder aus Properties, komplexe (temp/rain/evap/seeded) aus dem Store. */
     private function cfg(): array
     {
+        $store = $this->store()->get('config', []);
+        $store = is_array($store) ? $store : [];
+        $props = [];
+        foreach (self::PROP_MAP as $key => [$p, $t]) {
+            $props[$key] = $this->castProp($t, @$this->{'ReadProperty' . ($t==='i'?'Integer':($t==='f'?'Float':($t==='b'?'Boolean':'String')))}($p));
+        }
+        return array_merge($store, $props);
+    }
+
+    private function armed(): bool
+    {
+        return $this->ReadPropertyBoolean('Armed');
+    }
+
+    /** Flache Keys -> Properties, komplexe -> Store; $apply triggert ApplyChanges. */
+    private function applyConfigProperties(array $c, bool $apply = true): void
+    {
+        $storePatch = [];
+        foreach ($c as $k => $v) {
+            if (isset(self::PROP_MAP[$k])) {
+                [$p, $t] = self::PROP_MAP[$k];
+                @\IPS_SetProperty($this->InstanceID, $p, $this->castProp($t, $v));
+            } else {
+                $storePatch[$k] = $v; // temp/rain/evap/seeded …
+            }
+        }
+        if ($storePatch !== []) {
+            $this->store()->patch('config', $storePatch);
+        }
+        if ($apply) {
+            @\IPS_ApplyChanges($this->InstanceID);
+        }
+    }
+
+    /** Einmal-Migration: flache FabricStore-config -> native Properties (per RPC-Op). */
+    private function migrateConfig(): array
+    {
+        if ($this->ReadPropertyInteger('ConfigSchema') >= 1) {
+            return ['ok' => true, 'already' => true, 'config' => $this->cfg()];
+        }
         $c = $this->store()->get('config', []);
-        return is_array($c) ? $c : [];
+        $c = is_array($c) ? $c : [];
+        $flat = [];
+        foreach ($c as $k => $v) {
+            if (isset(self::PROP_MAP[$k])) {
+                [$p, $t] = self::PROP_MAP[$k];
+                @\IPS_SetProperty($this->InstanceID, $p, $this->castProp($t, $v));
+                $flat[] = $k;
+            }
+        }
+        @\IPS_SetProperty($this->InstanceID, 'ConfigSchema', 1);
+        @\IPS_ApplyChanges($this->InstanceID);
+        return ['ok' => true, 'migrated' => $flat, 'config' => $this->cfg()];
+    }
+
+    /** Bindungs-Links (Baum-Transparenz) je Modus + gemeinsame Sensoren. */
+    protected function bindingTargets(): array
+    {
+        $cfg = $this->cfg();
+        $out = [];
+        $add = function (string $ident, string $name, int $id) use (&$out): void {
+            if ($id > 0 && function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($id)) {
+                $out[] = ['ident' => $ident, 'name' => $name, 'targetId' => $id];
+            }
+        };
+        $mode = (string) $cfg['mode'];
+        if ($mode === 'duration') { $add('bl_startVarId', 'Start (Sek.)', (int) $cfg['startVarId']); $add('bl_stopVarId', 'Stop', (int) $cfg['stopVarId']); }
+        elseif ($mode === 'switch') { $add('bl_switchVarId', 'Schalter', (int) $cfg['switchVarId']); }
+        elseif ($mode === 'script') { $add('bl_onScriptId', 'Start-Skript', (int) $cfg['onScriptId']); $add('bl_offScriptId', 'Stop-Skript', (int) $cfg['offScriptId']); $add('bl_durationVarId', 'Dauer', (int) $cfg['durationVarId']); }
+        $add('bl_feedbackVarId', 'Ist-Zustand', (int) $cfg['feedbackVarId']);
+        $add('bl_flowVarId', 'Durchfluss', (int) $cfg['flowVarId']);
+        $add('bl_sensorId', 'Regensensor', (int) $cfg['sensorId']);
+        $temp = is_array($cfg['temp'] ?? null) ? $cfg['temp'] : [];
+        $add('bl_tempVarId', 'Temperatur', (int) ($temp['tempVarId'] ?? 0));
+        $evap = is_array($cfg['evap'] ?? null) ? $cfg['evap'] : [];
+        $add('bl_et0VarId', 'Verdunstung (ET0)', (int) ($evap['et0VarId'] ?? 0));
+        return $out;
     }
 
     /**
