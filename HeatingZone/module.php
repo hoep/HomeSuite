@@ -159,6 +159,8 @@ class HeatingZone extends EntityModule
                 ['op' => 'loadFromDevice',    'label' => 'Vom Geraet laden'],
                 ['op' => 'syncToDevice',      'label' => 'Ans Geraet schreiben'],
                 ['op' => 'getConfig',         'label' => 'Konfiguration lesen (Diagnose)'],
+                ['op' => 'setArmed',          'label' => 'Scharfschalten / Schatten-Modus'],
+                ['op' => 'migrateConfig',     'label' => 'Config auf Properties migrieren (einmalig)'],
             ],
 
             // ---- Konfig-Felder (Treiberwahl; im LVB gesetzt) ----
@@ -186,8 +188,24 @@ class HeatingZone extends EntityModule
     /** Konfigurierte driverId aus dem Store (ohne den Treiber zu bauen). */
     private function configuredDriverId(): string
     {
-        $cfg = $this->store()->get('config', []);
-        return is_array($cfg) ? (string) ($cfg['driver'] ?? '') : '';
+        return (string) $this->cfg()['driver'];
+    }
+
+    /** Konfiguration aus nativen Instanz-Properties (Symcon-Konzept). schedule.* bleibt im Store. */
+    private function cfg(): array
+    {
+        return [
+            'driver'    => $this->ReadPropertyString('Driver'),
+            'targetId'  => $this->ReadPropertyInteger('TargetId'),
+            'sensorId'  => $this->ReadPropertyInteger('SensorId'),
+            'frostTemp' => $this->ReadPropertyFloat('FrostTemp'),
+            'armed'     => $this->ReadPropertyBoolean('Armed'),
+        ];
+    }
+
+    private function armed(): bool
+    {
+        return $this->ReadPropertyBoolean('Armed');
     }
 
     /**
@@ -219,6 +237,12 @@ class HeatingZone extends EntityModule
      */
     protected function applyControl(Control $c, $value, ActionContext $ctx): void
     {
+        // Schatten-Modus: optimistischer SetValue der Basis bleibt, aber real wird
+        // NICHTS geschrieben, bis armed=true (Cutover, Kollision mit Altsteuerung vermeiden).
+        if (!$this->armed()) {
+            $this->SendDebug('HSHT.shadow', $c->ident . '=' . $this->scalar($value) . ' (Schatten-Modus)', 0);
+            return;
+        }
         $drv = $this->driver();
         if (!$drv instanceof IThermostat) {
             $this->SendDebug(
@@ -280,8 +304,7 @@ class HeatingZone extends EntityModule
         $this->driverResolved = true;
         $this->driverInstance = null;
 
-        $cfg      = $this->store()->get('config', []);
-        $cfg      = is_array($cfg) ? $cfg : [];
+        $cfg      = $this->cfg();
         $driverId = (string) ($cfg['driver'] ?? '');
         $targetId = (int) ($cfg['targetId'] ?? 0);
 
@@ -341,6 +364,11 @@ class HeatingZone extends EntityModule
         if (($live['humidity'] ?? null) !== null) {
             $this->setReflect('Humidity', (int) $live['humidity']);
         }
+        // Ist-Sollwert des Geraets spiegeln (read-only, auch im Schatten-Modus), damit die
+        // Anzeige den tatsaechlichen Sollwert zeigt statt 0. Kein Aktorschreiben.
+        if (($live['setpoint'] ?? null) !== null) {
+            @$this->SetValue('Setpoint', (float) $live['setpoint']);
+        }
         // Online-Heuristik: Sollwert lesbar => zugeordnete Geraetevariable da.
         $this->setReflect('Online', ($live['setpoint'] ?? null) !== null);
     }
@@ -369,6 +397,82 @@ class HeatingZone extends EntityModule
     // Lebenszyklus: Refresh-Timer scharf/aus je nach Treiber
     // ==================================================================
 
+
+    // Native Instanz-Properties (Symcon-Konzept). Wochenprofile (schedule.*) bleiben im Store.
+    public function Create()
+    {
+        parent::Create();
+        $this->RegisterPropertyString('Driver', '');
+        $this->RegisterPropertyInteger('TargetId', 0);
+        $this->RegisterPropertyInteger('SensorId', 0);
+        $this->RegisterPropertyFloat('FrostTemp', self::FROST_DEFAULT);
+        $this->RegisterPropertyBoolean('Armed', false);    // Schatten-Modus bis Cutover
+        $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
+    }
+
+    /** Bindungs-Links (Baum-Transparenz) auf Sollwert/Ist bzw. HM-Gerät — aus Properties. */
+    protected function bindingTargets(): array
+    {
+        $cfg = $this->cfg();
+        $out = [];
+        $add = function (string $ident, string $name, int $id) use (&$out): void {
+            if ($id > 0 && function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($id)) {
+                $out[] = ['ident' => $ident, 'name' => $name, 'targetId' => $id];
+            }
+        };
+        $driver = (string) $cfg['driver'];
+        $target = (int) $cfg['targetId'];
+        $sensor = (int) $cfg['sensorId'];
+        if (strncmp($driver, 'hm-', 3) === 0) {
+            $add('bl_Device', 'HM-Gerät', $target);
+            $add('bl_Setpoint', 'Sollwert', $this->resolveHmSetpoint($target));
+            $add('bl_Sensor', 'Ist-Sensor', $sensor);
+        } else {
+            $add('bl_Setpoint', 'Sollwert', $target);
+            $add('bl_Actual', 'Ist-Temperatur', $sensor);
+        }
+        return $out;
+    }
+
+    /** SET_TEMPERATURE/SETPOINT-Variable einer HM-Instanz (0 wenn nicht auflösbar). */
+    private function resolveHmSetpoint(int $instanceId): int
+    {
+        if ($instanceId <= 0 || !function_exists('IPS_GetObjectIDByIdent')) {
+            return 0;
+        }
+        $sp = @\IPS_GetObjectIDByIdent('SET_TEMPERATURE', $instanceId);
+        if (!is_int($sp) || $sp <= 0) {
+            $sp = @\IPS_GetObjectIDByIdent('SETPOINT', $instanceId);
+        }
+        return (is_int($sp) && $sp > 0) ? $sp : 0;
+    }
+
+    /** Schreibt Config-Felder in die nativen Properties (Teilmenge erlaubt). */
+    private function applyConfigProperties(array $c, bool $apply = true): void
+    {
+        $S = fn(string $p, $v) => @\IPS_SetProperty($this->InstanceID, $p, $v);
+        if (array_key_exists('driver', $c))    $S('Driver', (string) $c['driver']);
+        if (array_key_exists('targetId', $c))  $S('TargetId', (int) $c['targetId']);
+        if (array_key_exists('sensorId', $c))  $S('SensorId', (int) $c['sensorId']);
+        if (array_key_exists('frostTemp', $c)) $S('FrostTemp', (float) $c['frostTemp']);
+        if ($apply) {
+            @\IPS_ApplyChanges($this->InstanceID);
+        }
+    }
+
+    /** Einmal-Migration: alte FabricStore-config -> native Properties (per RPC-Op). */
+    private function migrateConfig(): array
+    {
+        if ($this->ReadPropertyInteger('ConfigSchema') >= 1) {
+            return ['ok' => true, 'already' => true, 'config' => $this->cfg()];
+        }
+        $c = $this->store()->get('config', []);
+        $c = is_array($c) ? $c : [];
+        $this->applyConfigProperties($c, false);
+        @\IPS_SetProperty($this->InstanceID, 'ConfigSchema', 1);
+        @\IPS_ApplyChanges($this->InstanceID);
+        return ['ok' => true, 'migrated' => array_keys($c), 'config' => $this->cfg()];
+    }
 
     protected function setupTimers(): void
     {
@@ -401,35 +505,32 @@ class HeatingZone extends EntityModule
      */
     public function GetConfigurationForm()
     {
-        $cfg = $this->store()->get('config', []);
-        $cfg = is_array($cfg) ? $cfg : [];
-        return json_encode(['elements' => [
-            ['type' => 'Label', 'caption' => 'Heizung — Bindung an das Thermostat. Ziel: generic = Sollwert-Variable, '
-                . 'hm-* = HomeMatic-CCU-Instanz. Zeitplaene/Praesenz kommen aus dem LiveViewBuilder.'],
-            ['type' => 'Select', 'name' => 'cfgDriver', 'caption' => 'Treiber',
-                'value' => (string) ($cfg['driver'] ?? ''), 'options' => [
+        // Native Symcon-Konfiguration: Felder property-gebunden (name == Property),
+        // gespeichert bei „Aenderungen uebernehmen". Buttons = Laufzeit-Aktionen (RPC).
+        return json_encode([
+            'elements' => [
+                ['type' => 'Label', 'caption' => 'Heizung — Bindung an das Thermostat. Ziel: generic = Sollwert-Variable, hm-* = HomeMatic-CCU-Instanz. Zeitplaene/Praesenz kommen aus dem LiveViewBuilder.'],
+                ['type' => 'Select', 'name' => 'Driver', 'caption' => 'Treiber', 'options' => [
                     ['caption' => '(keiner)', 'value' => ''],
                     ['caption' => 'Generisches Thermostat (Sollwert-Variable)', 'value' => 'generic-thermostat'],
                     ['caption' => 'HomeMatic HM-TC-IT-WM-W-EU (Wandthermostat)', 'value' => 'hm-HM-TC-IT-WM-W-EU'],
                     ['caption' => 'HomeMatic HM-CC-RT-DN (Heizkoerper)', 'value' => 'hm-HM-CC-RT-DN'],
                     ['caption' => 'HomeMatic HM-CC-TC', 'value' => 'hm-HM-CC-TC'],
                 ]],
-            ['type' => 'SelectObject', 'name' => 'cfgTargetId', 'caption' => 'Ziel (Variable bei generic, CCU-Instanz bei hm-*)',
-                'value' => (int) ($cfg['targetId'] ?? 0)],
-            ['type' => 'SelectObject', 'name' => 'cfgSensorId', 'caption' => 'Ist-Sensor (optional: Variable bzw. CCU-Instanz)',
-                'value' => (int) ($cfg['sensorId'] ?? 0)],
-            ['type' => 'Button', 'caption' => 'Bindung uebernehmen', 'onClick' =>
-                'echo HSHT_Manage($id, json_encode(["op"=>"configureDriver","args"=>['
-                . '"driver"=>$cfgDriver,"targetId"=>$cfgTargetId,"sensorId"=>$cfgSensorId]]));'],
-            ['type' => 'Label', 'caption' => 'Automatik — Frostschutz-Solltemperatur (Modus „Frost"). Bereich 3..15 °C.'],
-            ['type' => 'NumberSpinner', 'name' => 'cfgFrostTemp', 'caption' => 'Frostschutz-Solltemperatur (°C)',
-                'digits' => 1, 'minimum' => 3, 'maximum' => 15,
-                'value' => (float) ($cfg['frostTemp'] ?? self::FROST_DEFAULT)],
-            ['type' => 'Button', 'caption' => 'Frostschutz speichern', 'onClick' =>
-                'echo HSHT_Manage($id, json_encode(["op"=>"configureAutomation","args"=>['
-                . '"frostTemp"=>$cfgFrostTemp]]));'],
-            ['type' => 'Label', 'caption' => 'Verwaltung/Zeitplaene laufen im LiveViewBuilder; hier nur die Geraete-Bindung.'],
-        ]]);
+                ['type' => 'SelectObject', 'name' => 'TargetId', 'caption' => 'Ziel (Variable bei generic, CCU-Instanz bei hm-*)'],
+                ['type' => 'SelectObject', 'name' => 'SensorId', 'caption' => 'Ist-Sensor (optional: Variable bzw. CCU-Instanz)'],
+                ['type' => 'NumberSpinner', 'name' => 'FrostTemp', 'caption' => 'Frostschutz-Solltemperatur (°C)', 'digits' => 1, 'minimum' => 3, 'maximum' => 15],
+                ['type' => 'CheckBox', 'name' => 'Armed', 'caption' => 'Scharf — schaltet real (sonst Schatten-Modus; Altsteuerung bleibt Regler)'],
+            ],
+            'actions' => [
+                ['type' => 'RowLayout', 'items' => [
+                    ['type' => 'Button', 'caption' => 'Ist-Zustand', 'onClick' => 'echo HSHT_Manage($id, json_encode(["op"=>"getConfig"]));'],
+                    ['type' => 'Button', 'caption' => 'Wochenplan lesen', 'onClick' => 'echo HSHT_Manage($id, json_encode(["op"=>"getSchedule"]));'],
+                    ['type' => 'Button', 'caption' => 'Aus Altsteuerung importieren', 'onClick' => 'echo HSHT_Manage($id, json_encode(["op"=>"importLegacy","args"=>["dryrun"=>true]]));'],
+                ]],
+                ['type' => 'Label', 'caption' => 'Real geschaltet wird nur bei „scharf" (Armed). Zeitplan-/Praesenz-Verwaltung im LiveViewBuilder.'],
+            ],
+        ]);
     }
 
     /**
@@ -457,6 +558,9 @@ class HeatingZone extends EntityModule
      */
     private function reconcile(IThermostat $drv): void
     {
+        if (!$this->armed()) {
+            return; // Schatten-Modus: kein reales Schreiben (Altsteuerung bleibt Regler)
+        }
         if (!$this->automationEnabled()) {
             return; // globaler Automatik-Schalter (Hub) aus
         }
@@ -509,8 +613,7 @@ class HeatingZone extends EntityModule
     private function desiredSetpoint(int $mode): ?float
     {
         if ($mode === 3) {                            // Frostschutz
-            $v = $this->store()->get('config.frostTemp', self::FROST_DEFAULT);
-            return is_numeric($v) ? (float) $v : self::FROST_DEFAULT;
+            return (float) $this->ReadPropertyFloat('FrostTemp');
         }
         // Auto (0) und Boost (2, vorerst wie Auto) -> aus dem Wochenplan.
         $variant = $this->activeVariant();
@@ -650,10 +753,9 @@ class HeatingZone extends EntityModule
     {
         // Generisch: config.targetId ist bei generic die Sollwert-Variable,
         // bei hm-* die Instanz -> dort die SET_TEMPERATURE-Variable aufloesen.
-        $cfg    = $this->store()->get('config', []);
-        $cfg    = is_array($cfg) ? $cfg : [];
-        $target = (int) ($cfg['targetId'] ?? 0);
-        $driver = (string) ($cfg['driver'] ?? '');
+        $cfg    = $this->cfg();
+        $target = (int) $cfg['targetId'];
+        $driver = (string) $cfg['driver'];
         if ($target <= 0) {
             return 0;
         }
@@ -689,8 +791,13 @@ class HeatingZone extends EntityModule
             case 'adoptDevice':          // Alias der generischen Basis-Op
                 return $this->opLoadFromDevice();
             case 'getConfig':
-                $cfg = $this->store()->get('config', []);
-                return ['ok' => true, 'config' => is_array($cfg) ? $cfg : []];
+                return ['ok' => true, 'config' => $this->cfg()];
+            case 'migrateConfig':
+                return $this->migrateConfig();
+            case 'setArmed':
+                @\IPS_SetProperty($this->InstanceID, 'Armed', (bool) ($args['armed'] ?? false));
+                @\IPS_ApplyChanges($this->InstanceID);
+                return ['ok' => true, 'armed' => $this->armed()];
             default:
                 // syncStatus/loadFromDevice/syncToDevice u.a. behandelt die Basis generisch.
                 return parent::mgmt($op, $args, $ctx);
@@ -958,18 +1065,10 @@ class HeatingZone extends EntityModule
             return ['ok' => true, 'dryrun' => true, 'config' => $config, 'scheduleMode' => $this->scheduleModeOf($driver)];
         }
 
-        $this->store()->patch('config', $config);
-
-        // Treiber + Timer neu scharf ziehen und einmal sofort reflektieren.
-        $this->driverResolved = false;
-        $this->driverInstance = null;
+        // Native Properties schreiben (ApplyChanges zieht Treiber/Links/Timer neu).
+        $this->applyConfigProperties($config, true);
         $active = $this->driver() instanceof IThermostat;
-        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
-        if ($active) {
-            $this->Refresh();
-        }
-
-        return ['ok' => true, 'config' => $config, 'scheduleMode' => $this->scheduleModeOf($driver), 'driverActive' => $active];
+        return ['ok' => true, 'config' => $this->cfg(), 'scheduleMode' => $this->scheduleModeOf($driver), 'driverActive' => $active];
     }
 
     /**
@@ -992,7 +1091,8 @@ class HeatingZone extends EntityModule
             return ['ok' => true, 'dryrun' => true, 'frostTemp' => $frost];
         }
 
-        $this->store()->set('config.frostTemp', $frost);
+        @\IPS_SetProperty($this->InstanceID, 'FrostTemp', $frost);
+        @\IPS_ApplyChanges($this->InstanceID);
 
         // Wenn gerade Frost-Modus aktiv ist, sofort neu nachfahren.
         $drv = $this->driver();
