@@ -171,6 +171,8 @@ class PoolController extends EntityModule
                 ['op' => 'getSensorConfig',     'label' => 'Sensor-Konfig lesen (ADC/BNC/1-Wire/IO)'],
                 ['op' => 'getRomCodes',         'label' => '1-Wire ROM-Codes lesen'],
                 ['op' => 'computeCirculation',  'label' => 'Umwaelzzeit berechnen (TruePoolTemp)'],
+                ['op' => 'scheduleStatus',      'label' => 'Wochenplan-Status'],
+                ['op' => 'sendSchedule',        'label' => 'Wochenplan an Controller senden (schreibt)'],
                 // Konfiguration schreiben (gated)
                 ['op' => 'setDosageConfig',     'label' => 'Dosier-Sollwerte setzen (schreibt)'],
                 ['op' => 'setRules',            'label' => 'Steuerregeln setzen (schreibt)'],
@@ -232,6 +234,8 @@ class PoolController extends EntityModule
         $this->RegisterPropertyFloat('MinPlausible', 0.0);
         $this->RegisterPropertyFloat('MaxPlausible', 45.0);
         $this->RegisterPropertyInteger('MaxStaleSeconds', 1800);
+        // Umwälz-Wochenplan: welche TIMEC-Regel steuert die Filterpumpe
+        $this->RegisterPropertyInteger('FilterRuleIndex', 0);
         // Scharfschalten (reale Schreibzugriffe)
         $this->RegisterPropertyBoolean('Armed', false);
     }
@@ -261,6 +265,17 @@ class PoolController extends EntityModule
         $ms     = max(5000, (int) ($cfg['pollInterval'] ?? self::POLL_MS_DEF));
         $this->SetTimerInterval(self::TIMER_POLL, $active ? $ms : 0);
         $this->syncReferences();
+
+        // Wochenplan-Baseline: adoptierten Ist-Stand als Referenz merken, damit er
+        // nicht faelschlich als "pending" (zu schreiben) gilt.
+        $eid = $this->scheduleEventId();
+        if ($eid > 0) {
+            $rt = $this->readRt();
+            if (($rt['schedHash'] ?? '') === '') {
+                $rt['schedHash'] = md5(json_encode($this->ruleFromEvent($eid)));
+                $this->writeRt($rt);
+            }
+        }
     }
 
     // ==================================================================
@@ -346,6 +361,9 @@ class PoolController extends EntityModule
 
         // --- Durchfluss-abhaengige TruePoolTemp-Fusion (Nutzer-Anforderung #2) ---
         $this->fuseWaterTemp($inline, $flowRate, $pumpOn);
+
+        // --- Wochenplan -> Controller zurueckschreiben (bei Aenderung, gated) ---
+        $this->reconcileSchedule();
 
         // Empfohlene Umwaelzzeit aus der ECHTEN Wassertemperatur (kein Geraetezugriff).
         $trueTemp = @$this->GetValue('TruePoolTemp');
@@ -452,6 +470,138 @@ class PoolController extends EntityModule
             }
         }
         return $val;
+    }
+
+    // ==================================================================
+    // Umwälz-Wochenplan  <->  Controller (TIMEC-Regel)
+    // Der Wochenplan-Ereignis (Ident 'FilterSchedule', Kind der Instanz) ist die
+    // editierbare Quelle. Bei Aenderung wird er in eine TIMEC-Regel uebersetzt und
+    // (nur bei armed) an den Controller geschrieben. Tag-/Zeitfenster-Format gem.
+    // PROTOCOLS §9/§13. Kein Schreiben ohne Armed.
+    // ==================================================================
+
+    private function scheduleEventId(): int
+    {
+        $eid = @$this->GetIDForIdent('FilterSchedule');
+        return (is_int($eid) && $eid > 0) ? $eid : 0;
+    }
+
+    /** Symcon-Tagesmaske (Bit0=Mo..Bit6=So) -> Controller-Maske (Bit0=So,Bit1=Mo..Bit6=Sa). */
+    private static function symconToCtrlDays(int $sym): int
+    {
+        $r = 0;
+        if ($sym & 1)  { $r |= 2; }   // Mo
+        if ($sym & 2)  { $r |= 4; }   // Di
+        if ($sym & 4)  { $r |= 8; }   // Mi
+        if ($sym & 8)  { $r |= 16; }  // Do
+        if ($sym & 16) { $r |= 32; }  // Fr
+        if ($sym & 32) { $r |= 64; }  // Sa
+        if ($sym & 64) { $r |= 1; }   // So
+        return $r;
+    }
+
+    /** Liest das Wochenplan-Ereignis und leitet {days(sym), windows:[[start,end]..]} ab. */
+    private function ruleFromEvent(int $eid): array
+    {
+        $e = @\IPS_GetEvent($eid);
+        $groups = is_array($e) ? ($e['ScheduleGroups'] ?? []) : [];
+        $days = 0;
+        $windows = [];
+        foreach ($groups as $g) {
+            $pts = $g['Points'] ?? [];
+            if (!$pts) {
+                continue;
+            }
+            usort($pts, static function ($a, $b) {
+                return (($a['Start']['Hour'] ?? 0) * 60 + ($a['Start']['Minute'] ?? 0))
+                     - (($b['Start']['Hour'] ?? 0) * 60 + ($b['Start']['Minute'] ?? 0));
+            });
+            $open = null;
+            $local = [];
+            $hasEin = false;
+            foreach ($pts as $p) {
+                $min = (int) ($p['Start']['Hour'] ?? 0) * 60 + (int) ($p['Start']['Minute'] ?? 0);
+                $a = (int) ($p['ActionID'] ?? 0);
+                if ($a === 1) {
+                    $open = $min;
+                    $hasEin = true;
+                } elseif ($a === 0 && $open !== null) {
+                    $local[] = [$open, $min];
+                    $open = null;
+                }
+            }
+            if ($open !== null) {
+                $local[] = [$open, 1439];
+            }
+            if ($hasEin) {
+                $days |= (int) ($g['Days'] ?? 0);
+                if (!$windows) {
+                    $windows = $local;
+                }
+            }
+        }
+        return ['days' => $days, 'windows' => array_slice($windows, 0, 4)];
+    }
+
+    /** Baut die 15-Werte-TIMEC-Regel aus {days,windows}. */
+    private function buildFilterRule(array $st): array
+    {
+        $rule = array_fill(0, 15, 0);
+        $rule[1] = (int) $this->cfgVal('pumpRelayIndex', 0);
+        $rule[2] = self::symconToCtrlDays((int) ($st['days'] ?? 0));
+        $i = 0;
+        foreach (($st['windows'] ?? []) as $w) {
+            if ($i >= 4) {
+                break;
+            }
+            $rule[3 + $i * 3] = 1;
+            $rule[4 + $i * 3] = (int) $w[0];
+            $rule[5 + $i * 3] = (int) $w[1];
+            $i++;
+        }
+        $rule[0] = $i > 0 ? 1 : 0; // Regel aktiv, wenn Fenster vorhanden
+        return $rule;
+    }
+
+    /** Schreibt die Filter-Regel in den Controller (ersetzt nur FilterRuleIndex). Gated durch Aufrufer. */
+    private function writeFilterRule(array $st): array
+    {
+        $client = $this->client();
+        if ($client === null) {
+            return ['ok' => false, 'error' => 'not_configured'];
+        }
+        $idx = (int) $this->ReadPropertyInteger('FilterRuleIndex');
+        return $this->writeGuarded('TIMEC', function () use ($client, $st, $idx) {
+            $cur = $client->getRules('TIMEC');
+            $rules = ($cur['ok'] ?? false) ? $cur['rules'] : [];
+            $rules[$idx] = $this->buildFilterRule($st);
+            return $client->setRules('TIMEC', $rules);
+        });
+    }
+
+    /** Vergleicht Ereignis mit letztem geschriebenen Stand; schreibt bei Aenderung (nur armed). */
+    private function reconcileSchedule(): void
+    {
+        $eid = $this->scheduleEventId();
+        if ($eid === 0) {
+            return;
+        }
+        $st = $this->ruleFromEvent($eid);
+        $hash = md5(json_encode($st));
+        $rt = $this->readRt();
+        if ($hash === ($rt['schedHash'] ?? '')) {
+            return; // unveraendert
+        }
+        if (!(bool) $this->cfgVal('armed', false)) {
+            $this->SendDebug('HSPC.schedule', 'Zeitplan-Aenderung ausstehend (nicht scharf)', 0);
+            return; // Hash NICHT speichern -> wird bei Scharfschaltung geschrieben
+        }
+        $res = $this->writeFilterRule($st);
+        if (!empty($res['ok'])) {
+            $rt['schedHash'] = $hash;
+            $this->writeRt($rt);
+            $this->SendDebug('HSPC.schedule', 'Zeitplan an Controller geschrieben (' . count($st['windows']) . ' Fenster)', 0);
+        }
     }
 
     // ==================================================================
@@ -613,6 +763,32 @@ class PoolController extends EntityModule
                 });
             case 'computeCirculation':
                 return $this->mgmtComputeCirculation($args);
+            case 'scheduleStatus':
+                $eid = $this->scheduleEventId();
+                if ($eid === 0) {
+                    return ['ok' => false, 'error' => 'no_schedule_event'];
+                }
+                $st = $this->ruleFromEvent($eid);
+                $rt = $this->readRt();
+                return ['ok' => true, 'eventId' => $eid, 'ruleIndex' => (int) $this->ReadPropertyInteger('FilterRuleIndex'),
+                    'days' => $st['days'], 'windows' => $st['windows'], 'rule' => $this->buildFilterRule($st),
+                    'pending' => (md5(json_encode($st)) !== ($rt['schedHash'] ?? '')), 'armed' => (bool) $this->cfgVal('armed', false)];
+            case 'sendSchedule':
+                $eid = $this->scheduleEventId();
+                if ($eid === 0) {
+                    return ['ok' => false, 'error' => 'no_schedule_event'];
+                }
+                if (!$this->writeAllowed('sendSchedule')) {
+                    return ['ok' => true, 'shadow' => true, 'note' => 'Schatten-Modus: nicht gesendet'];
+                }
+                $st = $this->ruleFromEvent($eid);
+                $res = $this->writeFilterRule($st);
+                if (!empty($res['ok'])) {
+                    $rt = $this->readRt();
+                    $rt['schedHash'] = md5(json_encode($st));
+                    $this->writeRt($rt);
+                }
+                return ['ok' => (bool) ($res['ok'] ?? false), 'windows' => $st['windows'], 'rule' => $this->buildFilterRule($st)];
 
             // --- Konfiguration schreiben (gated) ---
             case 'setDosageConfig':
@@ -1038,6 +1214,7 @@ class PoolController extends EntityModule
                     ['type' => 'RowLayout', 'items' => [
                         ['type' => 'NumberSpinner', 'name' => 'PoolSize', 'caption' => 'Poolvolumen (m³, 0=Standardformel)', 'digits' => 1],
                         ['type' => 'NumberSpinner', 'name' => 'CircFlowRate', 'caption' => 'Umwaelzleistung (m³/h)', 'digits' => 1],
+                        ['type' => 'NumberSpinner', 'name' => 'FilterRuleIndex', 'caption' => 'Wochenplan: TIMEC-Regel-Index (0-15)', 'minimum' => 0, 'maximum' => 15],
                     ]],
                 ]],
 
@@ -1083,6 +1260,11 @@ class PoolController extends EntityModule
                     ['type' => 'Button', 'caption' => 'Umwaelzzeit berechnen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"computeCirculation"]));'],
                     ['type' => 'Button', 'caption' => 'Netzwerk lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getNetwork"]));'],
                     ['type' => 'Button', 'caption' => 'Sensor-Konfig lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getSensorConfig"]));'],
+                ]],
+                ['type' => 'Label', 'caption' => '— Umwälz-Wochenplan (editierbar über die Visu; Rückschreiben nur bei "scharf") —'],
+                ['type' => 'RowLayout', 'items' => [
+                    ['type' => 'Button', 'caption' => 'Wochenplan-Status', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"scheduleStatus"]));'],
+                    ['type' => 'Button', 'caption' => 'Wochenplan an Controller senden', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"sendSchedule"]));'],
                 ]],
             ],
 
