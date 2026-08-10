@@ -119,6 +119,9 @@ class HomeSuiteHub extends EntityModule
         $this->RegisterPropertyFloat('ShadeWindStormKmh', 50.0);
         $this->RegisterPropertyBoolean('ShadeRainClose', true);
         $this->RegisterPropertyInteger('ShadeSafePos', 0);
+        // Nordausrichtung (Haus-Abweichung gegen Nord, °): dreht alle Sonnenprofile mit.
+        $this->RegisterPropertyFloat('ShadeNorthDeg', -12.6);
+        $this->RegisterAttributeString('ShadeNorthApplied', ''); // zuletzt angewandte Ausrichtung (Baseline)
         // Heizung — Frostschutz (haus-weit)
         $this->RegisterPropertyFloat('HeatFrostTemp', 8.0);
         // Bewaesserung — Regensensor (grundstuecksweit)
@@ -261,6 +264,8 @@ class HomeSuiteHub extends EntityModule
                 ['type' => 'NumberSpinner', 'name' => 'ShadeSafePos', 'caption' => 'Sichere Position (%)', 'minimum' => 0, 'maximum' => 100],
                 ['type' => 'CheckBox', 'name' => 'ShadeRainClose', 'caption' => 'Bei Regen schließen'],
             ]],
+            ['type' => 'Label', 'caption' => 'Nordausrichtung: Haus-Abweichung gegen Nord (°). Beim Ändern werden ALLE Sonnenprofile (Hub + alle Zonen) automatisch mitgedreht.'],
+            ['type' => 'NumberSpinner', 'name' => 'ShadeNorthDeg', 'caption' => 'Nordausrichtung (° gegen Nord)', 'digits' => 1, 'minimum' => -180, 'maximum' => 180],
         ]];
         $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Heizung — Frostschutz (global)', 'items' => [
             ['type' => 'NumberSpinner', 'name' => 'HeatFrostTemp', 'caption' => 'Frostschutz-Solltemperatur (°C)', 'digits' => 1, 'minimum' => 3, 'maximum' => 15],
@@ -361,6 +366,8 @@ class HomeSuiteHub extends EntityModule
             'label' => 'Bewegungs-/Anwesenheits-Sensoren erkennen', 'destructive' => false, 'fields' => []]);
         $m->addManagementAction(['op' => 'validate', 'verb' => 'validate', 'target' => 'hub',
             'label' => 'Bindungen pruefen (alle Entitaeten)', 'destructive' => false, 'fields' => []]);
+        $m->addManagementAction(['op' => 'rotateSun', 'verb' => 'rotateSun', 'target' => 'hub',
+            'label' => 'Sonnenprofile drehen (Nordausrichtung, deltaDeg)', 'destructive' => false, 'fields' => []]);
 
         // --- Medienquellen (Provider) — haus-weit, im Symcon-Frontend konfigurierbar ---
         $m->addManagementAction(['op' => 'getSources', 'verb' => 'getSources', 'target' => 'hub',
@@ -442,6 +449,46 @@ class HomeSuiteHub extends EntityModule
         // referenzierten physischen Objekte (globale Sensoren/Standort, Automatik-
         // Regeln, Szenen-Mitglieder). syncBindingLinks() laeuft schon aus parent.
         $this->syncHubReferences();
+
+        // Nordausrichtung: bei Aenderung der Haus-Abweichung ALLE Sonnenprofile
+        // (Hub-benannte + je Zone geoProfile) um die Differenz mitdrehen. Beim
+        // ersten Lauf nur Baseline merken (kein Drehen).
+        $want = (float) $this->ReadPropertyFloat('ShadeNorthDeg');
+        $applied = $this->ReadAttributeString('ShadeNorthApplied');
+        if ($applied !== '' && abs((float) $applied - $want) > 0.001) {
+            $this->rotateSun($want - (float) $applied);
+        }
+        $this->WriteAttributeString('ShadeNorthApplied', (string) $want);
+    }
+
+    /**
+     * Dreht ALLE Sonnenprofile um $delta Grad (mod 360): die Hub-benannten Profile
+     * (profiles.sun) UND je ShadingDevice-Zone das geoProfile (via HSSH_Manage
+     * rotateGeo). Kern der zentralen „Nordausrichtung".
+     */
+    private function rotateSun(float $delta): array
+    {
+        $rot = function ($v) use ($delta) { $n = fmod(((float) $v + $delta), 360.0); if ($n < 0) { $n += 360.0; } return (int) round($n); };
+        $map = $this->store()->get('profiles.sun', []);
+        $profiles = 0;
+        if (is_array($map)) {
+            foreach ($map as $name => $p) {
+                if (!is_array($p)) { continue; }
+                if (isset($p['azimuthBgn'])) { $p['azimuthBgn'] = $rot($p['azimuthBgn']); }
+                if (isset($p['azimuthEnd'])) { $p['azimuthEnd'] = $rot($p['azimuthEnd']); }
+                $map[$name] = $p;
+                $profiles++;
+            }
+            $this->store()->set('profiles.sun', $map);
+        }
+        $zones = 0;
+        if (function_exists('IPS_GetInstanceListByModuleID') && function_exists('HSSH_Manage')) {
+            foreach (@\IPS_GetInstanceListByModuleID(self::GUID_HSSH) as $iid) {
+                @\HSSH_Manage((int) $iid, json_encode(['op' => 'rotateGeo', 'args' => ['deltaDeg' => $delta]]));
+                $zones++;
+            }
+        }
+        return ['ok' => true, 'delta' => $delta, 'profiles' => $profiles, 'zones' => $zones];
     }
 
     protected function applyControl(Control $c, $value, ActionContext $ctx): void
@@ -557,6 +604,9 @@ class HomeSuiteHub extends EntityModule
 
             case 'organizeTree':
                 return $this->organizeTree();
+
+            case 'rotateSun':
+                return $this->rotateSun((float) ($args['deltaDeg'] ?? 0));
 
             case 'detectContacts':
                 return ['ok' => true, 'contacts' => \Hoep\HomeSuite\Engines\Contacts::detect(

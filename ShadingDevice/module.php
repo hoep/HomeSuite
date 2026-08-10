@@ -191,6 +191,7 @@ class ShadingDevice extends EntityModule
                 ['op' => 'configureAutomation', 'label' => 'Sonne/Sicherheit konfigurieren'],
                 ['op' => 'setArmed',           'label' => 'Scharfschalten / Schatten-Modus'],
                 ['op' => 'migrateConfig',      'label' => 'Config auf Properties migrieren (einmalig)'],
+                ['op' => 'rotateGeo',          'label' => 'Sonnenprofil-Azimut drehen (Nordausrichtung)'],
                 ['op' => 'driverProbe',        'label' => 'Treiber-Status (Diagnose)'],
                 ['op' => 'reconcileProbe',     'label' => 'Regel-Entscheidung (Trockenlauf)'],
                 ['op' => 'getConfig',          'label' => 'Konfiguration lesen (Diagnose)'],
@@ -390,6 +391,8 @@ class ShadingDevice extends EntityModule
         $env = is_array($cfg['env'] ?? null) ? $cfg['env'] : [];
         $envLabels = ['sunAzId'=>'Sonnen-Azimut','sunElId'=>'Sonnen-Elevation','windId'=>'Wind','rainId'=>'Regen','brightId'=>'Helligkeit'];
         foreach ($envLabels as $k => $lab) { $add('bl_env_' . $k, $lab, (int) ($env[$k] ?? 0)); }
+        $tg = is_array($cfg['tempGate'] ?? null) ? $cfg['tempGate'] : [];
+        $add('bl_tempSensor', 'Temp-Gate-Sensor', (int) ($tg['sensorId'] ?? 0));
         $i = 0;
         foreach ((array) ($cfg['doorIds'] ?? []) as $d) { $add('bl_Door' . $i, 'Tür-Kontakt', (int) $d); $i++; }
         return $out;
@@ -577,6 +580,8 @@ class ShadingDevice extends EntityModule
                 return ['ok' => true, 'config' => $this->cfg()];
             case 'migrateConfig':
                 return $this->migrateConfig();
+            case 'rotateGeo':
+                return $this->mgmtRotateGeo($args);
             case 'referenceRun':
                 return $this->mgmtReferenceRun($args);
             case 'validate':
@@ -962,6 +967,21 @@ class ShadingDevice extends EntityModule
         @\IPS_SetProperty($this->InstanceID, 'Armed', $armed);
         @\IPS_ApplyChanges($this->InstanceID);
         return ['ok' => true, 'armed' => $this->armed()];
+    }
+
+    /** Dreht das Raum-Sonnenprofil (geoProfile azimuthBgn/End) um deltaDeg (Nordausrichtung, vom Hub gerufen). */
+    private function mgmtRotateGeo(array $args): array
+    {
+        $delta = (float) ($args['deltaDeg'] ?? 0);
+        $gp = $this->cfgVal('geoProfile', null);
+        if (!is_array($gp)) {
+            return ['ok' => true, 'skipped' => 'no geoProfile'];
+        }
+        $rot = function ($v) use ($delta) { $n = fmod(((float) $v + $delta), 360.0); if ($n < 0) { $n += 360.0; } return (int) round($n); };
+        if (isset($gp['azimuthBgn'])) { $gp['azimuthBgn'] = $rot($gp['azimuthBgn']); }
+        if (isset($gp['azimuthEnd'])) { $gp['azimuthEnd'] = $rot($gp['azimuthEnd']); }
+        $this->store()->patch('config', ['geoProfile' => $gp]);
+        return ['ok' => true, 'geoProfile' => $gp];
     }
 
     /**
