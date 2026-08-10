@@ -1122,6 +1122,13 @@ class AudioZone extends EntityModule
         return $this->ReadPropertyBoolean('Armed');
     }
 
+    /** Baum-Sichtbarkeit: Audio-Wochenplan/Wecken (config.schedule) als read-only JSON spiegeln. */
+    protected function refreshMirrors(): void
+    {
+        $cfg = $this->cfg();
+        $this->mirrorVar('ScheduleJson', 'Audio-Zeitplan/Wecken (JSON, Anzeige)', $cfg['schedule'] ?? []);
+    }
+
     /** Flache Keys -> Properties, verschachtelte -> Store; $apply triggert ApplyChanges. */
     private function applyConfigProperties(array $c, bool $apply = true): void
     {
@@ -1194,9 +1201,16 @@ class AudioZone extends EntityModule
         $add('bl_powerOn', 'Ein-Skript', $pow['scriptOn'] ?? 0);
         $add('bl_powerOff', 'Aus-Skript', $pow['scriptOff'] ?? 0);
         $grp = is_array($cfg['group'] ?? null) ? $cfg['group'] : [];
-        foreach (['scriptId'=>'Gruppen-Skript','rinconVarId'=>'RINCON','masterVarId'=>'Master','slaveVarId'=>'Slave'] as $k => $lab) {
+        foreach (['scriptId'=>'Gruppen-Skript','rinconVarId'=>'RINCON','masterVarId'=>'Master','slaveVarId'=>'Slave',
+                  'masterRinconVarId'=>'Master-RINCON','masterNameVarId'=>'Master-Name'] as $k => $lab) {
             $add('bl_grp_' . strtolower($k), $lab, $grp[$k] ?? 0);
         }
+        // Now-Playing-Reflect-Variablen (was das Modul liest/spiegelt) -> Baum-Transparenz.
+        $ref = is_array($cfg['reflect'] ?? null) ? $cfg['reflect'] : [];
+        $refLabels = ['title'=>'Titel','artist'=>'Interpret','album'=>'Album','albumArtist'=>'Album-Interpret',
+                      'coverUri'=>'Cover','positionTime'=>'Position','duration'=>'Dauer','playState'=>'Wiedergabe',
+                      'volume'=>'Lautstärke','mute'=>'Stumm','repeat'=>'Repeat','shuffle'=>'Shuffle'];
+        foreach ($refLabels as $k => $lab) { $add('bl_ref_' . $k, 'NowPlaying: ' . $lab, $ref[$k] ?? 0); }
         return $out;
     }
 

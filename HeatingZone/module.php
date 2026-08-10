@@ -208,6 +208,12 @@ class HeatingZone extends EntityModule
         return $this->ReadPropertyBoolean('Armed');
     }
 
+    /** Baum-Sichtbarkeit: Wochenplan (ScheduleEngine-Store) als read-only JSON spiegeln. */
+    protected function refreshMirrors(): void
+    {
+        $this->mirrorVar('ScheduleJson', 'Wochenplan (JSON, Anzeige)', $this->store()->get('schedule', []));
+    }
+
     /**
      * Schedule-Modus je Treiberklasse (Leitprinzip 7): der generische Sollwert-
      * Treiber laesst die ScheduleEngine im Modul fahren ('controller'), die

@@ -331,6 +331,18 @@ class ShadingDevice extends EntityModule
         return $this->ReadPropertyBoolean('Armed');
     }
 
+    /** Baum-Sichtbarkeit: Positions-Wochenplan + Automatik-Config (env/tempGate/Tag) als JSON spiegeln. */
+    protected function refreshMirrors(): void
+    {
+        $this->mirrorVar('ScheduleJson', 'Positions-Wochenplan (JSON, Anzeige)', $this->store()->get('schedule', []));
+        $auto = [];
+        foreach (['env', 'tempGate', 'dayBegin', 'dayEnd', 'doorIds', 'geoProfile'] as $k) {
+            $v = $this->cfgVal($k, null);
+            if ($v !== null) { $auto[$k] = $v; }
+        }
+        $this->mirrorVar('AutomationJson', 'Automatik/Sensoren (JSON, Anzeige)', $auto);
+    }
+
     /** Map flache Config-Keys -> [PropertyName, Typ]. */
     private const PROP_MAP = [
         'driver'=>['Driver','s'], 'invert'=>['Invert','b'], 'positionId'=>['PositionId','i'],

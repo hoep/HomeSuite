@@ -576,6 +576,13 @@ class HomeSuiteHub extends EntityModule
         }
     }
 
+    /** Baum-Sichtbarkeit: Szenen + Licht-Automatik als read-only JSON spiegeln. */
+    protected function refreshMirrors(): void
+    {
+        $this->mirrorVar('ScenesJson', 'Licht-Szenen (JSON, Anzeige)', $this->store()->get('lightScenes', []));
+        $this->mirrorVar('LightAutoJson', 'Licht-Automatik (JSON, Anzeige)', $this->store()->get('lightAuto', []));
+    }
+
     // ==================================================================
     // Verwaltungs-Ops (mgmt) — bereits whitelist-geprueft durch Manage()
     // ==================================================================

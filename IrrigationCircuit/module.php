@@ -989,6 +989,18 @@ class IrrigationCircuit extends EntityModule
         return $this->ReadPropertyBoolean('Armed');
     }
 
+    /** Baum-Sichtbarkeit: Bewaesserungs-Wochenplan + Klimaregeln als read-only JSON spiegeln. */
+    protected function refreshMirrors(): void
+    {
+        $this->mirrorVar('ScheduleJson', 'Bewässerungsplan (JSON, Anzeige)', $this->store()->get('schedule', []));
+        $climate = [];
+        foreach (['temp', 'rain', 'evap'] as $k) {
+            $v = $this->cfgVal($k, null);
+            if ($v !== null) { $climate[$k] = $v; }
+        }
+        $this->mirrorVar('ClimateJson', 'Klimaregeln (JSON, Anzeige)', $climate);
+    }
+
     /** Flache Keys -> Properties, komplexe -> Store; $apply triggert ApplyChanges. */
     private function applyConfigProperties(array $c, bool $apply = true): void
     {

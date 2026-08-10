@@ -89,6 +89,11 @@ abstract class EntityModule extends \IPSModule
         // was die Entitaet liest/schaltet (generisch aus der Store-Konfig).
         $this->syncBindingLinks();
 
+        // Baum-Sichtbarkeit fuer verschachtelte Store-Daten (Zeitplaene/Szenen/
+        // Automatik): read-only Spiegel-Variablen (JSON). Domaenen ueberschreiben
+        // refreshMirrors(); Default: nichts.
+        $this->refreshMirrors();
+
         // Falls Kernel bereits laeuft, Ready-Hook sofort ausloesen.
         if (function_exists('IPS_GetKernelRunlevel') && IPS_GetKernelRunlevel() === KR_READY) {
             $this->onKernelReady();
@@ -486,6 +491,24 @@ abstract class EntityModule extends \IPSModule
         }
         $g = (int) $this->hubProp($hubProp, 0);
         return $g > 0 ? $g : $default;
+    }
+
+    /**
+     * Baum-Sichtbarkeit fuer verschachtelte Store-Daten (Zeitplaene/Szenen/Automatik):
+     * legt/aktualisiert eine read-only String-Variable mit dem JSON. Store bleibt die
+     * Editier-Wahrheit (ueber die Editoren); die Variable macht den Inhalt im Baum
+     * nachvollziehbar. Idempotent.
+     */
+    protected function mirrorVar(string $ident, string $name, $data, int $pos = 95): void
+    {
+        @$this->RegisterVariableString($ident, $name, '', $pos);
+        $json = is_string($data) ? $data : (string) json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+        @$this->SetValue($ident, $json);
+    }
+
+    /** Domaenen-Hook: Spiegel-Variablen fuer verschachtelte Store-Daten pflegen (Default: nichts). */
+    protected function refreshMirrors(): void
+    {
     }
 
     // ==================================================================
