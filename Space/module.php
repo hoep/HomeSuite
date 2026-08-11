@@ -41,7 +41,7 @@ class HomeSuiteBereich extends IPSModule
         $form = [
             'elements' => [
                 ['type' => 'Select', 'name' => 'Kind', 'caption' => 'Ebene', 'options' => [
-                    ['caption' => 'Haus',          'value' => 'Haus'],
+                    ['caption' => 'Haus/Wohnung',  'value' => 'Haus'],
                     ['caption' => 'Bereich/Ebene', 'value' => 'Bereich'],
                     ['caption' => 'Raum',          'value' => 'Raum'],
                 ]],
