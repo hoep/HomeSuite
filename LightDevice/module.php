@@ -474,6 +474,45 @@ class LightDevice extends EntityModule
     }
 
     // ==================================================================
+    // Oeffentliche Scripting-Prozeduren (-> HSLT_SetPower / _SetBrightness …)
+    //
+    // Duenne, typisierte Fassaden ueber SetControl/GetControlValue (Basis). Setzen
+    // geht ueber RequestAction -> applyControl (armed-Gate/Reflect bleiben erhalten);
+    // realer Effekt nur bei Armed=true + gebundenem Treiber.
+    // ==================================================================
+
+    public function SetPower(bool $On): bool        { return $this->SetControl('Power', $On); }
+    public function SetBrightness(int $Percent): bool { return $this->SetControl('Brightness', $Percent); }
+    public function SetColorTemp(int $Kelvin): bool  { return $this->SetControl('ColorTemp', $Kelvin); }
+
+    /** Umschalten; liefert den neuen Soll-Zustand. */
+    public function Toggle(): bool
+    {
+        $new = !((bool) $this->GetControlValue('Power'));
+        return $this->SetControl('Power', $new) ? $new : !$new;
+    }
+
+    /** RGB-Farbe (0xRRGGBB). Interim ueber Manage 'setColor' (Color-Control noch nicht actionable). */
+    public function SetColor(int $Rgb): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'setColor', 'args' => ['rgb' => $Rgb]])), true);
+        return is_array($r) && !empty($r['ok']);
+    }
+
+    /** Scharf/Schatten (Cutover). Liefert den resultierenden Armed-Zustand. */
+    public function SetArmed(bool $Armed): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'setArmed', 'args' => ['armed' => $Armed]])), true);
+        return is_array($r) && !empty($r['armed']);
+    }
+
+    public function IsOn(): bool         { return (bool) $this->GetControlValue('Power'); }
+    public function GetBrightness(): int { return (int) $this->GetControlValue('Brightness'); }
+    public function GetColorTemp(): int  { return (int) $this->GetControlValue('ColorTemp'); }
+    public function GetWatt(): float     { return (float) $this->GetControlValue('Watt'); }
+    public function IsOnline(): bool     { return (bool) $this->GetControlValue('Online'); }
+
+    // ==================================================================
     // Konsolen-Formular (Notfall/Erstkonfiguration; Verwaltung sonst im LVB)
     // ==================================================================
 

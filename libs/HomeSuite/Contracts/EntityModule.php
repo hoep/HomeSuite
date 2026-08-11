@@ -311,6 +311,59 @@ abstract class EntityModule extends \IPSModule
     }
 
     // ==================================================================
+    // Oeffentliche Scripting-Fassade (-> Prefix_SetControl / _GetControlValue)
+    //
+    // Einheitlicher, script-tauglicher Eingang: RequestAction ist als reservierter
+    // SDK-Name NICHT als Prefix-Funktion aufrufbar; diese Methoden fuellen die Luecke.
+    // Setzen geht IMMER ueber RequestAction -> applyControl (armed-Gate, Wert-Haertung,
+    // manualHold, Reflect, Reconcile bleiben konsistent). NIE direkt SetValue am Geraet.
+    // Die typisierten Domaenen-Wrapper (Prefix_SetSetpoint …) delegieren hierher.
+    // ==================================================================
+
+    /**
+     * Setzt einen actionable Control per Ident aus einem Skript.
+     * Validiert VORHER (ehrlicher bool, da RequestAction void ist) und delegiert
+     * dann an den einen autoritativen Bedienpfad.
+     *
+     * @return bool true = validiert und dispatcht; false = unbekannt/nicht actionable
+     *              oder Wert unzulaessig (coerce-Fehler). Realer Effekt nur bei
+     *              Armed=true + gebundenem Treiber (sonst Schatten-Modus).
+     */
+    public function SetControl(string $Ident, $Value): bool
+    {
+        $c = $this->control($Ident);
+        if ($c === null || !$c->actionable) {
+            $this->LogMessage("HS.SetControl: '{$Ident}' unbekannt/nicht actionable", KL_ERROR);
+            return false;
+        }
+        try {
+            $c->coerce($Value); // Vor-Check -> ehrlicher Rueckgabewert
+        } catch (\Throwable $e) {
+            $this->LogMessage("HS.SetControl '{$Ident}': " . $e->getMessage(), KL_ERROR);
+            return false;
+        }
+        $this->RequestAction($Ident, $Value); // EINZIGER Bedienpfad (coerct erneut)
+        return true;
+    }
+
+    /**
+     * Liest den aktuellen Statuswert eines Controls per Ident.
+     *
+     * @return mixed Wert oder null (kein solches Control / keine Variable / leer).
+     */
+    public function GetControlValue(string $Ident)
+    {
+        if ($this->control($Ident) === null || $this->GetIDForIdent($Ident) === false) {
+            return null;
+        }
+        try {
+            return $this->GetValue($Ident);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    // ==================================================================
     // Domaenen-Helfer (protected, ueberschreibbar)
     // ==================================================================
 

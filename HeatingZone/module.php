@@ -521,6 +521,55 @@ class HeatingZone extends EntityModule
         }
     }
 
+    // ==================================================================
+    // Oeffentliche Scripting-Prozeduren (-> HSHT_SetSetpoint / _SetMode …)
+    //
+    // Duenne, typisierte Fassaden ueber SetControl/GetControlValue (Basis). Setzen
+    // geht ueber RequestAction -> applyControl (armed-Gate/Reflect/Reconcile bleiben
+    // erhalten); realer Effekt nur bei Armed=true + gebundenem Treiber.
+    // Zeitplan-Bearbeitung bleibt Manage/LVB — hier nur Leser.
+    // ==================================================================
+
+    public function SetSetpoint(float $Celsius): bool { return $this->SetControl('Setpoint', $Celsius); }
+    public function SetMode(int $Mode): bool          { return $this->SetControl('Mode', $Mode); }
+    public function SetPresence(int $Presence): bool  { return $this->SetControl('Presence', $Presence); }
+
+    /** Modus per Klartext: auto|manual|manuell|boost|frost|frostschutz. */
+    public function SetModeName(string $Mode): bool
+    {
+        $map = ['auto' => 0, 'manual' => 1, 'manuell' => 1, 'boost' => 2, 'frost' => 3, 'frostschutz' => 3];
+        $k = strtolower(trim($Mode));
+        if (!isset($map[$k])) {
+            $this->LogMessage("HSHT.SetModeName: unbekannter Modus '{$Mode}'", KL_ERROR);
+            return false;
+        }
+        return $this->SetControl('Mode', $map[$k]);
+    }
+
+    public function Boost(): bool        { return $this->SetControl('Mode', 2); }
+    public function FrostProtect(): bool { return $this->SetControl('Mode', 3); }
+
+    public function GetSetpoint(): float   { return (float) $this->GetControlValue('Setpoint'); }
+    public function GetActualTemp(): float { return (float) $this->GetControlValue('ActualTemp'); }
+    public function GetHumidity(): int     { return (int) $this->GetControlValue('Humidity'); }
+    public function GetMode(): int         { return (int) $this->GetControlValue('Mode'); }
+    public function GetPresence(): int     { return (int) $this->GetControlValue('Presence'); }
+    public function IsOnline(): bool       { return (bool) $this->GetControlValue('Online'); }
+
+    /** Scharf/Schatten (Cutover). Liefert den resultierenden Armed-Zustand. */
+    public function SetArmed(bool $Armed): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'setArmed', 'args' => ['armed' => $Armed]])), true);
+        return is_array($r) && !empty($r['armed']);
+    }
+
+    /** Wochenplan einer Praesenz als JSON lesen (Diagnose); Presence<0 = aktive. */
+    public function GetScheduleJson(int $Presence = -1): string
+    {
+        $args = ($Presence >= 0) ? ['variant' => $Presence] : [];
+        return $this->Manage(json_encode(['op' => 'getSchedule', 'args' => $args]));
+    }
+
     /**
      * Konsole: native Bindungs-Ansicht (additiv, ohne Properties -> wirkt sofort
      * auf Bestandsinstanzen, kein Kernel-Neustart). Felder mit aktueller Store-
