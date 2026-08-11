@@ -58,6 +58,8 @@ class IrrigationCircuit extends EntityModule
     // Manifest (Vertrag 2)
     // ==================================================================
 
+    protected function entityLabel(): string { return 'Bewässerung'; }
+
     protected function manifest(): array
     {
         return [

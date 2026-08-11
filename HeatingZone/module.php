@@ -71,6 +71,8 @@ class HeatingZone extends EntityModule
      *
      * @return array<string,mixed>
      */
+    protected function entityLabel(): string { return 'Heizung'; }
+
     protected function manifest(): array
     {
         return [

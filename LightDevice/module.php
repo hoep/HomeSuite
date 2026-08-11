@@ -48,6 +48,8 @@ class LightDevice extends EntityModule
     // Manifest (Vertrag 2)
     // ==================================================================
 
+    protected function entityLabel(): string { return 'Licht'; }
+
     protected function manifest(): array
     {
         return [

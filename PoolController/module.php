@@ -80,6 +80,8 @@ class PoolController extends EntityModule
     // Manifest
     // ==================================================================
 
+    protected function entityLabel(): string { return 'Pool'; }
+
     protected function manifest(): array
     {
         $R = function (string $ident, string $label, int $varType, string $profile = '') {

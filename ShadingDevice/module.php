@@ -90,6 +90,8 @@ class ShadingDevice extends EntityModule
      *
      * @return array<string,mixed>
      */
+    protected function entityLabel(): string { return 'Beschattung'; }
+
     protected function manifest(): array
     {
         return [

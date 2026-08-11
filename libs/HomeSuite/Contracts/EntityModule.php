@@ -103,6 +103,9 @@ abstract class EntityModule extends \IPSModule
         // refreshMirrors(); Default: nichts.
         $this->refreshMirrors();
 
+        // Baum-Klarheit: Entitaets-Typ als Suffix im Instanznamen "(Licht)" etc.
+        $this->ensureEntitySuffix();
+
         // Falls Kernel bereits laeuft, Ready-Hook sofort ausloesen.
         if (function_exists('IPS_GetKernelRunlevel') && IPS_GetKernelRunlevel() === KR_READY) {
             $this->onKernelReady();
@@ -219,6 +222,30 @@ abstract class EntityModule extends \IPSModule
      * @return array<string,mixed>
      */
     abstract protected function manifest(): array;
+
+    /**
+     * Domaenen-Label fuer den Baum-Suffix (z. B. 'Licht', 'Beschattung', 'Audio',
+     * 'Heizung'). Leer = kein Suffix (z. B. Hub). Domaenen ueberschreiben.
+     */
+    protected function entityLabel(): string
+    {
+        return '';
+    }
+
+    /** Haengt den Entitaets-Typ als "(Label)" an den Instanznamen an (idempotent). */
+    private function ensureEntitySuffix(): void
+    {
+        $lbl = trim($this->entityLabel());
+        if ($lbl === '' || !function_exists('IPS_SetName')) {
+            return;
+        }
+        $suffix = ' (' . $lbl . ')';
+        $name   = (string) @\IPS_GetName($this->InstanceID);
+        if ($name === '' || substr($name, -strlen($suffix)) === $suffix) {
+            return; // leer oder bereits vorhanden -> nichts tun
+        }
+        @\IPS_SetName($this->InstanceID, $name . $suffix);
+    }
 
     // ==================================================================
     // RPC-Trio (-> Prefix_GetManifest / _GetState / _Manage)

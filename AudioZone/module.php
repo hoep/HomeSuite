@@ -64,6 +64,8 @@ class AudioZone extends EntityModule
     // Manifest (Vertrag 2)
     // ==================================================================
 
+    protected function entityLabel(): string { return 'Audio'; }
+
     protected function manifest(): array
     {
         return [
