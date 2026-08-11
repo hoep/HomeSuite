@@ -261,12 +261,16 @@ class HomeSuiteHub extends EntityModule
             'onClick' => 'echo HSH_Manage($id, json_encode(["op"=>"configureSources","args"=>[' . implode(',', $argParts) . ']]));'];
         // Spotify-OAuth: Redirect-URI anzeigen (in Spotify-App eintragen) + Login-Link erzeugen.
         $redir = $this->spotifyRedirectUri();
+        $login = ($redir !== '') ? $redir : ''; // /hook/hsspotify leitet ohne code direkt zu Spotify weiter
         $items[] = ['type' => 'Label', 'caption' => '— Spotify verbinden (OAuth) —'];
-        $items[] = ['type' => 'Label', 'caption' => 'Redirect-URI fuer die Spotify-App: '
+        $items[] = ['type' => 'Label', 'caption' => 'Redirect-URI fuer die Spotify-App (in den App-Settings eintragen): '
             . ($redir !== '' ? $redir : '(Symcon Connect nicht verfuegbar)')];
-        $items[] = ['type' => 'Label', 'caption' => 'Erst Client-ID/Secret oben speichern, dann Login-Link erzeugen, im Browser oeffnen und bei Spotify anmelden.'];
-        $items[] = ['type' => 'Button', 'caption' => 'Spotify-Login-Link erzeugen',
-            'onClick' => 'echo HSH_Manage($id, json_encode(["op"=>"spotifyAuthUrl"]));'];
+        $items[] = ['type' => 'Label', 'caption' => 'Client-ID/Secret oben speichern, dann auf den Link klicken und bei Spotify anmelden — der Refresh-Token wird automatisch gespeichert.'];
+        // Direkter Ein-Klick-Login: der Link oeffnet den Hook, der sofort zu Spotify weiterleitet.
+        $items[] = ['type' => 'Label', 'caption' => $login !== '' ? ('Bei Spotify anmelden: ' . $login) : 'Login-Link nicht verfuegbar (Symcon Connect pruefen).'];
+        // Fallback-Button (zeigt denselben Login-Link, falls der Link oben nicht anklickbar ist).
+        $items[] = ['type' => 'Button', 'caption' => 'Spotify-Login-Link anzeigen',
+            'onClick' => 'echo (@json_decode(HSH_Manage($id, json_encode(["op"=>"spotifyAuthUrl"])), true)["authUrl"] ?? "Login-Link nicht verfuegbar");'];
         $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Medienquellen (Audio-Provider)', 'items' => $items];
 
         // --- Globale, domaenenweite Einstellungen (property-gebunden; Childs lesen via hubProp) ---
@@ -1272,9 +1276,21 @@ class HomeSuiteHub extends EntityModule
     /** Spotify-OAuth-Callback: code -> refresh_token, im Store ablegen. Liefert HTML. */
     private function handleSpotifyCallback(): void
     {
-        header('Content-Type: text/html; charset=utf-8');
         $code = (string) ($_GET['code'] ?? '');
         $err  = (string) ($_GET['error'] ?? '');
+        // Aufruf OHNE code/error = Login-START -> direkt zu Spotify weiterleiten
+        // (Ein-Klick: /hook/hsspotify oeffnen genuegt).
+        if ($code === '' && $err === '') {
+            $a = $this->mgmtSpotifyAuthUrl();
+            if (!empty($a['authUrl'])) {
+                header('Location: ' . $a['authUrl'], true, 302);
+                return;
+            }
+            header('Content-Type: text/html; charset=utf-8');
+            echo $this->spotifyHtml('Login nicht moeglich: ' . htmlspecialchars((string) ($a['error'] ?? 'Client-ID/Connect fehlt')));
+            return;
+        }
+        header('Content-Type: text/html; charset=utf-8');
         $sp   = (array) ($this->sourcesConfig()['spotify'] ?? []);
         if ($err !== '') {
             echo $this->spotifyHtml('Spotify meldet einen Fehler: ' . htmlspecialchars($err));
