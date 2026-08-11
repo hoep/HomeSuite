@@ -365,7 +365,17 @@ abstract class EntityModule extends \IPSModule
      *              oder Wert unzulaessig (coerce-Fehler). Realer Effekt nur bei
      *              Armed=true + gebundenem Treiber (sonst Schatten-Modus).
      */
-    public function SetControl(string $Ident, $Value): bool
+    public function SetControl(string $Ident, string $Value): bool
+    {
+        // Oeffentliche Fassade: die Symcon-Funktionsbibliothek verlangt fuer Prefix-
+        // Funktionen skalar-typisierte Parameter (bool/int/float/string) — daher hier
+        // string; die Wert-Haertung (coerce) wandelt in den echten Control-Typ. Interne,
+        // typisierte Wrapper rufen setControlValue() (untypisiert) direkt.
+        return $this->setControlValue($Ident, $Value);
+    }
+
+    /** Interner, untypisierter Setz-Pfad (nicht exponiert -> beliebiger Wertetyp erlaubt). */
+    protected function setControlValue(string $Ident, $Value): bool
     {
         $c = $this->control($Ident);
         if ($c === null || !$c->actionable) {

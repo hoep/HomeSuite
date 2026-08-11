@@ -487,19 +487,19 @@ class LightDevice extends EntityModule
     // realer Effekt nur bei Armed=true + gebundenem Treiber.
     // ==================================================================
 
-    public function SetPower(bool $On): bool        { return $this->SetControl('Power', $On); }
-    public function SetBrightness(int $Percent): bool { return $this->SetControl('Brightness', $Percent); }
-    public function SetColorTemp(int $Kelvin): bool  { return $this->SetControl('ColorTemp', $Kelvin); }
+    public function SetPower(bool $On): bool        { return $this->setControlValue('Power', $On); }
+    public function SetBrightness(int $Percent): bool { return $this->setControlValue('Brightness', $Percent); }
+    public function SetColorTemp(int $Kelvin): bool  { return $this->setControlValue('ColorTemp', $Kelvin); }
 
     /** Umschalten; liefert den neuen Soll-Zustand. */
     public function Toggle(): bool
     {
         $new = !((bool) $this->GetControlValue('Power'));
-        return $this->SetControl('Power', $new) ? $new : !$new;
+        return $this->setControlValue('Power', $new) ? $new : !$new;
     }
 
     /** RGB-Farbe (0xRRGGBB) ueber den nativen Control-Pfad. */
-    public function SetColor(int $Rgb): bool { return $this->SetControl('Color', $Rgb); }
+    public function SetColor(int $Rgb): bool { return $this->setControlValue('Color', $Rgb); }
 
     /** Scharf/Schatten (Cutover). Liefert den resultierenden Armed-Zustand. */
     public function SetArmed(bool $Armed): bool

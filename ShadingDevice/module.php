@@ -1123,7 +1123,7 @@ class ShadingDevice extends EntityModule
     // Duenne Fassaden ueber SetControl/GetControlValue; realer Effekt nur bei Armed=true.
     // ==================================================================
 
-    public function SetPosition(int $Percent): bool { return $this->SetControl('Position', $Percent); }
+    public function SetPosition(int $Percent): bool { return $this->setControlValue('Position', $Percent); }
 
     /** Richtung: up|auf|1 / down|ab|zu|2 / stop|0. */
     public function Move(string $Direction): bool
@@ -1131,18 +1131,18 @@ class ShadingDevice extends EntityModule
         $map = ['up' => 1, 'auf' => 1, '1' => 1, 'down' => 2, 'ab' => 2, 'zu' => 2, '2' => 2, 'stop' => 0, '0' => 0];
         $k = strtolower(trim($Direction));
         if (!isset($map[$k])) { $this->LogMessage("HSSH.Move: unbekannte Richtung '{$Direction}'", KL_ERROR); return false; }
-        return $this->SetControl('Movement', $map[$k]);
+        return $this->setControlValue('Movement', $map[$k]);
     }
-    public function MoveUp(): bool   { return $this->SetControl('Movement', 1); }
-    public function MoveDown(): bool { return $this->SetControl('Movement', 2); }
-    public function MoveStop(): bool { return $this->SetControl('Movement', 0); }
+    public function MoveUp(): bool   { return $this->setControlValue('Movement', 1); }
+    public function MoveDown(): bool { return $this->setControlValue('Movement', 2); }
+    public function MoveStop(): bool { return $this->setControlValue('Movement', 0); }
 
-    public function SetMode(int $Mode): bool             { return $this->SetControl('Mode', $Mode); }
-    public function SetPlan(int $Plan): bool             { return $this->SetControl('Plan', $Plan); }
-    public function SetSeason(int $Season): bool         { return $this->SetControl('Season', $Season); }
-    public function SetSunAzimuthBegin(int $Deg): bool   { return $this->SetControl('SunAzBgn', $Deg); }
-    public function SetSunAzimuthEnd(int $Deg): bool     { return $this->SetControl('SunAzEnd', $Deg); }
-    public function SetSunElevation(int $Deg): bool      { return $this->SetControl('SunElev', $Deg); }
+    public function SetMode(int $Mode): bool             { return $this->setControlValue('Mode', $Mode); }
+    public function SetPlan(int $Plan): bool             { return $this->setControlValue('Plan', $Plan); }
+    public function SetSeason(int $Season): bool         { return $this->setControlValue('Season', $Season); }
+    public function SetSunAzimuthBegin(int $Deg): bool   { return $this->setControlValue('SunAzBgn', $Deg); }
+    public function SetSunAzimuthEnd(int $Deg): bool     { return $this->setControlValue('SunAzEnd', $Deg); }
+    public function SetSunElevation(int $Deg): bool      { return $this->setControlValue('SunElev', $Deg); }
 
     /** Scharf/Schatten (Cutover). Achtung: schaltet reale Rollo-Telegramme frei. */
     public function SetArmed(bool $Armed): bool

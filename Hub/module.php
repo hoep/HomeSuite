@@ -180,11 +180,11 @@ class HomeSuiteHub extends EntityModule
     // Globale Bedienung + duenne Manage-Fassaden (Szenen/Licht-Automatik/Rotation).
     // ==================================================================
 
-    public function SetAutomationEnabled(bool $Enabled): bool { return $this->SetControl('AutomationEnabled', $Enabled); }
+    public function SetAutomationEnabled(bool $Enabled): bool { return $this->setControlValue('AutomationEnabled', $Enabled); }
     public function GetAutomationEnabled(): bool              { return (bool) $this->GetControlValue('AutomationEnabled'); }
 
     /** Nordausrichtung (Grad); dreht alle Sonnenprofile additiv (Property+ApplyChanges+Rotation). */
-    public function SetNorthAlignment(float $Degrees): bool { return $this->SetControl('ShadeNorth', $Degrees); }
+    public function SetNorthAlignment(float $Degrees): bool { return $this->setControlValue('ShadeNorth', $Degrees); }
     public function GetNorthAlignment(): float             { return (float) $this->GetControlValue('ShadeNorth'); }
 
     public function ApplyLightScene(string $SceneId): bool
@@ -325,8 +325,8 @@ class HomeSuiteHub extends EntityModule
             $on  = ($vid && $vid > 0) ? (bool) @\GetValue($vid) : false;
             $armItems[] = ['type' => 'RowLayout', 'items' => [
                 ['type' => 'Label', 'width' => '200px', 'caption' => $ad[1] . ':  ' . ($on ? '● scharf' : '○ Schatten')],
-                ['type' => 'Button', 'caption' => 'scharf',   'onClick' => 'HSH_SetControl($id, "' . $ad[0] . '", true);  echo "' . $ad[1] . ' scharf — Formular neu öffnen";'],
-                ['type' => 'Button', 'caption' => 'Schatten', 'onClick' => 'HSH_SetControl($id, "' . $ad[0] . '", false); echo "' . $ad[1] . ' Schatten — Formular neu öffnen";'],
+                ['type' => 'Button', 'caption' => 'scharf',   'onClick' => 'HSH_SetControl($id, "' . $ad[0] . '", "1"); echo "' . $ad[1] . ' scharf — Formular neu öffnen";'],
+                ['type' => 'Button', 'caption' => 'Schatten', 'onClick' => 'HSH_SetControl($id, "' . $ad[0] . '", "0"); echo "' . $ad[1] . ' Schatten — Formular neu öffnen";'],
             ]];
         }
         $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Scharf-Schaltungen (je Domäne)', 'items' => $armItems];

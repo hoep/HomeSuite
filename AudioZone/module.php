@@ -1067,22 +1067,22 @@ class AudioZone extends EntityModule
     // Audio ist scharf (armed=true) -> Setter wirken real.
     // ==================================================================
 
-    public function Play(): bool         { return $this->SetControl('Transport', self::TR_PLAY); }
-    public function Pause(): bool        { return $this->SetControl('Transport', self::TR_PAUSE); }
-    public function StopPlayback(): bool { return $this->SetControl('Transport', self::TR_STOP); }
-    public function Next(): bool         { return $this->SetControl('Transport', self::TR_NEXT); }
-    public function Previous(): bool     { return $this->SetControl('Transport', self::TR_PREV); }
+    public function Play(): bool         { return $this->setControlValue('Transport', self::TR_PLAY); }
+    public function Pause(): bool        { return $this->setControlValue('Transport', self::TR_PAUSE); }
+    public function StopPlayback(): bool { return $this->setControlValue('Transport', self::TR_STOP); }
+    public function Next(): bool         { return $this->setControlValue('Transport', self::TR_NEXT); }
+    public function Previous(): bool     { return $this->setControlValue('Transport', self::TR_PREV); }
 
-    public function SetVolume(int $Percent): bool { return $this->SetControl('Volume', $Percent); }
-    public function SetMute(bool $On): bool       { return $this->SetControl('Mute', $On); }
-    public function SetPower(bool $On): bool      { return $this->SetControl('Power', $On); }
-    public function SetRepeat(int $Mode): bool    { return $this->SetControl('Repeat', $Mode); }
-    public function SetShuffle(bool $On): bool    { return $this->SetControl('Shuffle', $On); }
-    public function Seek(int $Percent): bool      { return $this->SetControl('Position', $Percent); }
+    public function SetVolume(int $Percent): bool { return $this->setControlValue('Volume', $Percent); }
+    public function SetMute(bool $On): bool       { return $this->setControlValue('Mute', $On); }
+    public function SetPower(bool $On): bool      { return $this->setControlValue('Power', $On); }
+    public function SetRepeat(int $Mode): bool    { return $this->setControlValue('Repeat', $Mode); }
+    public function SetShuffle(bool $On): bool    { return $this->setControlValue('Shuffle', $On); }
+    public function Seek(int $Percent): bool      { return $this->setControlValue('Position', $Percent); }
 
-    public function PlayFavorite(int $Index): bool { return $this->SetControl('SourceFavorite', $Index); }
-    public function PlayRadio(int $Index): bool    { return $this->SetControl('SourceRadio', $Index); }
-    public function PlayPlaylist(int $Index): bool { return $this->SetControl('SourcePlaylist', $Index); }
+    public function PlayFavorite(int $Index): bool { return $this->setControlValue('SourceFavorite', $Index); }
+    public function PlayRadio(int $Index): bool    { return $this->setControlValue('SourceRadio', $Index); }
+    public function PlayPlaylist(int $Index): bool { return $this->setControlValue('SourcePlaylist', $Index); }
 
     /** Werbefreier HQ-Direktstream (Sender-Key). */
     public function PlayDirectRadio(string $StationKey): bool

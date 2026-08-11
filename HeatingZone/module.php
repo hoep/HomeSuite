@@ -532,9 +532,9 @@ class HeatingZone extends EntityModule
     // Zeitplan-Bearbeitung bleibt Manage/LVB — hier nur Leser.
     // ==================================================================
 
-    public function SetSetpoint(float $Celsius): bool { return $this->SetControl('Setpoint', $Celsius); }
-    public function SetMode(int $Mode): bool          { return $this->SetControl('Mode', $Mode); }
-    public function SetPresence(int $Presence): bool  { return $this->SetControl('Presence', $Presence); }
+    public function SetSetpoint(float $Celsius): bool { return $this->setControlValue('Setpoint', $Celsius); }
+    public function SetMode(int $Mode): bool          { return $this->setControlValue('Mode', $Mode); }
+    public function SetPresence(int $Presence): bool  { return $this->setControlValue('Presence', $Presence); }
 
     /** Modus per Klartext: auto|manual|manuell|boost|frost|frostschutz. */
     public function SetModeName(string $Mode): bool
@@ -545,11 +545,11 @@ class HeatingZone extends EntityModule
             $this->LogMessage("HSHT.SetModeName: unbekannter Modus '{$Mode}'", KL_ERROR);
             return false;
         }
-        return $this->SetControl('Mode', $map[$k]);
+        return $this->setControlValue('Mode', $map[$k]);
     }
 
-    public function Boost(): bool        { return $this->SetControl('Mode', 2); }
-    public function FrostProtect(): bool { return $this->SetControl('Mode', 3); }
+    public function Boost(): bool        { return $this->setControlValue('Mode', 2); }
+    public function FrostProtect(): bool { return $this->setControlValue('Mode', 3); }
 
     public function GetSetpoint(): float   { return (float) $this->GetControlValue('Setpoint'); }
     public function GetActualTemp(): float { return (float) $this->GetControlValue('ActualTemp'); }

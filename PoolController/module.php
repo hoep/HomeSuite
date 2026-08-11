@@ -1363,9 +1363,9 @@ class PoolController extends EntityModule
     // Realer Effekt nur bei Armed=true (Global-Gate).
     // ==================================================================
 
-    public function SetDosingRedoxAuto(bool $On): bool { return $this->SetControl('DosingClAuto', $On); }
-    public function SetDosingPHAuto(bool $On): bool    { return $this->SetControl('DosingPHAuto', $On); }
-    public function SetCircAuto(bool $On): bool        { return $this->SetControl('CircAuto', $On); }
+    public function SetDosingRedoxAuto(bool $On): bool { return $this->setControlValue('DosingClAuto', $On); }
+    public function SetDosingPHAuto(bool $On): bool    { return $this->setControlValue('DosingPHAuto', $On); }
+    public function SetCircAuto(bool $On): bool        { return $this->setControlValue('CircAuto', $On); }
 
     /** Relais 0..7 -> Modus 0=Auto/1=Manuell Aus/2=Manuell Ein. */
     public function SetRelayMode(int $Index, int $Mode): bool
@@ -1374,7 +1374,7 @@ class PoolController extends EntityModule
             $this->LogMessage("HSPC.SetRelayMode: Index/Mode ausserhalb (idx={$Index}, mode={$Mode})", KL_ERROR);
             return false;
         }
-        return $this->SetControl('Relay' . $Index . 'Mode', $Mode);
+        return $this->setControlValue('Relay' . $Index . 'Mode', $Mode);
     }
 
     private function pcManage(string $op, array $args = []): bool

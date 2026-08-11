@@ -951,15 +951,15 @@ class IrrigationCircuit extends EntityModule
     // Duenne Fassaden ueber SetControl/GetControlValue; realer Effekt nur bei Armed=true.
     // ==================================================================
 
-    public function SetActive(bool $On): bool          { return $this->SetControl('Active', $On); }
-    public function SetAutomatic(bool $On): bool        { return $this->SetControl('Automatic', $On); }
-    public function SetDuration(int $Minutes): bool     { return $this->SetControl('Duration', $Minutes); }
-    public function SetSeasonalAdjust(int $Percent): bool { return $this->SetControl('SeasonalAdjust', $Percent); }
-    public function SetProgram(int $Program): bool      { return $this->SetControl('Program', $Program); }
+    public function SetActive(bool $On): bool          { return $this->setControlValue('Active', $On); }
+    public function SetAutomatic(bool $On): bool        { return $this->setControlValue('Automatic', $On); }
+    public function SetDuration(int $Minutes): bool     { return $this->setControlValue('Duration', $Minutes); }
+    public function SetSeasonalAdjust(int $Percent): bool { return $this->setControlValue('SeasonalAdjust', $Percent); }
+    public function SetProgram(int $Program): bool      { return $this->setControlValue('Program', $Program); }
 
     /** Sofortlauf; 0 = konfigurierte Dauer. Umgeht Gates (explizit gewollt). */
-    public function RunNow(int $Minutes = 0): bool      { return $this->SetControl('Run', $Minutes); }
-    public function Stop(): bool                        { return $this->SetControl('Stop', 1); }
+    public function RunNow(int $Minutes = 0): bool      { return $this->setControlValue('Run', $Minutes); }
+    public function Stop(): bool                        { return $this->setControlValue('Stop', 1); }
 
     public function SetArmed(bool $Armed): bool
     {
