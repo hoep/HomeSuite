@@ -19,7 +19,7 @@ Domänen-Modul „Licht" — eine Instanz = eine Leuchte/Lichtgruppe. Schaltet A
 | `bool HSLT_SetBrightness(int $id, int $Percent)` | Helligkeit 0–100 % |
 | `bool HSLT_SetColorTemp(int $id, int $Kelvin)` | Farbtemperatur (2700–6500 K) |
 | `bool HSLT_Toggle(int $id)` | Umschalten; liefert neuen Soll-Zustand |
-| `bool HSLT_SetColor(int $id, int $Rgb)` | RGB `0xRRGGBB` (interim über Manage `setColor`) |
+| `bool HSLT_SetColor(int $id, int $Rgb)` | RGB `0xRRGGBB` |
 | `bool HSLT_SetArmed(int $id, bool $Armed)` | scharf/Schatten (Cutover) |
 
 ### Lesen
@@ -30,8 +30,6 @@ Domänen-Modul „Licht" — eine Instanz = eine Leuchte/Lichtgruppe. Schaltet A
 | `int HSLT_GetColorTemp(int $id)` | Farbtemperatur |
 | `float HSLT_GetWatt(int $id)` | Leistung |
 | `bool HSLT_IsOnline(int $id)` | Erreichbarkeit |
-
-> Hinweis: Die `Color`-Variable ist derzeit nicht als Control `actionable`; `HSLT_SetColor` läuft übergangsweise über `HSLT_Manage(op:"setColor")`.
 
 ### Beispiele
 ```php

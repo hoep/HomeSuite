@@ -64,8 +64,9 @@ class LightDevice extends EntityModule
                 ['ident' => 'ColorTemp', 'type' => ControlContract::T_SETPOINT, 'role' => 'light:cct',
                  'label' => 'Farbtemperatur', 'varType' => 1, 'unit' => 'K',
                  'min' => self::CCT_MIN, 'max' => self::CCT_MAX, 'step' => 100, 'actionable' => true],
-                ['ident' => 'Color', 'type' => ControlContract::T_REFLECT, 'role' => 'light:color',
-                 'label' => 'Farbe', 'varType' => 1, 'actionable' => false],
+                ['ident' => 'Color', 'type' => ControlContract::T_SETPOINT, 'role' => 'light:color',
+                 'label' => 'Farbe', 'varType' => 1, 'profile' => '~HexColor',
+                 'min' => 0, 'max' => 0xFFFFFF, 'step' => 1, 'actionable' => true],
                 ['ident' => 'Watt', 'type' => ControlContract::T_REFLECT, 'role' => 'light:watt',
                  'label' => 'Leistung', 'varType' => 2, 'unit' => 'W', 'actionable' => false],
                 ['ident' => 'Online', 'type' => ControlContract::T_REFLECT, 'role' => 'light:online',
@@ -99,7 +100,7 @@ class LightDevice extends EntityModule
     /** Bedienung dieser Idents oeffnet ein manualHold-Fenster (Automatik-Hoheit, A3). */
     protected function isAutomated(Control $c): bool
     {
-        return in_array($c->ident, ['Power', 'Brightness', 'ColorTemp'], true);
+        return in_array($c->ident, ['Power', 'Brightness', 'ColorTemp', 'Color'], true);
     }
 
     // ==================================================================
@@ -194,6 +195,9 @@ class LightDevice extends EntityModule
                 break;
             case 'ColorTemp':
                 $drv->setCct((int) $value);
+                break;
+            case 'Color':
+                $drv->setColor((int) $value);
                 break;
             default:
                 $this->SendDebug('HSLT.apply', $c->ident . ' unbehandelt', 0);
@@ -492,12 +496,8 @@ class LightDevice extends EntityModule
         return $this->SetControl('Power', $new) ? $new : !$new;
     }
 
-    /** RGB-Farbe (0xRRGGBB). Interim ueber Manage 'setColor' (Color-Control noch nicht actionable). */
-    public function SetColor(int $Rgb): bool
-    {
-        $r = json_decode($this->Manage(json_encode(['op' => 'setColor', 'args' => ['rgb' => $Rgb]])), true);
-        return is_array($r) && !empty($r['ok']);
-    }
+    /** RGB-Farbe (0xRRGGBB) ueber den nativen Control-Pfad. */
+    public function SetColor(int $Rgb): bool { return $this->SetControl('Color', $Rgb); }
 
     /** Scharf/Schatten (Cutover). Liefert den resultierenden Armed-Zustand. */
     public function SetArmed(bool $Armed): bool
