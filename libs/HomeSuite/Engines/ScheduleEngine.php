@@ -218,6 +218,18 @@ final class ScheduleEngine
         return $week;
     }
 
+    /**
+     * Rastert+begrenzt eine beliebige Slot-Liste (fuer aus Wochenplan-Ereignissen
+     * abgeleitete Tagesprofile, damit sie ins Geraeteraster passen).
+     *
+     * @param array<int,array{end:int,val:mixed}> $slots
+     * @return array<int,array{end:int,val:mixed}>
+     */
+    public function rasterCap(array $slots, int $rasterMin = 10, int $slotLimit = 13): array
+    {
+        return $this->rasterAndCap($slots, max(1, $rasterMin), max(1, $slotLimit));
+    }
+
     // ----------------------------------------------------------------------
 
     /**

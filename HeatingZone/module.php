@@ -501,6 +501,9 @@ class HeatingZone extends EntityModule
         // Manual-Override-Erkennung: auf Aenderungen der GERAETE-Sollwertvariable
         // lauschen (jemand verstellt am Geraet/HM-Oberflaeche).
         $this->registerSetpointWatch($drv);
+
+        // Native Wochenplaene je Praesenz als Zeitplan-Wahrheit sicherstellen.
+        $this->ensureHeatEvents();
     }
 
     /**
@@ -622,7 +625,14 @@ class HeatingZone extends EntityModule
             $hf = (float) $this->hubProp('HeatFrostTemp', 0);
             return $hf > 0 ? $hf : (float) $this->ReadPropertyFloat('FrostTemp');
         }
-        // Auto (0) und Boost (2, vorerst wie Auto) -> aus dem Wochenplan.
+        // Auto (0) und Boost (2, vorerst wie Auto) -> aus dem nativen Wochenplan
+        // der aktiven Praesenz (Zeitplan-Wahrheit). Fallback auf ScheduleEngine,
+        // falls das Ereignis (noch) nicht existiert.
+        $p = $this->intVal('Presence');
+        if ($this->heatEventId($p) > 0) {
+            $v = $this->heatTempAt(time(), $p);
+            return is_numeric($v) ? (float) $v : null;
+        }
         $variant = $this->activeVariant();
         $v = $this->scheduleValueAt(time(), $variant); // Basis: loest ggf. Sonnen-Anker auf
         return is_numeric($v) ? (float) $v : null;
@@ -641,12 +651,18 @@ class HeatingZone extends EntityModule
      */
     private function pushWeekIfChanged(IThermostat $drv): void
     {
-        $variant = $this->activeVariant();
-        $week    = $this->schedules()->toHomematicWeek($variant, 10, 13);
+        $p = $this->intVal('Presence');
+        // Zeitplan-Wahrheit = nativer Wochenplan; daraus das Geraeteprofil ableiten.
+        // Fallback auf ScheduleEngine, falls das Ereignis (noch) fehlt.
+        if ($this->heatEventId($p) > 0) {
+            $week = $this->heatWeekFromEvent($p);
+        } else {
+            $week = $this->schedules()->toHomematicWeek($this->activeVariant(), 10, 13);
+        }
         if ($this->weekIsEmpty($week)) {
             return; // kein Plan hinterlegt -> Geraeteprogramm nicht anfassen
         }
-        $hash = md5($variant . '|' . json_encode($week));
+        $hash = md5($p . '|' . json_encode($week));
         $rt   = $this->readRt();
         if (($rt['pushHash'] ?? '') === $hash) {
             return; // schon aktuell
@@ -740,6 +756,203 @@ class HeatingZone extends EntityModule
         }
         // Keine spaetere Grenze heute -> bis Mitternacht.
         return max(60, (1440 - $minNow) * 60);
+    }
+
+    // ==================================================================
+    // Native Symcon-Wochenplaene (Zeitplan-Wahrheit) — je Praesenz ein
+    // Ereignis (Ident HeatSchedule_0..2), Aktionen = Temperatur-Palette.
+    // Aktion 0 = „kein Plan" (kein Override); Aktion i = Solltemperatur,
+    // Wert im Namen kodiert ("20,5 °C") und beim Lesen zurueckgeparst.
+    // ==================================================================
+
+    private function heatEventId(int $p): int
+    {
+        $e = @$this->GetIDForIdent('HeatSchedule_' . $p);
+        return (is_int($e) && $e > 0) ? $e : 0;
+    }
+
+    /** Legt je Praesenz einen Wochenplan an + migriert einmalig aus dem ScheduleEngine. */
+    private function ensureHeatEvents(): void
+    {
+        if (!function_exists('IPS_CreateEvent')) {
+            return;
+        }
+        foreach (self::PRESENCE_VARIANTS as $p => $variant) {
+            $palette = $this->heatBuildPalette($variant);
+            $eid   = $this->heatEventId($p);
+            $fresh = false;
+            if ($eid <= 0) {
+                $eid = @\IPS_CreateEvent(2);
+                if (!$eid) {
+                    continue;
+                }
+                @\IPS_SetParent($eid, $this->InstanceID);
+                @\IPS_SetIdent($eid, 'HeatSchedule_' . $p);
+                @\IPS_SetName($eid, 'Heizplan ' . $variant);
+                @\IPS_SetEventActive($eid, true);
+                $fresh = true;
+            }
+            if ($fresh) {
+                // Palette schreiben: 0 = kein Plan, dann je Temperatur eine Aktion.
+                @\IPS_SetEventScheduleAction($eid, 0, 'kein Plan', 0x9AA5AD, '');
+                foreach ($palette as $i => $t) {
+                    @\IPS_SetEventScheduleAction($eid, $i + 1, $this->heatTempName($t), $this->heatTempColor($t), '');
+                }
+            }
+            $ev = @\IPS_GetEvent($eid);
+            $hasPoints = false;
+            foreach (($ev['ScheduleGroups'] ?? []) as $g) {
+                if (!empty($g['Points'])) { $hasPoints = true; break; }
+            }
+            if ($fresh || !$hasPoints) {
+                $this->migrateHeatEvent($eid, $variant, $palette);
+            }
+        }
+    }
+
+    /** Sortierte, auf 0,5° gerundete Menge aller Solltemperaturen der Variante. */
+    private function heatBuildPalette(string $variant): array
+    {
+        $set = [];
+        for ($d = 0; $d < 7; $d++) {
+            foreach ($this->schedules()->getSlots($variant, $d) as $s) {
+                $v = (float) ($s['val'] ?? 0);
+                if ($v > 0) {
+                    $r = round($v * 2) / 2;
+                    $set[(string) $r] = $r;
+                }
+            }
+        }
+        $vals = array_values($set);
+        sort($vals);
+        return $vals;
+    }
+
+    private function heatTempName(float $t): string
+    {
+        return number_format($t, 1, ',', '') . ' °C';
+    }
+
+    /** Blau (kalt) -> Rot (warm) fuer die Palette; per weekedit umfaerbbar. */
+    private function heatTempColor(float $t): int
+    {
+        if ($t <= 17.0) { return 0x3B82F6; }
+        if ($t <= 19.0) { return 0x22C55E; }
+        if ($t <= 21.0) { return 0xF59E0B; }
+        return 0xEF4444;
+    }
+
+    /** ScheduleEngine-Slots -> Wochenplan-Punkte (Temperatur -> Palette-Aktion). */
+    private function migrateHeatEvent(int $eid, string $variant, array $palette): void
+    {
+        // Temperatur -> Aktions-ID (Palette-Index + 1); 0 = kein Plan.
+        $map = [];
+        foreach ($palette as $i => $t) {
+            $map[(string) $t] = $i + 1;
+        }
+        $ev = @\IPS_GetEvent($eid);
+        foreach (($ev['ScheduleGroups'] ?? []) as $g) {
+            @\IPS_SetEventScheduleGroup($eid, (int) $g['ID'], 0);
+        }
+        for ($d = 0; $d < 7; $d++) {
+            @\IPS_SetEventScheduleGroup($eid, $d, (1 << $d));
+            $slots = $this->schedules()->getSlots($variant, $d);
+            usort($slots, fn($a, $b) => (int) $a['end'] - (int) $b['end']);
+            $prev = 0; $pid = 0;
+            @\IPS_SetEventScheduleGroupPoint($eid, $d, $pid++, 0, 0, 0, 0); // Tagesstart = kein Plan
+            foreach ($slots as $s) {
+                $start = (int) $prev;
+                $v     = (float) ($s['val'] ?? 0);
+                $act   = ($v > 0) ? (int) ($map[(string) (round($v * 2) / 2)] ?? 0) : 0;
+                if ($start > 0) {
+                    @\IPS_SetEventScheduleGroupPoint($eid, $d, $pid++, intdiv($start, 60), $start % 60, 0, $act);
+                } else {
+                    @\IPS_SetEventScheduleGroupPoint($eid, $d, 0, 0, 0, 0, $act);
+                }
+                $prev = (int) ($s['end'] ?? 1440);
+            }
+        }
+    }
+
+    /** Aktive Solltemperatur der Praesenz aus dem Wochenplan (null = kein Plan). */
+    private function heatTempAt(int $now, int $p): ?float
+    {
+        $eid = $this->heatEventId($p);
+        if ($eid <= 0) {
+            return null;
+        }
+        $e = @\IPS_GetEvent($eid);
+        if (!is_array($e) || empty($e['EventActive'])) {
+            return null;
+        }
+        $dow   = (int) date('N', $now) - 1;
+        $minNow = (int) date('G', $now) * 60 + (int) date('i', $now);
+        $act = 0;
+        foreach (($e['ScheduleGroups'] ?? []) as $g) {
+            if (!(((int) ($g['Days'] ?? 0)) & (1 << $dow))) { continue; }
+            $pts = $g['Points'] ?? [];
+            usort($pts, fn($a, $b) => (($a['Start']['Hour'] ?? 0) * 60 + ($a['Start']['Minute'] ?? 0)) - (($b['Start']['Hour'] ?? 0) * 60 + ($b['Start']['Minute'] ?? 0)));
+            foreach ($pts as $pt) {
+                $m = (int) ($pt['Start']['Hour'] ?? 0) * 60 + (int) ($pt['Start']['Minute'] ?? 0);
+                if ($m <= $minNow) { $act = (int) ($pt['ActionID'] ?? 0); }
+            }
+        }
+        if ($act <= 0) {
+            return null; // kein Plan -> nichts erzwingen
+        }
+        foreach (($e['ScheduleActions'] ?? []) as $a) {
+            if ((int) ($a['ID'] ?? -1) === $act) {
+                return (float) str_replace(',', '.', (string) ($a['Name'] ?? ''));
+            }
+        }
+        return null;
+    }
+
+    /**
+     * device-Modus: leitet das HomeMatic-Wochenprofil ({end,val} je Tag) aus dem
+     * nativen Wochenplan der Praesenz ab (kein Plan -> Frostschutz-Temperatur).
+     */
+    private function heatWeekFromEvent(int $p): array
+    {
+        $eid = $this->heatEventId($p);
+        if ($eid <= 0) {
+            return [];
+        }
+        $e = @\IPS_GetEvent($eid);
+        if (!is_array($e)) {
+            return [];
+        }
+        $temp = [];
+        foreach (($e['ScheduleActions'] ?? []) as $a) {
+            $id = (int) ($a['ID'] ?? -1);
+            $temp[$id] = ($id <= 0) ? null : (float) str_replace(',', '.', (string) ($a['Name'] ?? ''));
+        }
+        $frost = (float) $this->hubProp('HeatFrostTemp', 0);
+        if ($frost <= 0) {
+            $frost = (float) $this->ReadPropertyFloat('FrostTemp');
+        }
+        $week = [];
+        for ($d = 0; $d < 7; $d++) {
+            $pts = [];
+            foreach (($e['ScheduleGroups'] ?? []) as $g) {
+                if (!(((int) ($g['Days'] ?? 0)) & (1 << $d))) { continue; }
+                foreach (($g['Points'] ?? []) as $pt) {
+                    $pts[] = ['m' => (int) ($pt['Start']['Hour'] ?? 0) * 60 + (int) ($pt['Start']['Minute'] ?? 0), 'a' => (int) ($pt['ActionID'] ?? 0)];
+                }
+            }
+            usort($pts, fn($x, $y) => $x['m'] - $y['m']);
+            $slots = [];
+            $n = count($pts);
+            for ($i = 0; $i < $n; $i++) {
+                $end = ($i + 1 < $n) ? $pts[$i + 1]['m'] : 1440;
+                if ($end <= $pts[$i]['m']) { continue; }
+                $t = $temp[$pts[$i]['a']] ?? null;
+                if ($t === null) { $t = $frost; } // kein Plan -> Frostschutz halten
+                $slots[] = ['end' => $end, 'val' => $t];
+            }
+            $week[$d] = $this->schedules()->rasterCap($slots, 10, 13);
+        }
+        return $week;
     }
 
     // ==================================================================
