@@ -545,6 +545,39 @@ abstract class EntityModule extends \IPSModule
         return (is_array($hubs) && $hubs !== []) ? (int) $hubs[0] : 0;
     }
 
+    /** Hub-Variablen-Ident des domaenenweiten Scharf-Schalters ('' = kein Master). */
+    protected function armGateIdent(): string
+    {
+        $m = ['Licht' => 'ArmLight', 'Heizung' => 'ArmHeating', 'Beschattung' => 'ArmShading',
+              'Bewässerung' => 'ArmIrrigation', 'Audio' => 'ArmAudio', 'Pool' => 'ArmPool'];
+        return $m[$this->entityLabel()] ?? '';
+    }
+
+    /** Liest den domaenenweiten Scharf-Master aus dem Hub; null wenn (noch) nicht vorhanden. */
+    protected function hubArmGate(): ?bool
+    {
+        $id = $this->armGateIdent();
+        if ($id === '') {
+            return null;
+        }
+        $hub = $this->hubInstanceId();
+        if ($hub <= 0 || !function_exists('IPS_GetObjectIDByIdent')) {
+            return null;
+        }
+        $gv = @\IPS_GetObjectIDByIdent($id, $hub);
+        if (!is_int($gv) || $gv <= 0) {
+            return null;
+        }
+        return (bool) @\GetValue($gv);
+    }
+
+    /** Scharf-Zustand: Hub-Master hat Vorrang (Autoritaet), sonst per-Instanz-Wert. */
+    protected function armedEffective(bool $own): bool
+    {
+        $g = $this->hubArmGate();
+        return $g === null ? $own : $g;
+    }
+
     /**
      * Globale (domaenenweite) Einstellung aus dem zentralen Hub-Config-Formular
      * (native Hub-Property, extern via IPS_GetProperty lesbar). Liefert $default,

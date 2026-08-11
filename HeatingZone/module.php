@@ -207,7 +207,7 @@ class HeatingZone extends EntityModule
 
     private function armed(): bool
     {
-        return $this->ReadPropertyBoolean('Armed');
+        return $this->armedEffective($this->ReadPropertyBoolean('Armed')); // Hub-Master hat Vorrang
     }
 
     /** Baum-Sichtbarkeit: Wochenplan (ScheduleEngine-Store) als read-only JSON spiegeln. */

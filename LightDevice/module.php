@@ -659,7 +659,8 @@ class LightDevice extends EntityModule
     private function cfgVal(string $key, $def)
     {
         $c = $this->cfg();
-        return array_key_exists($key, $c) ? $c[$key] : $def;
+        $v = array_key_exists($key, $c) ? $c[$key] : $def;
+        return $key === 'armed' ? $this->armedEffective((bool) $v) : $v; // Hub-Master hat Vorrang
     }
 
     private function configuredDriverId(): string

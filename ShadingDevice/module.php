@@ -330,7 +330,7 @@ class ShadingDevice extends EntityModule
 
     private function armed(): bool
     {
-        return $this->ReadPropertyBoolean('Armed');
+        return $this->armedEffective($this->ReadPropertyBoolean('Armed')); // Hub-Master hat Vorrang
     }
 
     /** Baum-Sichtbarkeit: Positions-Wochenplan + Automatik-Config (env/tempGate/Tag) als JSON spiegeln. */
@@ -1853,7 +1853,8 @@ class ShadingDevice extends EntityModule
     private function cfgVal(string $key, $def)
     {
         $cfg = $this->cfg();
-        return $cfg[$key] ?? $def;
+        $v = $cfg[$key] ?? $def;
+        return $key === 'armed' ? $this->armedEffective((bool) $v) : $v; // Hub-Master hat Vorrang
     }
 
 

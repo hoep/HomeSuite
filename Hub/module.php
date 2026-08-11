@@ -102,6 +102,9 @@ class HomeSuiteHub extends EntityModule
         // Async-Provision-Warteschlange (persistente Job-Liste, resumable).
         $this->RegisterAttributeString(self::ATTR_QUEUE, '[]');
 
+        // Einmal-Seed-Flag fuer die Scharf-Master (ArmLight etc. aus per-Instanz-Armed).
+        $this->RegisterAttributeBoolean('ArmSeeded', false);
+
         // --- Globale, domaenenweite Einstellungen (zentrales Config-Formular) ---
         // Alle Instanzen einer Domaene teilen sich diese Werte (statt Duplikat je
         // Instanz). Childs lesen sie via EntityModule::hubProp() mit Instanz-Override.
@@ -469,6 +472,16 @@ class HomeSuiteHub extends EntityModule
             'role' => 'hub:northdeg', 'label' => 'Nordausrichtung', 'varType' => 2,
             'unit' => '°', 'min' => -180, 'max' => 180, 'step' => 0.1, 'actionable' => true,
         ]);
+        // Scharf-Master je Domaene: jede Entitaet liest ihren Gate live ueber
+        // EntityModule::armed() (Hub-Vorrang). ON = ganze Domaene schaltet real.
+        foreach ([['ArmLight','Licht scharf'],['ArmHeating','Heizung scharf'],['ArmShading','Beschattung scharf'],
+                  ['ArmIrrigation','Bewässerung scharf'],['ArmAudio','Audio scharf'],['ArmPool','Pool scharf']] as $ag) {
+            $m->addControl([
+                'ident' => $ag[0], 'type' => \Hoep\HomeSuite\ControlContract::T_SWITCH,
+                'role' => 'hub:arm', 'label' => $ag[1], 'varType' => 0,
+                'profile' => '~Switch', 'actionable' => true,
+            ]);
+        }
 
         return $m->toArray();
     }
@@ -485,6 +498,27 @@ class HomeSuiteHub extends EntityModule
         if (!(bool) $this->store()->get('autoSeeded', false)) {
             @$this->SetValue('AutomationEnabled', true);
             $this->store()->set('autoSeeded', true);
+        }
+
+        // Scharf-Master einmalig aus dem aktuellen per-Instanz-Armed jeder Domaene
+        // seeden (so bleibt der bisherige Live/Schatten-Zustand exakt erhalten).
+        if (!$this->ReadAttributeBoolean('ArmSeeded')) {
+            $doms = [
+                'ArmLight'      => '{B7E1C3A4-5D62-4F08-9A1E-2C7D6B4F0E93}',
+                'ArmHeating'    => '{AC059357-088A-4DF8-ABBC-F8724BC78769}',
+                'ArmShading'    => '{A9645ED8-CB55-43B8-869B-BFF6ACFC8DC1}',
+                'ArmIrrigation' => '{D264A82B-DE31-45CC-8AF2-8F4C5D076508}',
+                'ArmAudio'      => '{C4F2639D-2A87-453D-8175-B586BF605A38}',
+                'ArmPool'       => '{878CA345-86D1-84FC-B196-5B3224C067CF}',
+            ];
+            foreach ($doms as $ident => $guid) {
+                $on = false;
+                foreach (@\IPS_GetInstanceListByModuleID($guid) ?: [] as $iid) {
+                    if (@\IPS_GetProperty($iid, 'Armed')) { $on = true; break; }
+                }
+                if (@$this->GetIDForIdent($ident)) { @$this->SetValue($ident, $on); }
+            }
+            $this->WriteAttributeBoolean('ArmSeeded', true);
         }
 
         // Licht-Automatik: Timer + Bewegungs-Messages entsprechend Konfig einrichten.

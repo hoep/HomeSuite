@@ -1181,7 +1181,7 @@ class AudioZone extends EntityModule
 
     private function armed(): bool
     {
-        return $this->ReadPropertyBoolean('Armed');
+        return $this->armedEffective($this->ReadPropertyBoolean('Armed')); // Hub-Master hat Vorrang
     }
 
     /** Baum-Sichtbarkeit: Programm-Parameter (Quelle/Volume/Ruhezeiten) als JSON; die Wochen-TIMING liegt im nativen Wochenplan-Ereignis. */
@@ -1350,7 +1350,8 @@ class AudioZone extends EntityModule
     protected function cfgVal(string $key, $def)
     {
         $c = $this->cfg();
-        return array_key_exists($key, $c) ? $c[$key] : $def;
+        $v = array_key_exists($key, $c) ? $c[$key] : $def;
+        return $key === 'armed' ? $this->armedEffective((bool) $v) : $v; // Hub-Master hat Vorrang
     }
 
     private function configuredDriverId(): string
