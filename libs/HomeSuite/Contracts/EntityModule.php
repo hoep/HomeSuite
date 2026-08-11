@@ -27,6 +27,15 @@ namespace Hoep\HomeSuite;
  *        Konfig-Store (FabricStore). `setReflect()` schreibt ausschliesslich die
  *        Statusvariable.
  *
+ * SKRIPT-API: Neben dem RPC-Trio (PREFIX_GetManifest/_GetState/_Manage) stellt
+ * die Basis eine typisierte Scripting-Fassade bereit, die alle Kindmodule erben:
+ *   - `PREFIX_SetControl($id, string $Ident, $Value): bool` — actionable Control
+ *     aus einem Skript setzen (validiert vor, delegiert an RequestAction).
+ *   - `PREFIX_GetControlValue($id, string $Ident)` — aktuellen Statuswert lesen.
+ * Die Domaenenmodule ergaenzen duenne, typisierte Wrapper (PREFIX_SetSetpoint,
+ * PREFIX_SetVolume …) darauf; alle gehen ueber RequestAction -> applyControl
+ * (armed-Gate/Reflect/Reconcile bleiben konsistent). Referenz je Modul: README.md.
+ *
  * HINWEIS (Milestone-Abgrenzung): Die WebHook-Registrierung bei KR_READY
  * (HookTrait, F3) ist Sache des Hub-Moduls und wird in einem spaeteren
  * Meilenstein als Trait eingemischt. Diese Basis stellt dafuer den

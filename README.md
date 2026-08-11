@@ -52,6 +52,23 @@ wenn zwei Libraries mit gleichem Root im selben Kernel-Prozess geladen werden.
 Geladen wird ueber `autoload.php` mit expliziten `require_once` (belegtes
 Store-Muster).
 
+## Skript-API (PHP-Befehlsreferenz)
+
+Jedes Domänenmodul stellt öffentlich aufrufbare, typisierte Prozeduren bereit, um
+seine Variablen aus Symcon-Skripten zu setzen/lesen (IP-Symcon exponiert jede
+`public function` als `PREFIX_Methode($InstanceID, …)`). Setzen geht immer intern
+über `RequestAction` → `applyControl`, damit armed-Gate, Wert-Härtung, manualHold,
+Reflect und Reconcile konsistent bleiben. **Realer Effekt nur bei `Armed=true` +
+gebundenem Treiber** (sonst Schatten-Modus).
+
+Basis (in allen Modulen): `PREFIX_SetControl($id, string $Ident, $Value): bool`
+und `PREFIX_GetControlValue($id, string $Ident)`.
+
+Vollständige Befehlsreferenz je Modul in dessen `README.md`:
+`HeatingZone` (HSHT) · `LightDevice` (HSLT) · `ShadingDevice` (HSSH) ·
+`IrrigationCircuit` (HSIR) · `AudioZone` (HSAU) / `AudioZoneBridged` (HSAUX) ·
+`PoolController` (HSPC) · `Hub` (HSH). Gesamtplan: `../../scripts/data/homesuite/PLAN_public_api.md`.
+
 ## Kompatibilitaet (Hinweis)
 
 `library.json` traegt `compatibility.version = "1.0"` als **Platzhalter**. Die
