@@ -76,13 +76,17 @@ final class SpotifyProvider implements IMediaProvider
 
     public function browse(string $containerId, int $offset = 0, int $limit = 50): array
     {
+        $limit = max(1, min($limit, 50)); // Spotify: /me/playlists, /me/albums, tracks -> hartes Maximum 50 (limit>50 => HTTP 400 => leer)
         if ($containerId === 'playlists') {
             $j = $this->api('/me/playlists?limit=' . $limit . '&offset=' . $offset);
             $out = [];
             foreach ((array) ($j['items'] ?? []) as $p) {
+                // isContainer=false: Playlist direkt abspielbar (Tippen spielt die ganze Playlist via URI).
+                // Spotify liefert /playlists/{id}/tracks fuer gefolgte/fremde Playlists 403 -> Drill-in nutzlos,
+                // und fuer die Wiedergabe uebersetzt der Renderer ohnehin die spotify:playlist:-URI.
                 $out[] = new ContentRef('spotify', 'spotify', 'pl:' . $p['id'], 'spotify:playlist:' . $p['id'],
                     (string) ($p['name'] ?? ''), (string) ($p['owner']['display_name'] ?? ''), '',
-                    (string) ($p['images'][0]['url'] ?? ''), '', 0, true);
+                    (string) ($p['images'][0]['url'] ?? ''), '', 0, false);
             }
             return $out;
         }
@@ -125,11 +129,12 @@ final class SpotifyProvider implements IMediaProvider
 
     public function search(string $query, int $limit = 30): array
     {
+        $limit = max(1, min($limit, 50)); // Spotify /search: max 50
         $j = $this->api('/search?type=playlist,album,track&limit=' . $limit . '&q=' . rawurlencode($query));
         $out = [];
         foreach ((array) ($j['playlists']['items'] ?? []) as $p) {
             $out[] = new ContentRef('spotify', 'spotify', 'pl:' . $p['id'], 'spotify:playlist:' . $p['id'],
-                (string) ($p['name'] ?? ''), 'Playlist', '', (string) ($p['images'][0]['url'] ?? ''), '', 0, true);
+                (string) ($p['name'] ?? ''), 'Playlist', '', (string) ($p['images'][0]['url'] ?? ''), '', 0, false);
         }
         foreach ((array) ($j['tracks']['items'] ?? []) as $t) {
             $out[] = new ContentRef('spotify', 'spotify', 'tr:' . $t['id'], 'spotify:track:' . $t['id'],
