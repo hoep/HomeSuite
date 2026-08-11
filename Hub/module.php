@@ -315,6 +315,22 @@ class HomeSuiteHub extends EntityModule
             ['type' => 'SelectVariable', 'name' => 'IrrRainSensorId', 'caption' => 'Regensensor (mm)'],
         ]];
 
+        // Scharf-Schaltungen je Domaene (Master): Zustand + Buttons. Schaltet die Baum-
+        // Variablen (ArmLight etc.), die alle Instanzen der Domaene live lesen.
+        $armDefs = [['ArmLight', 'Licht'], ['ArmHeating', 'Heizung'], ['ArmShading', 'Beschattung'],
+                    ['ArmIrrigation', 'Bewässerung'], ['ArmAudio', 'Audio'], ['ArmPool', 'Pool']];
+        $armItems = [['type' => 'Label', 'caption' => 'ON = ganze Domäne schaltet REAL, OFF = Schatten (nur Anzeige/Log). Wirkt sofort; Zustand nach Klick durch Neu-Öffnen des Formulars aktualisieren.']];
+        foreach ($armDefs as $ad) {
+            $vid = @$this->GetIDForIdent($ad[0]);
+            $on  = ($vid && $vid > 0) ? (bool) @\GetValue($vid) : false;
+            $armItems[] = ['type' => 'RowLayout', 'items' => [
+                ['type' => 'Label', 'width' => '200px', 'caption' => $ad[1] . ':  ' . ($on ? '● scharf' : '○ Schatten')],
+                ['type' => 'Button', 'caption' => 'scharf',   'onClick' => 'HSH_SetControl($id, "' . $ad[0] . '", true);  echo "' . $ad[1] . ' scharf — Formular neu öffnen";'],
+                ['type' => 'Button', 'caption' => 'Schatten', 'onClick' => 'HSH_SetControl($id, "' . $ad[0] . '", false); echo "' . $ad[1] . ' Schatten — Formular neu öffnen";'],
+            ]];
+        }
+        $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Scharf-Schaltungen (je Domäne)', 'items' => $armItems];
+
         $json = json_encode($form, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         return $json === false ? '{"elements":[]}' : $json;
     }
