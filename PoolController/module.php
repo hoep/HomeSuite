@@ -1354,6 +1354,61 @@ class PoolController extends EntityModule
     // Konsolen-Formular (Erstkonfiguration + Diagnose)
     // ==================================================================
 
+    // ==================================================================
+    // Oeffentliche Scripting-Prozeduren (-> HSPC_SetRelayMode / _DoDosage …)
+    // Control-Setter ueber SetControl; Sollwerte/Dosierung/Wartung ueber Manage.
+    // Realer Effekt nur bei Armed=true (Global-Gate).
+    // ==================================================================
+
+    public function SetDosingRedoxAuto(bool $On): bool { return $this->SetControl('DosingClAuto', $On); }
+    public function SetDosingPHAuto(bool $On): bool    { return $this->SetControl('DosingPHAuto', $On); }
+    public function SetCircAuto(bool $On): bool        { return $this->SetControl('CircAuto', $On); }
+
+    /** Relais 0..7 -> Modus 0=Auto/1=Manuell Aus/2=Manuell Ein. */
+    public function SetRelayMode(int $Index, int $Mode): bool
+    {
+        if ($Index < 0 || $Index > 7 || $Mode < 0 || $Mode > 2) {
+            $this->LogMessage("HSPC.SetRelayMode: Index/Mode ausserhalb (idx={$Index}, mode={$Mode})", KL_ERROR);
+            return false;
+        }
+        return $this->SetControl('Relay' . $Index . 'Mode', $Mode);
+    }
+
+    private function pcManage(string $op, array $args = []): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => $op, 'args' => $args])), true);
+        return is_array($r) && !empty($r['ok']);
+    }
+
+    public function SetArmed(bool $Armed): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'setArmed', 'args' => ['armed' => $Armed]])), true);
+        return is_array($r) && (isset($r['armed']) ? (bool) $r['armed'] : (!empty($r['ok']) ? $Armed : false));
+    }
+
+    /** Manuell dosieren: Type 0=Cl/Redox,1=pH-,2=pH+; Seconds 0=Stop. */
+    public function DoDosage(int $Type, int $Seconds): bool     { return $this->pcManage('doDosage', ['type' => $Type, 'seconds' => max(0, $Seconds)]); }
+    public function ResetContainer(int $Type, float $Liters): bool { return $this->pcManage('resetContainer', ['type' => $Type, 'liters' => $Liters]); }
+    public function SetRelayName(int $Index, string $Name): bool { return $this->pcManage('setRelayName', ['index' => $Index, 'name' => $Name]); }
+    public function SendSchedule(): bool                        { return $this->pcManage('sendSchedule'); }
+    public function ClearErrors(): bool                         { return $this->pcManage('clearErrors'); }
+    /** Geraeteuhr stellen; Unix<=0 = jetzt. */
+    public function SetDeviceTime(int $Unix = 0): bool          { return $this->pcManage('setDeviceTime', $Unix > 0 ? ['unix' => $Unix] : []); }
+    /** Dosier-Sollwerte/-Grenzen; ConfigJson-Shape wie getDosageConfig(type) liefert. */
+    public function SetDosageConfig(int $Type, string $ConfigJson): bool
+    {
+        $cfg = json_decode($ConfigJson, true);
+        if (!is_array($cfg)) { $this->LogMessage('HSPC.SetDosageConfig: ConfigJson ungueltig', KL_ERROR); return false; }
+        return $this->pcManage('setDosageConfig', ['type' => $Type, 'config' => $cfg]);
+    }
+
+    public function GetTruePoolTemp(): float
+    {
+        $v = $this->GetControlValue('TruePoolTemp');
+        if ($v === null && $this->GetIDForIdent('TruePoolTemp') !== false) { $v = @$this->GetValue('TruePoolTemp'); }
+        return (float) $v;
+    }
+
     public function GetConfigurationForm()
     {
         // Native Symcon-Konfiguration: Felder sind an Instanz-Properties gebunden

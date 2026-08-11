@@ -944,6 +944,33 @@ class IrrigationCircuit extends EntityModule
     // Konsolen-Formular (Notfall/Erstkonfiguration; Verwaltung sonst im LVB)
     // ==================================================================
 
+    // ==================================================================
+    // Oeffentliche Scripting-Prozeduren (-> HSIR_RunNow / _Stop …)
+    // Duenne Fassaden ueber SetControl/GetControlValue; realer Effekt nur bei Armed=true.
+    // ==================================================================
+
+    public function SetActive(bool $On): bool          { return $this->SetControl('Active', $On); }
+    public function SetAutomatic(bool $On): bool        { return $this->SetControl('Automatic', $On); }
+    public function SetDuration(int $Minutes): bool     { return $this->SetControl('Duration', $Minutes); }
+    public function SetSeasonalAdjust(int $Percent): bool { return $this->SetControl('SeasonalAdjust', $Percent); }
+    public function SetProgram(int $Program): bool      { return $this->SetControl('Program', $Program); }
+
+    /** Sofortlauf; 0 = konfigurierte Dauer. Umgeht Gates (explizit gewollt). */
+    public function RunNow(int $Minutes = 0): bool      { return $this->SetControl('Run', $Minutes); }
+    public function Stop(): bool                        { return $this->SetControl('Stop', 1); }
+
+    public function SetArmed(bool $Armed): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'setArmed', 'args' => ['armed' => $Armed]])), true);
+        return is_array($r) && (isset($r['armed']) ? (bool) $r['armed'] : (!empty($r['ok']) ? $Armed : false));
+    }
+
+    public function IsRunning(): bool     { return (bool) $this->GetControlValue('Running'); }
+    public function IsRainBlocked(): bool { return (bool) $this->GetControlValue('RainBlocked'); }
+    public function GetLastRun(): string  { return (string) $this->GetControlValue('LastRun'); }
+    /** Berechnete effektive Laufdauer (Basisdauer x Saison, inkl. Gates) in Minuten. */
+    public function GetEffectiveMinutes(): float { return round($this->effectiveSeconds() / 60, 1); }
+
     public function GetConfigurationForm()
     {
         $cfg   = $this->cfg();

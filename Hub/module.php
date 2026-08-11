@@ -172,6 +172,40 @@ class HomeSuiteHub extends EntityModule
      * laeuft im LiveViewBuilder. Baut auf form.json auf und spielt die aktuellen
      * Laufzeitwerte (Token, Hook-URL, Anzahl Entitaeten) ein.
      */
+    // ==================================================================
+    // Oeffentliche Scripting-Prozeduren (-> HSH_SetAutomationEnabled …)
+    // Globale Bedienung + duenne Manage-Fassaden (Szenen/Licht-Automatik/Rotation).
+    // ==================================================================
+
+    public function SetAutomationEnabled(bool $Enabled): bool { return $this->SetControl('AutomationEnabled', $Enabled); }
+    public function GetAutomationEnabled(): bool              { return (bool) $this->GetControlValue('AutomationEnabled'); }
+
+    /** Nordausrichtung (Grad); dreht alle Sonnenprofile additiv (Property+ApplyChanges+Rotation). */
+    public function SetNorthAlignment(float $Degrees): bool { return $this->SetControl('ShadeNorth', $Degrees); }
+    public function GetNorthAlignment(): float             { return (float) $this->GetControlValue('ShadeNorth'); }
+
+    public function ApplyLightScene(string $SceneId): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'lightSceneApply', 'args' => ['id' => $SceneId]])), true);
+        return is_array($r) && !empty($r['ok']);
+    }
+    public function ListLightScenes(): string { return $this->Manage(json_encode(['op' => 'lightSceneList'])); }
+
+    /** Licht-Automatik an/aus OHNE die Regeln zu verlieren (liest sie erst und schreibt sie zurueck). */
+    public function SetLightAutomationEnabled(bool $Enabled): bool
+    {
+        $g = json_decode($this->Manage(json_encode(['op' => 'lightAutoGet'])), true);
+        $rules = (is_array($g) && isset($g['rules']) && is_array($g['rules'])) ? $g['rules'] : [];
+        $r = json_decode($this->Manage(json_encode(['op' => 'lightAutoSet', 'args' => ['enabled' => $Enabled, 'rules' => $rules]])), true);
+        return is_array($r) && !empty($r['ok']);
+    }
+
+    /** Additive Rotation aller Sonnenprofile (Wartung); liefert das Manage-JSON. */
+    public function RotateSunProfiles(float $DeltaDeg): string
+    {
+        return $this->Manage(json_encode(['op' => 'rotateSun', 'args' => ['deltaDeg' => $DeltaDeg]]));
+    }
+
     public function GetConfigurationForm()
     {
         $form = [];

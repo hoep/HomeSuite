@@ -1116,6 +1116,44 @@ class ShadingDevice extends EntityModule
      * aktuellen Store-Bindung vorbelegt; „Bindung uebernehmen" ruft configureDriver.
      * Sicherheits-Schwellen und Sonnenprofil kommen aus den geteilten Profilen.
      */
+    // ==================================================================
+    // Oeffentliche Scripting-Prozeduren (-> HSSH_SetPosition / _Move …)
+    // Duenne Fassaden ueber SetControl/GetControlValue; realer Effekt nur bei Armed=true.
+    // ==================================================================
+
+    public function SetPosition(int $Percent): bool { return $this->SetControl('Position', $Percent); }
+
+    /** Richtung: up|auf|1 / down|ab|zu|2 / stop|0. */
+    public function Move(string $Direction): bool
+    {
+        $map = ['up' => 1, 'auf' => 1, '1' => 1, 'down' => 2, 'ab' => 2, 'zu' => 2, '2' => 2, 'stop' => 0, '0' => 0];
+        $k = strtolower(trim($Direction));
+        if (!isset($map[$k])) { $this->LogMessage("HSSH.Move: unbekannte Richtung '{$Direction}'", KL_ERROR); return false; }
+        return $this->SetControl('Movement', $map[$k]);
+    }
+    public function MoveUp(): bool   { return $this->SetControl('Movement', 1); }
+    public function MoveDown(): bool { return $this->SetControl('Movement', 2); }
+    public function MoveStop(): bool { return $this->SetControl('Movement', 0); }
+
+    public function SetMode(int $Mode): bool             { return $this->SetControl('Mode', $Mode); }
+    public function SetPlan(int $Plan): bool             { return $this->SetControl('Plan', $Plan); }
+    public function SetSeason(int $Season): bool         { return $this->SetControl('Season', $Season); }
+    public function SetSunAzimuthBegin(int $Deg): bool   { return $this->SetControl('SunAzBgn', $Deg); }
+    public function SetSunAzimuthEnd(int $Deg): bool     { return $this->SetControl('SunAzEnd', $Deg); }
+    public function SetSunElevation(int $Deg): bool      { return $this->SetControl('SunElev', $Deg); }
+
+    /** Scharf/Schatten (Cutover). Achtung: schaltet reale Rollo-Telegramme frei. */
+    public function SetArmed(bool $Armed): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'setArmed', 'args' => ['armed' => $Armed]])), true);
+        return is_array($r) && (isset($r['armed']) ? (bool) $r['armed'] : (!empty($r['ok']) ? $Armed : false));
+    }
+
+    public function GetPosition(): int       { return (int) $this->GetControlValue('Position'); }
+    public function GetActualPosition(): int { return (int) $this->GetControlValue('ActualPosition'); }
+    public function GetMode(): int           { return (int) $this->GetControlValue('Mode'); }
+    public function IsOnline(): bool         { return (bool) $this->GetControlValue('Online'); }
+
     public function GetConfigurationForm()
     {
         $cfg = $this->cfg();

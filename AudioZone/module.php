@@ -1059,6 +1059,65 @@ class AudioZone extends EntityModule
     // Konsolen-Formular (Notfall/Diagnose; Verwaltung sonst im LVB)
     // ==================================================================
 
+    // ==================================================================
+    // Oeffentliche Scripting-Prozeduren (-> HSAU_Play / _SetVolume …)
+    // Gilt via Vererbung identisch fuer AudioZoneBridged (HSAUX_).
+    // Audio ist scharf (armed=true) -> Setter wirken real.
+    // ==================================================================
+
+    public function Play(): bool         { return $this->SetControl('Transport', self::TR_PLAY); }
+    public function Pause(): bool        { return $this->SetControl('Transport', self::TR_PAUSE); }
+    public function StopPlayback(): bool { return $this->SetControl('Transport', self::TR_STOP); }
+    public function Next(): bool         { return $this->SetControl('Transport', self::TR_NEXT); }
+    public function Previous(): bool     { return $this->SetControl('Transport', self::TR_PREV); }
+
+    public function SetVolume(int $Percent): bool { return $this->SetControl('Volume', $Percent); }
+    public function SetMute(bool $On): bool       { return $this->SetControl('Mute', $On); }
+    public function SetPower(bool $On): bool      { return $this->SetControl('Power', $On); }
+    public function SetRepeat(int $Mode): bool    { return $this->SetControl('Repeat', $Mode); }
+    public function SetShuffle(bool $On): bool    { return $this->SetControl('Shuffle', $On); }
+    public function Seek(int $Percent): bool      { return $this->SetControl('Position', $Percent); }
+
+    public function PlayFavorite(int $Index): bool { return $this->SetControl('SourceFavorite', $Index); }
+    public function PlayRadio(int $Index): bool    { return $this->SetControl('SourceRadio', $Index); }
+    public function PlayPlaylist(int $Index): bool { return $this->SetControl('SourcePlaylist', $Index); }
+
+    /** Werbefreier HQ-Direktstream (Sender-Key). */
+    public function PlayDirectRadio(string $StationKey): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'playDirect', 'args' => ['station' => $StationKey]])), true);
+        return is_array($r) && !empty($r['ok']);
+    }
+    public function SetSleep(int $Minutes): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'setSleep', 'args' => ['minutes' => $Minutes]])), true);
+        return is_array($r) && !empty($r['ok']);
+    }
+    public function CancelSleep(): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'cancelSleep'])), true);
+        return is_array($r) && !empty($r['ok']);
+    }
+    public function SetGroupVolume(int $Percent): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'setGroupVolume', 'args' => ['volume' => $Percent]])), true);
+        return is_array($r) && !empty($r['ok']);
+    }
+    public function Ungroup(): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'ungroup'])), true);
+        return is_array($r) && !empty($r['ok']);
+    }
+    public function SetArmed(bool $Armed): bool
+    {
+        $r = json_decode($this->Manage(json_encode(['op' => 'setArmed', 'args' => ['armed' => $Armed]])), true);
+        return is_array($r) && (isset($r['armed']) ? (bool) $r['armed'] : (!empty($r['ok']) ? $Armed : false));
+    }
+
+    public function GetVolume(): int  { return (int) $this->GetControlValue('Volume'); }
+    public function IsPlaying(): bool { return (bool) $this->GetControlValue('PlayState'); }
+    public function IsOnline(): bool  { return (bool) $this->GetControlValue('Online'); }
+
     public function GetConfigurationForm()
     {
         $cfg = $this->cfg();
