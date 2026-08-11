@@ -1169,6 +1169,13 @@ abstract class EntityModule extends \IPSModule
                     break;
             }
 
+            // RegisterVariable benennt nur beim ANLEGEN. Damit Manifest-Label-Aenderungen auch bei
+            // BESTEHENDEN Variablen greifen (z. B. korrigierte Regel-Feldnamen), Namen nachziehen (idempotent).
+            $vid = @$this->GetIDForIdent($c->ident);
+            if ($vid && $c->label !== '' && @IPS_GetName($vid) !== $c->label) {
+                @IPS_SetName($vid, $c->label);
+            }
+
             // F5: JEDES actionable Control (command inklusive) bekommt EnableAction.
             if ($c->actionable) {
                 $this->EnableAction($c->ident);

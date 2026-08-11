@@ -76,6 +76,18 @@ class PoolController extends EntityModule
         'Pumpe pH plus', 'Scheinwerfer', 'Photovoltaik', 'Relais 8',
     ];
 
+    // --- Regel-Feldlayouts + Enums (Protokoll-Wahrheit, PROTOCOLS.md:95-98/:170-174) ---
+    // Der PoolClient kapselt getRules/setRules generisch; die semantische Feldbelegung je
+    // Sektion liegt hier im UI-Editor (nicht im Transport-Client).
+    private const TEMPC_DEFAULT   = [0, 0, 0, 0, 0, 0, 255, 0, 0, 0];                    // PROTOCOLS.md:174
+    private const ADCC_DEFAULT    = [0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 10]; // PROTOCOLS.md:174
+    private const SWITCHC_DEFAULT = [0, 0, 0, 0, 0, 0];                                  // PROTOCOLS.md:174
+    private const RULE_LOGIC      = ['<', '<=', '==', '>', '>='];                        // PROTOCOLS.md:171
+    private const SWITCHC_FUNC    = ['NORMAL', 'STEP', 'IMPULSE', 'IMPULSE_RESET'];      // PROTOCOLS.md:98/:173
+
+    /** Instanz-Cache der tabellengetriebenen Konfig-Variablen-Map ($CFGVARS). */
+    private ?array $cfgVarsCache = null;
+
     // ==================================================================
     // Manifest
     // ==================================================================
@@ -87,6 +99,23 @@ class PoolController extends EntityModule
         $R = function (string $ident, string $label, int $varType, string $profile = '') {
             return ['ident' => $ident, 'type' => ControlContract::T_REFLECT, 'role' => 'pool:reflect',
                 'label' => $label, 'varType' => $varType, 'profile' => $profile, 'actionable' => false];
+        };
+
+        // Schreibbare Konfig-Variable (EnableAction). varType bestimmt den Control-Typ:
+        // 0=bool -> switch, 2=float / 1=int -> setpoint (keine min/max -> kein Clamping),
+        // 3=string -> select mit leerem Optionsset (coerce reicht den String durch;
+        // optimistic=false, damit der Dispatch keinen SetValue mit falschem Typ versucht).
+        $CFG = function (string $ident, string $label, int $varType, string $profile = '') {
+            $type = $varType === 0
+                ? ControlContract::T_SWITCH
+                : ($varType === 3 ? ControlContract::T_SELECT : ControlContract::T_SETPOINT);
+            $d = ['ident' => $ident, 'type' => $type, 'role' => 'pool:cfg', 'label' => $label,
+                'varType' => $varType, 'profile' => $profile, 'actionable' => true];
+            if ($varType === 3) {
+                $d['options']    = [];
+                $d['optimistic'] = false;
+            }
+            return $d;
         };
 
         $controls = [
@@ -103,9 +132,9 @@ class PoolController extends EntityModule
             $R('TempPumpHousing', 'Pumpe (Gehaeuse)', 2, '~Temperature'),
             // --- Wasserchemie ---
             $R('PH', 'pH-Wert', 2, 'HSPC.pH'),
-            $R('PHTarget', 'pH Sollwert', 2, 'HSPC.pH'),
+            $CFG('PHTarget', 'pH Sollwert', 2, 'HSPC.pH'),        // schreibbar (setDosageFull type=1)
             $R('Redox', 'Redox', 2, 'HSPC.Redox'),
-            $R('RedoxTarget', 'Redox Sollwert', 2, 'HSPC.Redox'),
+            $CFG('RedoxTarget', 'Redox Sollwert', 2, 'HSPC.Redox'), // schreibbar (setDosageFull type=0)
             // --- Hydraulik ---
             $R('Pressure', 'Kesseldruck', 2, 'HSPC.Pressure'),
             $R('FlowVolume', 'Durchfluss (Volumen)', 2, 'HSPC.Flow'),
@@ -124,6 +153,19 @@ class PoolController extends EntityModule
         $controls[] = $R('PHMinusDosing', 'pH-minus dosiert gerade', 0, '~Switch');
         $controls[] = $R('PHPlusDosing', 'pH-plus dosiert gerade', 0, '~Switch');
 
+        // --- Dosier-Laufzeit (read-only, aus GetDos.csv; Spalten PROTOCOLS.md:60-70) ---
+        // Als Float gefuehrt (HSPC.Seconds ist ein Float-Profil), Prefixe wie *Dosing.
+        foreach ([['Cl', 'Chlor'], ['PHMinus', 'pH-minus'], ['PHPlus', 'pH-plus']] as [$p, $lbl]) {
+            $controls[] = $R($p . 'DosRemain', $lbl . ' Restzeit (manuell)', 2, 'HSPC.Seconds');    // col3
+            $controls[] = $R($p . 'DosNextCycle', $lbl . ' naechster Zyklus', 2, 'HSPC.Seconds');   // col6
+            $controls[] = $R($p . 'DosDurCur', $lbl . ' aktuelle Dauer', 2, 'HSPC.Seconds');        // col4
+            $controls[] = $R($p . 'DosDurTotal', $lbl . ' Gesamt-Dauer', 2, 'HSPC.Seconds');        // col5
+            $controls[] = $R($p . 'DosConsumed', $lbl . ' Dosis-Verbrauch', 2, 'HSPC.Milliliter');  // col4*FLOW
+        }
+        $controls[] = $R('ClPoleReversal', 'Chlor Salz-Umpolung', 2, 'HSPC.Seconds');               // col7, nur Cl
+        // pH+ Sollwert (Auto-Schalter DosingPHPAuto siehe $SW-Block) — schreibbar (setDosageFull type=2)
+        $controls[] = $CFG('PHPlusTarget', 'pH-plus Sollwert', 2, 'HSPC.pH');
+
         // --- Automatik-Schalter (schaltbar, gated) ---
         $SW = function (string $ident, string $label) {
             return ['ident' => $ident, 'type' => ControlContract::T_SWITCH, 'role' => 'pool:auto',
@@ -131,6 +173,7 @@ class PoolController extends EntityModule
         };
         $controls[] = $SW('DosingClAuto', 'Dosierautomatik Redox');   // Geraete-Dosierung Cl/Redox ein/aus
         $controls[] = $SW('DosingPHAuto', 'Dosierautomatik pH');      // Geraete-Dosierung pH-minus ein/aus
+        $controls[] = $SW('DosingPHPAuto', 'Dosierautomatik pH-plus'); // Geraete-Dosierung pH+ (PHPCNTRL) ein/aus
         $controls[] = $SW('CircAuto', 'Umwaelzautomatik');            // automatische Filterzeit scharf
 
         // --- Relais: Ist-Zustand (reflect) + Modus Auto/Manuell Aus/Manuell Ein (schaltbar) ---
@@ -158,6 +201,27 @@ class PoolController extends EntityModule
         $controls[] = $R('ErrorCount', 'Fehleranzahl', 1);
         $controls[] = $R('ErrorText', 'Fehler/Meldungen', 3);
         $controls[] = $R('LinkOK', 'Verbindung', 0, '~Switch');
+
+        // --- Tabellengetriebene, schreibbare Konfig-Variablen (skalare + Regel-Sektionen) ---
+        // Aus der zentralen $CFGVARS-Map generiert. Die Regel-Sektionen (tempc/adcc/switchc)
+        // sind vollstaendig enthalten: je Regelindex x Feld eine schreibbare Variable
+        // (EnableAction). Dispatch via writeRuleField, Ist-Spiegel via spiegelRules().
+        // Bereits vorhandene Idents (Sollwerte/Auto-Schalter) werden uebersprungen.
+        $existing = ['RedoxTarget' => 1, 'PHTarget' => 1, 'PHPlusTarget' => 1,
+            'DosingClAuto' => 1, 'DosingPHAuto' => 1, 'DosingPHPAuto' => 1];
+        $scalarGrps = ['rdx' => 1, 'ph' => 1, 'sensor' => 1, 'network' => 1, 'other' => 1,
+            'email' => 1, 'contacts' => 1, 'dtc' => 1, 'cal' => 1,
+            'tempc' => 1, 'adcc' => 1, 'switchc' => 1];
+        foreach ($this->cfgVars() as $ident => $e) {
+            if (!isset($scalarGrps[$e['grp']]) || isset($existing[$ident])) {
+                continue;
+            }
+            if (!empty($e['ro'])) {
+                $controls[] = $R($ident, $e['label'], $e['vt'], $e['profile']); // read-only Reflect
+                continue;
+            }
+            $controls[] = $CFG($ident, $e['label'], $e['vt'], $e['profile']);
+        }
 
         return [
             'domain'   => 'pool',
@@ -195,7 +259,37 @@ class PoolController extends EntityModule
                 ['op' => 'setDeviceTime',       'label' => 'Geraeteuhr stellen (schreibt)'],
                 ['op' => 'setRelayName',        'label' => 'Relaisname setzen (schreibt)'],
                 ['op' => 'setDtc',              'label' => 'Alarm-Matrix setzen (schreibt)'],
+                ['op' => 'setDtcField',         'label' => 'Alarm-Meldestufe eines Codes setzen (RMW, schreibt)'],
                 ['op' => 'setSensorConfig',     'label' => 'Sensor-Konfig setzen (schreibt)'],
+                // --- Dosierung voll (S3, RMW) ---
+                ['op' => 'setDosageFull',       'label' => 'Dosier-Regler VOLL konfigurieren (schreibt, RMW)'],
+                // --- Temperatur-/Solar-Regeln TEMPC (S4) ---
+                ['op' => 'getTempRule',         'label' => 'Temperaturregel lesen (TEMPC)'],
+                ['op' => 'setTempRule',         'label' => 'Temperaturregel setzen (schreibt)'],
+                // --- Analog-/Digital-IO-Regeln ADCC/SWITCHC (S5) ---
+                ['op' => 'getAdccRule',         'label' => 'Analog-Regel lesen (ADCC)'],
+                ['op' => 'setAdccRule',         'label' => 'Analog-Regel setzen (schreibt)'],
+                ['op' => 'getSwitchcRule',      'label' => 'Digital-IO-Regel lesen (SWITCHC)'],
+                ['op' => 'setSwitchcRule',      'label' => 'Digital-IO-Regel setzen (schreibt)'],
+                // --- Sensor-Konfig Einzelkanal-RMW + Rechenhelfer (S6) ---
+                ['op' => 'setSensorChannel',    'label' => 'Sensor-Einzelkanal setzen (RMW, schreibt)'],
+                ['op' => 'calcImpulseGain',     'label' => 'Impulszaehler-Gain berechnen'],
+                ['op' => 'calcGainOffset',      'label' => 'ADC 2-Punkt-Gain/Offset berechnen'],
+                // --- Netzwerk RMW (S7) ---
+                ['op' => 'setNetworkFields',    'label' => 'Netzwerk setzen (RMW, schreibt)'],
+                // --- Alarme/EMAIL/CONTACTS/OTHER (S8) ---
+                ['op' => 'getEmail',            'label' => 'E-Mail/Alarm-Konfiguration lesen'],
+                ['op' => 'getContacts',         'label' => 'Kontakte lesen'],
+                ['op' => 'getOther',            'label' => 'Sonstiges (Zeitzone/Ext-Relais/Durchfluss) lesen'],
+                ['op' => 'setEmailAccount',     'label' => 'E-Mail-Konto/Alarm-Mail setzen (schreibt)'],
+                ['op' => 'setEmailServer',      'label' => 'SMTP-Server setzen (schreibt)'],
+                ['op' => 'setContacts',         'label' => 'Kontakte setzen (schreibt)'],
+                ['op' => 'sendTestMail',        'label' => 'Test-Mail senden (schreibt/loest aus)'],
+                ['op' => 'setOther',            'label' => 'Sonstiges setzen (schreibt)'],
+                // --- Kalibrierung (Messkette! Doppel-Gate: Armed + CalibrationAllowed) ---
+                ['op' => 'getCal',              'label' => 'Kalibrierung lesen (Diagnose)'],
+                ['op' => 'setHwCal',            'label' => 'ADC-Hardware-Kalibrierung setzen (Messkette! Freigabe)'],
+                ['op' => 'setRdxPhCal',         'label' => 'Elektroden-Kalibrierung setzen (Messkette! Freigabe)'],
                 ['op' => 'setArmed',            'label' => 'Scharfschalten / Schatten-Modus'],
             ],
             'capabilities' => [
@@ -251,10 +345,17 @@ class PoolController extends EntityModule
         $this->RegisterPropertyInteger('MaxStaleSeconds', 1800);
         // Umwälz-Wochenplan: welche TIMEC-Regel steuert die Filterpumpe
         $this->RegisterPropertyInteger('FilterRuleIndex', 0);
+        // Umwaelz-Wochenplan: Anzahl TIMEC-Regeln (ab FilterRuleIndex), eine je Wochentag-Gruppe.
+        $this->RegisterPropertyInteger('FilterRuleCount', 4);
         // Umwaelzautomatik: Startzeit des automatischen Filterfensters (Min ab Mitternacht)
         $this->RegisterPropertyInteger('CircWindowStart', 480);
         // Scharfschalten (reale Schreibzugriffe)
         $this->RegisterPropertyBoolean('Armed', false);
+        // Extra-Gate: Kalibrierung schreibt in die Messkette -> nur mit ausdruecklicher Freigabe.
+        $this->RegisterPropertyBoolean('CalibrationAllowed', false);
+        // Alarm-/DTC-Codes, fuer die je eine schreibbare Meldestufe-Variable (DtcLevel<code>)
+        // erzeugt wird. Komma-separierte Liste (z.B. '3,7,12'); leer = keine DTC-Variablen.
+        $this->RegisterPropertyString('DtcCodes', '');
     }
 
     /** Bindungs-Link (Baum-Transparenz) auf den externen In-Pool-Sensor. */
@@ -274,6 +375,7 @@ class PoolController extends EntityModule
 
     public function ApplyChanges()
     {
+        $this->cfgVarsCache = null;    // CFGVARS-Map neu aufbauen (DtcCodes kann sich geaendert haben)
         $this->ensureProfiles();       // MUSS vor registerControls (parent) laufen
         parent::ApplyChanges();
 
@@ -290,7 +392,7 @@ class PoolController extends EntityModule
         if ($eid > 0) {
             $rt = $this->readRt();
             if (($rt['schedHash'] ?? '') === '') {
-                $rt['schedHash'] = md5(json_encode($this->ruleFromEvent($eid)));
+                $rt['schedHash'] = md5(json_encode($this->groupsFromEvent($eid)));
                 $this->writeRt($rt);
             }
         }
@@ -364,6 +466,28 @@ class PoolController extends EntityModule
         @$this->SetValue('PHMinusDosing', $relOn(3));
         @$this->SetValue('PHPlusDosing', $relOn(4));
 
+        // --- Dosier-Laufzeit aus GetDos.csv (Spalten PROTOCOLS.md:60-70), jeder Poll ---
+        // Ergaenzt (ersetzt NICHT) die relais-bit-basierten *Dosing-Vars oben.
+        $dos = $client->getDos();
+        if (!empty($dos['ok'])) {
+            $rtDos = $this->readRt();
+            $flow  = $rtDos['flow'] ?? [];   // FLOW-Verhaeltnisse aus der 300s-Config-Lesung (s.u.)
+            foreach ([0 => 'Cl', 1 => 'PHMinus', 2 => 'PHPlus'] as $row => $p) {
+                $d = PoolClient::dosRow($dos, $row);
+                @$this->SetValue($p . 'DosRemain', (float) $d['remaining']);
+                @$this->SetValue($p . 'DosNextCycle', (float) $d['nextCycle']);
+                @$this->SetValue($p . 'DosDurCur', (float) $d['actualDur']);
+                @$this->SetValue($p . 'DosDurTotal', (float) $d['totalDur']);
+                // Verbrauch ml = actualDur * (FLOW_ML/FLOW_SEC); nur wenn FLOW-Cache vorhanden.
+                $fl = $flow[$row] ?? null;
+                if (is_array($fl) && (int) ($fl['sec'] ?? 0) > 0) {
+                    @$this->SetValue($p . 'DosConsumed',
+                        $this->r2($d['actualDur'] * ((float) $fl['ml'] / (int) $fl['sec'])));
+                }
+            }
+            @$this->SetValue('ClPoleReversal', (float) PoolClient::dosRow($dos, 0)['poleReversal']); // nur Cl/Salz
+        }
+
         // System
         @$this->SetValue('Firmware', (string) ($st['firmware'] ?? ''));
         @$this->SetValue('StatusFlag', (int) ($st['statusFlag'] ?? 0));
@@ -379,6 +503,14 @@ class PoolController extends EntityModule
                 $rt['errTs'] = time();
                 $this->writeRt($rt);
             }
+        }
+
+        // Regel-Sensor-/Eingangsprofile mit Live-Namen nachziehen (gedrosselt: alle 3600 s).
+        if (time() - (int) ($rt['sensTs'] ?? 0) > 3600) {
+            $this->refreshRuleSensorProfiles($client);
+            $rt = $this->readRt();
+            $rt['sensTs'] = time();
+            $this->writeRt($rt);
         }
 
         // --- Durchfluss-abhaengige TruePoolTemp-Fusion (Nutzer-Anforderung #2) ---
@@ -414,10 +546,12 @@ class PoolController extends EntityModule
         // Programmierte Filterzeit = Summe der Fenster der Filter-Regel (aus Wochenplan-Event).
         $eidP = $this->scheduleEventId();
         if ($eidP > 0) {
-            $stP = $this->ruleFromEvent($eidP);
+            $groupsP = $this->groupsFromEvent($eidP);
             $sumP = 0;
-            foreach (($stP['windows'] ?? []) as $wP) {
-                $sumP += max(0, (int) $wP[1] - (int) $wP[0]);
+            foreach ($groupsP as $gP) {
+                foreach ($gP['windows'] as $wP) {
+                    $sumP += max(0, (int) $wP[1] - (int) $wP[0]);
+                }
             }
             @$this->SetValue('ProgFilterMin', $sumP);
         }
@@ -428,6 +562,7 @@ class PoolController extends EntityModule
             if ($cl !== null) {
                 $rdx = $cl->getDosageConfig(0);
                 $phm = $cl->getDosageConfig(1);
+                $php = $cl->getDosageConfig(2); // pH+ = PHPCNTRL
                 if (!empty($rdx['ok'])) {
                     @$this->SetValue('RedoxTarget', $this->r2((float) ($rdx['config']['target'] ?? 0)));
                     @$this->SetValue('DosingClAuto', (bool) ($rdx['config']['enabled'] ?? false));
@@ -436,11 +571,32 @@ class PoolController extends EntityModule
                     @$this->SetValue('PHTarget', $this->r2((float) ($phm['config']['target'] ?? 0)));
                     @$this->SetValue('DosingPHAuto', (bool) ($phm['config']['enabled'] ?? false));
                 }
+                if (!empty($php['ok'])) {
+                    @$this->SetValue('PHPlusTarget', $this->r2((float) ($php['config']['target'] ?? 0)));
+                    @$this->SetValue('DosingPHPAuto', (bool) ($php['config']['enabled'] ?? false));
+                }
+                // Vollstaendiger Ist-Spiegel aller schreibbaren Dosier-Konfig-Variablen.
+                $this->spiegelDosage(0, $rdx);
+                $this->spiegelDosage(1, $phm);
+                $this->spiegelDosage(2, $php);
+                // FLOW-Verhaeltnisse fuer GetDos-Verbrauch cachen (Cl: flowValue/flowTime; pH: flowMl/flowSec).
+                // EIN readRt/writeRt in diesem Block (kein zweites), damit opTick nicht ueberschrieben wird.
                 $rt = $this->readRt();
+                $rt['flow'] = [
+                    0 => ['ml' => (float) ($rdx['config']['flowValue'] ?? 0), 'sec' => (int) ($rdx['config']['flowTime'] ?? 0)],
+                    1 => ['ml' => (float) ($phm['config']['flowMl'] ?? 0), 'sec' => (int) ($phm['config']['flowSec'] ?? 0)],
+                    2 => ['ml' => (float) ($php['config']['flowMl'] ?? 0), 'sec' => (int) ($php['config']['flowSec'] ?? 0)],
+                ];
                 $rt['dosTs'] = time();
                 $this->writeRt($rt);
             }
         }
+
+        // Ist-Spiegel der uebrigen skalaren Konfig-Sektionen (je eigene Drossel).
+        $this->spiegelSensorCfg();  // ADC/BNC/1-Wire/IO (300s)
+        $this->spiegelNetOther();   // Netzwerk + OTHER (300s)
+        $this->spiegelMiscCfg();    // E-Mail/SMTP/Kontakte/DTC/Kalibrierung (900s)
+        $this->spiegelRules();      // TEMPC/ADCC/SWITCHC Regel-Felder (300s)
     }
 
     /**
@@ -538,6 +694,15 @@ class PoolController extends EntityModule
         return (is_int($eid) && $eid > 0) ? $eid : 0;
     }
 
+    /** Regel-Indizes, die dem Filter-Wochenplan gehoeren (zusammenhaengendes Budget, 0..15). */
+    private function filterRuleIndices(): array
+    {
+        $base = max(0, min(15, (int) $this->ReadPropertyInteger('FilterRuleIndex')));
+        $cnt  = max(1, (int) $this->ReadPropertyInteger('FilterRuleCount'));
+        $cnt  = min($cnt, 16 - $base); // nie ueber Index 15 hinaus (TIMEC count=16)
+        return range($base, $base + $cnt - 1);
+    }
+
     /** Symcon-Tagesmaske (Bit0=Mo..Bit6=So) -> Controller-Maske (Bit0=So,Bit1=Mo..Bit6=Sa). */
     private static function symconToCtrlDays(int $sym): int
     {
@@ -552,13 +717,16 @@ class PoolController extends EntityModule
         return $r;
     }
 
-    /** Liest das Wochenplan-Ereignis und leitet {days(sym), windows:[[start,end]..]} ab. */
-    private function ruleFromEvent(int $eid): array
+    /**
+     * Liest das Wochenplan-Ereignis und liefert JE Wochenplan-GRUPPE mit Ein-Fenster
+     * einen Satz {days(sym), windows:[[start,end]..max4]}. KEINE Zusammenfassung mehr —
+     * jede Wochentag-Gruppe wird zu einer eigenen TIMEC-Regel (S2).
+     */
+    private function groupsFromEvent(int $eid): array
     {
         $e = @\IPS_GetEvent($eid);
         $groups = is_array($e) ? ($e['ScheduleGroups'] ?? []) : [];
-        $days = 0;
-        $windows = [];
+        $out = [];
         foreach ($groups as $g) {
             $pts = $g['Points'] ?? [];
             if (!$pts) {
@@ -575,6 +743,12 @@ class PoolController extends EntityModule
                 $min = (int) ($p['Start']['Hour'] ?? 0) * 60 + (int) ($p['Start']['Minute'] ?? 0);
                 $a = (int) ($p['ActionID'] ?? 0);
                 if ($a === 1) {
+                    // Angrenzendes "Ein" (neues Ein, waehrend schon offen): das vorherige Fenster
+                    // HIER schliessen und ein neues oeffnen -> zwei beruehrende Fenster bleiben
+                    // getrennt (Zeit1-4 exakt wie in der Original-UI), statt zu verschmelzen.
+                    if ($open !== null && $min > $open) {
+                        $local[] = [$open, $min];
+                    }
                     $open = $min;
                     $hasEin = true;
                 } elseif ($a === 0 && $open !== null) {
@@ -585,14 +759,13 @@ class PoolController extends EntityModule
             if ($open !== null) {
                 $local[] = [$open, 1439];
             }
-            if ($hasEin) {
-                $days |= (int) ($g['Days'] ?? 0);
-                if (!$windows) {
-                    $windows = $local;
-                }
+            if ($hasEin && $local) {
+                $out[] = ['days' => (int) ($g['Days'] ?? 0), 'windows' => array_slice($local, 0, 4)];
             }
         }
-        return ['days' => $days, 'windows' => array_slice($windows, 0, 4)];
+        // Deterministische Reihenfolge => stabiler schedHash unabhaengig von Gruppen-Sortierung.
+        usort($out, static fn($a, $b) => ($a['days'] <=> $b['days']));
+        return $out;
     }
 
     /** Baut die 15-Werte-TIMEC-Regel aus {days,windows}. */
@@ -615,19 +788,35 @@ class PoolController extends EntityModule
         return $rule;
     }
 
-    /** Schreibt die Filter-Regel in den Controller (ersetzt nur FilterRuleIndex). Gated durch Aufrufer. */
-    private function writeFilterRule(array $st): array
+    /**
+     * Schreibt je Wochentag-Gruppe eine Filter-Regel in die Budget-Slots; ungenutzte Slots
+     * werden geleert. Regeln ausserhalb des Budgets bleiben unangetastet (RMW). Gated durch
+     * Aufrufer/writeGuarded. Bei fehlgeschlagenem Basis-Read wird ABGEBROCHEN (kein Nullen
+     * fremder Regeln mit leerer Basis).
+     */
+    private function writeFilterRules(array $groups): array
     {
         $client = $this->client();
         if ($client === null) {
             return ['ok' => false, 'error' => 'not_configured'];
         }
-        $idx = (int) $this->ReadPropertyInteger('FilterRuleIndex');
-        return $this->writeGuarded('TIMEC', function () use ($client, $st, $idx) {
+        $slots = $this->filterRuleIndices();
+        return $this->writeGuarded('TIMEC', function () use ($client, $groups, $slots) {
             $cur = $client->getRules('TIMEC');
-            $rules = ($cur['ok'] ?? false) ? $cur['rules'] : [];
-            $rules[$idx] = $this->buildFilterRule($st);
-            return $client->setRules('TIMEC', $rules);
+            if (empty($cur['ok'])) {
+                return ['ok' => false, 'error' => 'read_before_write_failed'];
+            }
+            $rules = $cur['rules']; // 0..15 (RMW-Basis, Fremd-Regeln bleiben erhalten)
+            foreach ($slots as $k => $idx) {
+                $rules[$idx] = ($k < count($groups))
+                    ? $this->buildFilterRule($groups[$k])
+                    : array_fill(0, 15, 0); // Budget-Slot freigeben (ENA=0)
+            }
+            if (count($groups) > count($slots)) {
+                $this->SendDebug('HSPC.schedule',
+                    'Wochentag-Gruppen (' . count($groups) . ') > Regel-Budget (' . count($slots) . '); Rest verworfen', 0);
+            }
+            return $client->setRules('TIMEC', $rules); // setRules haengt TIMEC=1 selbst an
         });
     }
 
@@ -643,8 +832,8 @@ class PoolController extends EntityModule
         if ($eid === 0) {
             return;
         }
-        $st = $this->ruleFromEvent($eid);
-        $hash = md5(json_encode($st));
+        $groups = $this->groupsFromEvent($eid);
+        $hash = md5(json_encode($groups));
         $rt = $this->readRt();
         if ($hash === ($rt['schedHash'] ?? '')) {
             return; // unveraendert
@@ -653,11 +842,11 @@ class PoolController extends EntityModule
             $this->SendDebug('HSPC.schedule', 'Zeitplan-Aenderung ausstehend (nicht scharf)', 0);
             return; // Hash NICHT speichern -> wird bei Scharfschaltung geschrieben
         }
-        $res = $this->writeFilterRule($st);
+        $res = $this->writeFilterRules($groups);
         if (!empty($res['ok'])) {
             $rt['schedHash'] = $hash;
             $this->writeRt($rt);
-            $this->SendDebug('HSPC.schedule', 'Zeitplan an Controller geschrieben (' . count($st['windows']) . ' Fenster)', 0);
+            $this->SendDebug('HSPC.schedule', 'Zeitplan an Controller geschrieben (' . count($groups) . ' Gruppen)', 0);
         }
     }
 
@@ -754,12 +943,144 @@ class PoolController extends EntityModule
             $this->applyDosingEnable(1, (bool) $value);
             return;
         }
+        if ($c->ident === 'DosingPHPAuto') {
+            $this->applyDosingEnable(2, (bool) $value); // 2 = PHPCNTRL (pH+)
+            return;
+        }
         if ($c->ident === 'CircAuto') {
             // Reines Modul-Flag; die Automatik laeuft im Poll (circAdjust), nur bei armed.
             $this->SendDebug('HSPC.circ', 'Umwaelzautomatik ' . ((bool) $value ? 'AN' : 'AUS'), 0);
             return;
         }
+        // Tabellengetriebener Konfig-Dispatch: ident -> $CFGVARS -> gegatete mgmt-Op.
+        $cv = $this->cfgVars();
+        if (isset($cv[$c->ident]) && empty($cv[$c->ident]['ro'])) {
+            $this->dispatchCfgVar($c->ident, $cv[$c->ident], $value);
+            return;
+        }
         $this->SendDebug('HSPC.apply', $c->ident . ' unbehandelt', 0);
+    }
+
+    /**
+     * Dispatch einer schreibbaren Konfig-Variable: baut aus dem $CFGVARS-Eintrag die
+     * Argumentstruktur der zustaendigen (gegateten) mgmt-Op und ruft sie auf. Der
+     * Schreibpfad bleibt hinter dem Armed-Gate (bzw. Doppel-Gate bei Kalibrierung)
+     * der jeweiligen Op.
+     *
+     * @param mixed $value bereits per Control::coerce() gehaerteter Wert
+     */
+    private function dispatchCfgVar(string $ident, array $e, $value): void
+    {
+        $op    = (string) $e['op'];
+        $field = (string) $e['field'];
+        $grp   = (string) $e['grp'];
+
+        switch ($grp) {
+            case 'rdx':
+            case 'ph':
+                // Dosier-Config: bool-Felder als 0/1, sonst Wert direkt (Setter skaliert intern).
+                $v = is_bool($value) ? ((int) $value) : $value;
+                $this->mgmt('setDosageFull', ['type' => (int) $e['type'], $field => $v], []);
+                return;
+            case 'sensor':
+                $this->mgmt('setSensorChannel',
+                    ['kind' => (string) $e['kind'], 'index' => (int) $e['index'], 'patch' => [$field => $value]], []);
+                return;
+            case 'network':
+                $this->mgmt('setNetworkFields', ['fields' => [$field => $value]], []);
+                return;
+            case 'other':
+                $this->mgmt('setOther', ['other' => [$field => $value]], []);
+                return;
+            case 'email':
+                if ($op === 'setEmailServer') {
+                    $this->mgmt('setEmailServer', ['server' => [$field => $value]], []);
+                } else {
+                    $args = ['fields' => [$field => $value]];
+                    if ($e['index'] !== null) {
+                        $args['index'] = (int) $e['index'];
+                    }
+                    $this->mgmt('setEmailAccount', $args, []);
+                }
+                return;
+            case 'contacts':
+                $this->mgmt('setContacts', ['contacts' => [(int) $e['index'] => (string) $value]], []);
+                return;
+            case 'dtc':
+                $this->mgmt('setDtcField', ['code' => (int) $e['index'], 'level' => (int) $value], []);
+                return;
+            case 'cal':
+                [$ch, $param] = array_pad(explode('.', $field, 2), 2, '');
+                $this->mgmt($op, ['cal' => [$ch => [$param => (int) $value]]], []);
+                return;
+            case 'tempc':
+            case 'adcc':
+            case 'switchc':
+                $this->writeRuleField(strtoupper($grp), (int) $e['index'], $field, $value);
+                return;
+            default:
+                $this->SendDebug('HSPC.cfg', $ident . ' unbekannte Gruppe ' . $grp, 0);
+        }
+    }
+
+    /**
+     * Per-Feld-RMW-Overlay fuer eine Regel (TEMPC/ADCC/SWITCHC): liest die aktuelle
+     * Regel, ueberschreibt genau EINE Feldposition (mit Einheiten-/Enum-Umrechnung)
+     * und schreibt zurueck. Fremdregeln bleiben erhalten. Hinter Armed-Gate ('rules').
+     * (Wird von den generischen Regel-Konfig-Variablen genutzt; Manifest/Poll dafuer
+     * folgen in der Regel-Phase.)
+     *
+     * @param mixed $value
+     */
+    private function writeRuleField(string $section, int $ruleIndex, string $field, $value): array
+    {
+        $maps = [
+            'TEMPC'   => ['ena' => 0, 'rel' => 1, 'start' => 2, 'end' => 3, 'state' => 4,
+                'sens1' => 5, 'sens2' => 6, 'logic' => 7, 'diff' => 8, 'hyst' => 9],
+            'ADCC'    => ['ena' => 0, 'rel' => 1, 'state' => 2, 'drel' => 3, 'start' => 4, 'end' => 5,
+                'sens' => 6, 'logic' => 7, 'diff' => 8, 'hyst' => 9, 'cLow' => 10, 'lower' => 11,
+                'cHigh' => 12, 'upper' => 13, 'bad' => 14, 'good' => 15],
+            'SWITCHC' => ['ena' => 0, 'inp' => 1, 'rel' => 2, 'func' => 3, 'time' => 4, 'state' => 5],
+        ];
+        $defs = ['TEMPC' => self::TEMPC_DEFAULT, 'ADCC' => self::ADCC_DEFAULT, 'SWITCHC' => self::SWITCHC_DEFAULT];
+        if (!isset($maps[$section][$field])) {
+            return ['ok' => false, 'error' => 'bad_field'];
+        }
+        $pos  = $maps[$section][$field];
+        $bool = ['ena' => 1, 'state' => 1, 'cLow' => 1, 'cHigh' => 1];
+        return $this->gatedWrite('rules', 'cfg:' . $section . ':' . $field,
+            function ($cl) use ($section, $ruleIndex, $field, $value, $pos, $bool, $defs) {
+                $cur = $cl->getRules($section);
+                if (empty($cur['ok'])) {
+                    return ['ok' => false, 'error' => 'read_before_write_failed'];
+                }
+                $rules = $cur['rules'];
+                $def   = $defs[$section];
+                if ($section === 'TEMPC') {
+                    for ($i = 0; $i < 8; $i++) {
+                        if (!isset($rules[$i]) || array_sum(array_map('abs', $rules[$i])) === 0) {
+                            $rules[$i] = $def;
+                        }
+                    }
+                }
+                $rule = $rules[$ruleIndex] ?? $def;
+                if (array_sum(array_map('abs', $rule)) === 0) {
+                    $rule = $def;
+                }
+                if (isset($bool[$field])) {
+                    $conv = ((bool) $value) ? 1 : 0;
+                } elseif ($section === 'TEMPC' && ($field === 'diff' || $field === 'hyst')) {
+                    $conv = (int) round(((float) $value) * 100);
+                } elseif ($section === 'ADCC' && in_array($field, ['diff', 'hyst', 'lower', 'upper'], true)) {
+                    [$offs, $gain] = $this->adccSensorScale($cl, (int) $rule[6]);
+                    $conv = (int) round($gain != 0.0 ? ((float) $value - $offs) / $gain : 0.0);
+                } else {
+                    $conv = (int) round((float) $value);
+                }
+                $rule[$pos]        = $conv;
+                $rules[$ruleIndex] = $rule;
+                return $cl->setRules($section, $rules);
+            });
     }
 
     /** Geraete-Dosierung ein/aus (type 0=Cl/Redox, 1=pH-). Liest Konfig, setzt enabled, schreibt (gated). */
@@ -806,7 +1127,7 @@ class PoolController extends EntityModule
         if ($rem > 30) {
             $win[] = [0, min(1439, $rem)];
         }
-        $res = $this->writeFilterRule(['days' => 127, 'windows' => $win]);
+        $res = $this->writeFilterRules([['days' => 127, 'windows' => $win]]);
         if (!empty($res['ok'])) {
             $rt = $this->readRt();
             $rt['circTs'] = time();
@@ -974,11 +1295,15 @@ class PoolController extends EntityModule
                 if ($eid === 0) {
                     return ['ok' => false, 'error' => 'no_schedule_event'];
                 }
-                $st = $this->ruleFromEvent($eid);
+                $groups = $this->groupsFromEvent($eid);
                 $rt = $this->readRt();
-                return ['ok' => true, 'eventId' => $eid, 'ruleIndex' => (int) $this->ReadPropertyInteger('FilterRuleIndex'),
-                    'days' => $st['days'], 'windows' => $st['windows'], 'rule' => $this->buildFilterRule($st),
-                    'pending' => (md5(json_encode($st)) !== ($rt['schedHash'] ?? '')), 'armed' => (bool) $this->cfgVal('armed', false)];
+                return ['ok' => true, 'eventId' => $eid,
+                    'ruleIndices' => $this->filterRuleIndices(),
+                    'groups' => array_map(fn($g) => [
+                        'days' => $g['days'], 'windows' => $g['windows'], 'rule' => $this->buildFilterRule($g),
+                    ], $groups),
+                    'pending' => (md5(json_encode($groups)) !== ($rt['schedHash'] ?? '')),
+                    'armed' => (bool) $this->cfgVal('armed', false)];
             case 'sendSchedule':
                 $eid = $this->scheduleEventId();
                 if ($eid === 0) {
@@ -987,14 +1312,14 @@ class PoolController extends EntityModule
                 if (!$this->writeAllowed('sendSchedule')) {
                     return ['ok' => true, 'shadow' => true, 'note' => 'Schatten-Modus: nicht gesendet'];
                 }
-                $st = $this->ruleFromEvent($eid);
-                $res = $this->writeFilterRule($st);
+                $groups = $this->groupsFromEvent($eid);
+                $res = $this->writeFilterRules($groups);
                 if (!empty($res['ok'])) {
                     $rt = $this->readRt();
-                    $rt['schedHash'] = md5(json_encode($st));
+                    $rt['schedHash'] = md5(json_encode($groups));
                     $this->writeRt($rt);
                 }
-                return ['ok' => (bool) ($res['ok'] ?? false), 'windows' => $st['windows'], 'rule' => $this->buildFilterRule($st)];
+                return ['ok' => (bool) ($res['ok'] ?? false), 'groups' => $groups];
 
             // --- Konfiguration schreiben (gated) ---
             case 'setDosageConfig':
@@ -1016,6 +1341,72 @@ class PoolController extends EntityModule
                     fn($cl) => $cl->setDtc((array) ($args['dtc'] ?? []), (int) ($args['count'] ?? 70)));
             case 'setSensorConfig':
                 return $this->mgmtSetSensorConfig($args);
+
+            // --- Dosierung voll (S3) ---
+            case 'setDosageFull':
+                return $this->mgmtSetDosageFull($args);
+
+            // --- TEMPC (S4) ---
+            case 'getTempRule':
+                return $this->mgmtGetTempRule($args);
+            case 'setTempRule':
+                return $this->mgmtSetTempRule($args);
+
+            // --- ADCC / SWITCHC (S5) ---
+            case 'getAdccRule':
+                return $this->mgmtGetAdccRule($args);
+            case 'setAdccRule':
+                return $this->mgmtSetAdccRule($args);
+            case 'getSwitchcRule':
+                return $this->mgmtGetSwitchcRule($args);
+            case 'setSwitchcRule':
+                return $this->mgmtSetSwitchcRule($args);
+
+            // --- Sensor-Einzelkanal-RMW + Rechenhelfer (S6, calc ist ungated) ---
+            case 'setSensorChannel':
+                return $this->mgmtSetSensorChannel($args);
+            case 'calcImpulseGain':
+                $r = $this->calcImpulseGain((float) ($args['inputValue'] ?? 0), (float) ($args['diameter'] ?? 0),
+                    (int) ($args['sensorType'] ?? 0), (int) ($args['outputUnit'] ?? 0));
+                return ['ok' => ($r['gain'] != 0.0), 'gain' => $r['gain'], 'unit' => $r['unit'],
+                    'note' => ($r['gain'] == 0.0 ? 'Gain 0 — inputValue/diameter pruefen' : '')];
+            case 'calcGainOffset':
+                return $this->calcGainOffset((float) ($args['raw1'] ?? 0), (float) ($args['raw2'] ?? 0),
+                    (float) ($args['val1'] ?? 0), (float) ($args['val2'] ?? 0));
+
+            // --- Netzwerk RMW (S7) ---
+            case 'setNetworkFields':
+                return $this->mgmtSetNetworkFields($args);
+
+            // --- Alarme/EMAIL/CONTACTS/OTHER lesen (S8, ungated) ---
+            case 'getEmail':
+                return $this->withClient(fn($cl) => ['ok' => true, 'account' => $cl->getEmailAccount(), 'server' => $cl->getEmailServer()]);
+            case 'getContacts':
+                return $this->withClient(fn($cl) => $cl->getContacts());
+            case 'getOther':
+                return $this->withClient(fn($cl) => $cl->getOther());
+            case 'getCal':
+                return $this->withClient(fn($cl) => ['ok' => true, 'hwcal' => $cl->getHwCal(), 'rdxphcal' => $cl->getRdxPhCal()]);
+
+            // --- Alarme/EMAIL/CONTACTS/OTHER schreiben (S8, Armed-Gate) ---
+            case 'setEmailAccount':
+                return $this->mgmtSetEmailAccount($args);
+            case 'setEmailServer':
+                return $this->mgmtSetEmailServer($args);
+            case 'setContacts':
+                return $this->mgmtSetContacts($args);
+            case 'setDtcField':
+                return $this->mgmtSetDtcField($args);
+            case 'sendTestMail':
+                return $this->gatedWrite('email', 'sendTestMail', fn($cl) => $cl->sendTestMail((int) ($args['index'] ?? 0)));
+            case 'setOther':
+                return $this->mgmtSetOther($args);
+
+            // --- Kalibrierung (S8, Doppel-Gate: Armed + CalibrationAllowed) ---
+            case 'setHwCal':
+                return $this->gatedCalWrite('hwcal', 'setHwCal', fn($cl) => $cl->setHwCal((array) ($args['cal'] ?? [])));
+            case 'setRdxPhCal':
+                return $this->gatedCalWrite('rdxphcal', 'setRdxPhCal', fn($cl) => $cl->setRdxPhCal((array) ($args['cal'] ?? [])));
 
             case 'setArmed':
                 $this->setProps(['Armed' => (bool) ($args['armed'] ?? false)]);
@@ -1218,6 +1609,521 @@ class PoolController extends EntityModule
         });
     }
 
+    // ==================================================================
+    // S3 — Dosierung voll (RMW read-merge-write, Salz-Round-Trip entschaerft)
+    // ==================================================================
+
+    private function mgmtSetDosageFull(array $args): array
+    {
+        $type = (int) ($args['type'] ?? -1);
+        if ($type < 0 || $type > 2) {
+            return ['ok' => false, 'error' => 'bad_type'];
+        }
+        return $this->gatedWrite('dosage', 'setDosageFull', function ($cl) use ($type, $args) {
+            $cur = $cl->getDosageConfig($type);
+            if (empty($cur['ok'])) {
+                return ['ok' => false, 'error' => 'read_before_write_failed'];
+            }
+            $base = $cur['config'];
+            // Salz-Round-Trip (nur Cl, DTYPE=1): Getter liefert FLOW/MAXQUANT roh, Setter dividiert
+            // erneut durch 1.25*0.126 -> vor dem Merge in die Anzeige-Einheit zurueckrechnen.
+            if ($type === 0 && (int) ($args['cntrlType'] ?? ($base['cntrlType'] ?? 0)) === 1) {
+                $base['flowValue']   = (float) ($base['flowValue'] ?? 0) * 1.25 * 0.126;
+                $base['maxQuantity'] = (float) ($base['maxQuantity'] ?? 0) * 1.25 * 0.126;
+            }
+            $allow = $type === 0
+                ? ['enabled', 'cntrlType', 'target', 'lowerLimit', 'upperLimit', 'kp', 'maxQuantity', 'delaySec',
+                   'refTimeSec', 'minTimeSec', 'maxTimeSec', 'containerL', 'polChange', 'polRelay',
+                   'polIntervalS', 'polPauseMs', 'manualSec']
+                : ['enabled', 'target', 'lowerLimit', 'upperLimit', 'kp', 'maxQuantity', 'delaySec',
+                   'minTimeSec', 'maxTimeSec', 'containerL', 'manualSec',
+                   // Erweiterung fuer die schreibbaren pH-Konfig-Variablen (Verdrahtung/Foerdermenge/Beckenparameter)
+                   'filterPump', 'dosagePump', 'flowMl', 'flowSec', 'poolParam1', 'poolParam2'];
+            $merged = $base;
+            foreach ($allow as $k) {
+                if (array_key_exists($k, $args)) {
+                    $merged[$k] = $args[$k];
+                }
+            }
+            $res = $cl->setDosageConfig($type, $merged);
+            if (!empty($res['ok'])) {
+                // dosTs zuruecksetzen -> naechster Poll spiegelt die frische Config (300s-Drossel).
+                $rt = $this->readRt();
+                $rt['dosTs'] = 0;
+                $this->writeRt($rt);
+            }
+            return $res + ['type' => $type];
+        });
+    }
+
+    // ==================================================================
+    // S4 — TEMPC (Temperatur-/Solar-Regeln), RMW ueber getRules/setRules
+    // Feldlayout PROTOCOLS.md:171: [0]ena [1]REL [2]start [3]end [4]STATE [5]SENS1
+    //   [6]SENS2|255 [7]LOGIC [8]DIFF*100 [9]HYST*100.
+    // ==================================================================
+
+    private function mgmtGetTempRule(array $args): array
+    {
+        $idx = max(0, min(7, (int) ($args['index'] ?? 0)));
+        return $this->withClient(function ($cl) use ($idx) {
+            $r = $cl->getRules('TEMPC');
+            if (empty($r['ok'])) {
+                return $r;
+            }
+            $rule = $r['rules'][$idx] ?? self::TEMPC_DEFAULT;
+            if (array_sum(array_map('abs', $rule)) === 0) {
+                $rule = self::TEMPC_DEFAULT; // Ganz-Null-Regel -> SENS2=255 (absolut)
+            }
+            $abs = ((int) $rule[6] === 255);
+            @$this->UpdateFormField('tcEna', 'value', (bool) $rule[0]);
+            @$this->UpdateFormField('tcRel', 'value', (int) $rule[1]);
+            @$this->UpdateFormField('tcStartH', 'value', intdiv((int) $rule[2], 60));
+            @$this->UpdateFormField('tcStartM', 'value', (int) $rule[2] % 60);
+            @$this->UpdateFormField('tcEndH', 'value', intdiv((int) $rule[3], 60));
+            @$this->UpdateFormField('tcEndM', 'value', (int) $rule[3] % 60);
+            @$this->UpdateFormField('tcState', 'value', (int) $rule[4]);
+            @$this->UpdateFormField('tcSens1', 'value', (int) $rule[5]);
+            @$this->UpdateFormField('tcSens2Abs', 'value', $abs);
+            @$this->UpdateFormField('tcSens2', 'value', $abs ? 0 : (int) $rule[6]);
+            @$this->UpdateFormField('tcLogic', 'value', (int) $rule[7]);
+            @$this->UpdateFormField('tcDiff', 'value', (float) $rule[8] / 100);
+            @$this->UpdateFormField('tcHyst', 'value', (float) $rule[9] / 100);
+            return ['ok' => true, 'index' => $idx, 'rule' => $rule];
+        });
+    }
+
+    private function mgmtSetTempRule(array $args): array
+    {
+        $idx   = max(0, min(7, (int) ($args['index'] ?? 0)));
+        $start = max(0, min(1439, (int) ($args['startH'] ?? 0) * 60 + (int) ($args['startM'] ?? 0)));
+        $end   = max(0, min(1439, (int) ($args['endH'] ?? 0) * 60 + (int) ($args['endM'] ?? 0)));
+        $sens2 = !empty($args['sens2Abs']) ? 255 : max(0, min(7, (int) ($args['sens2'] ?? 0)));
+        $new = [
+            !empty($args['ena']) ? 1 : 0,
+            max(0, min(15, (int) ($args['rel'] ?? 1))),
+            $start,
+            $end,
+            !empty($args['state']) ? 1 : 0,
+            max(0, min(7, (int) ($args['sens1'] ?? 0))),
+            $sens2,
+            max(0, min(4, (int) ($args['logic'] ?? 0))),
+            (int) round(((float) ($args['diff'] ?? 0)) * 100),
+            (int) round(((float) ($args['hyst'] ?? 0)) * 100),
+        ];
+        return $this->gatedWrite('rules', 'setTempRule', function ($cl) use ($idx, $new) {
+            $cur = $cl->getRules('TEMPC');
+            if (empty($cur['ok'])) {
+                return ['ok' => false, 'error' => 'read_before_write_failed'];
+            }
+            $rules = $cur['rules'];
+            for ($i = 0; $i < 8; $i++) {
+                if (!isset($rules[$i]) || array_sum(array_map('abs', $rules[$i])) === 0) {
+                    $rules[$i] = self::TEMPC_DEFAULT; // fehlende/Null-Regeln auf korrekten Default
+                }
+            }
+            $rules[$idx] = $new;
+            return $cl->setRules('TEMPC', $rules);
+        });
+    }
+
+    // ==================================================================
+    // S5 — ADCC (Analog) + SWITCHC (Digital-IO), RMW ueber getRules/setRules
+    // ADCC 16 Werte (PROTOCOLS.md:172): [0]ena [1]REL [2]STATE [3]DREL|255 [4]start
+    //   [5]end [6]SENS [7]LOGIC [8]diff_raw [9]hyst_raw [10]CLOW [11]lower_raw
+    //   [12]CHIGH [13]upper_raw [14]BAD [15]GOOD. Roh=(Anzeige-offs)/gain.
+    // SWITCHC 6 Werte (PROTOCOLS.md:173): [0]ena [1]INP [2]REL [3]FUNC [4]time_sec [5]STATE.
+    // ==================================================================
+
+    /** offs/gain der GetState-Spalte des ADCC-Sensors (Fallback 0/1). */
+    private function adccSensorScale(PoolClient $cl, int $sens): array
+    {
+        $st = $cl->getState();
+        if (!empty($st['ok']) && isset($st['cols'][$sens])) {
+            $g = (float) $st['cols'][$sens]['gain'];
+            return [(float) $st['cols'][$sens]['offset'], $g != 0.0 ? $g : 1.0];
+        }
+        return [0.0, 1.0];
+    }
+
+    private function mgmtGetAdccRule(array $args): array
+    {
+        $idx = (int) ($args['index'] ?? 0);
+        if ($idx < 0 || $idx > 7) {
+            return ['ok' => false, 'error' => 'bad_index'];
+        }
+        return $this->withClient(function ($cl) use ($idx) {
+            $r = $cl->getRules('ADCC');
+            if (empty($r['ok'])) {
+                return $r;
+            }
+            $v = $r['rules'][$idx] ?? self::ADCC_DEFAULT;
+            if (array_sum(array_map('abs', $v)) === 0) {
+                $v = self::ADCC_DEFAULT;
+            }
+            [$offs, $gain] = $this->adccSensorScale($cl, (int) $v[6]);
+            $disp = fn(int $raw) => $offs + $gain * (float) $raw;
+            @$this->UpdateFormField('aEna', 'value', (bool) $v[0]);
+            @$this->UpdateFormField('aRel', 'value', (int) $v[1]);
+            @$this->UpdateFormField('aState', 'value', (int) $v[2]);
+            @$this->UpdateFormField('aDrel', 'value', (int) $v[3]);
+            @$this->UpdateFormField('aStart', 'value', (int) $v[4]);
+            @$this->UpdateFormField('aEnd', 'value', (int) $v[5]);
+            @$this->UpdateFormField('aSens', 'value', (int) $v[6]);
+            @$this->UpdateFormField('aLogic', 'value', self::RULE_LOGIC[(int) $v[7]] ?? '<');
+            @$this->UpdateFormField('aDiff', 'value', $disp((int) $v[8]));
+            @$this->UpdateFormField('aHyst', 'value', $disp((int) $v[9]));
+            @$this->UpdateFormField('aCLow', 'value', (bool) $v[10]);
+            @$this->UpdateFormField('aLower', 'value', $disp((int) $v[11]));
+            @$this->UpdateFormField('aCHigh', 'value', (bool) $v[12]);
+            @$this->UpdateFormField('aUpper', 'value', $disp((int) $v[13]));
+            @$this->UpdateFormField('aBad', 'value', (int) $v[14]);
+            @$this->UpdateFormField('aGood', 'value', (int) $v[15]);
+            return ['ok' => true, 'index' => $idx, 'raw' => $v, 'offs' => $offs, 'gain' => $gain];
+        });
+    }
+
+    private function mgmtSetAdccRule(array $args): array
+    {
+        $idx = (int) ($args['index'] ?? -1);
+        if ($idx < 0 || $idx > 7) {
+            return ['ok' => false, 'error' => 'bad_index'];
+        }
+        return $this->gatedWrite('rules', 'setAdccRule', function ($cl) use ($idx, $args) {
+            $cur = $cl->getRules('ADCC');
+            if (empty($cur['ok'])) {
+                return ['ok' => false, 'error' => 'read_before_write_failed'];
+            }
+            $rules = $cur['rules'];
+            $sens  = max(0, (int) ($args['sens'] ?? 0));
+            [$offs, $gain] = $this->adccSensorScale($cl, $sens);
+            $raw   = fn(float $disp) => (int) round($gain != 0.0 ? ($disp - $offs) / $gain : 0.0);
+            $logic = array_search((string) ($args['logic'] ?? '<'), self::RULE_LOGIC, true);
+            $rule = self::ADCC_DEFAULT;
+            $rule[0]  = !empty($args['ena']) ? 1 : 0;
+            $rule[1]  = max(0, min(15, (int) ($args['rel'] ?? 0)));
+            $rule[2]  = !empty($args['state']) ? 1 : 0;
+            $rule[3]  = max(0, min(255, (int) ($args['drel'] ?? 255)));  // 255 = Uhrzeit-Modus
+            $rule[4]  = max(0, min(1439, (int) ($args['start'] ?? 0)));  // Min
+            $rule[5]  = max(0, min(1439, (int) ($args['end'] ?? 0)));    // Min
+            $rule[6]  = $sens;
+            $rule[7]  = $logic === false ? 0 : (int) $logic;
+            $rule[8]  = $raw((float) ($args['diff'] ?? 0));
+            $rule[9]  = $raw((float) ($args['hyst'] ?? 0));
+            $rule[10] = !empty($args['cLow']) ? 1 : 0;
+            $rule[11] = $raw((float) ($args['lower'] ?? 0));
+            $rule[12] = !empty($args['cHigh']) ? 1 : 0;
+            $rule[13] = $raw((float) ($args['upper'] ?? 0));
+            $rule[14] = max(0, min(255, (int) ($args['bad'] ?? 10)));
+            $rule[15] = max(0, min(255, (int) ($args['good'] ?? 10)));
+            $rules[$idx] = $rule;
+            return $cl->setRules('ADCC', $rules);
+        });
+    }
+
+    private function mgmtGetSwitchcRule(array $args): array
+    {
+        $idx = (int) ($args['index'] ?? 0);
+        if ($idx < 0 || $idx > 7) {
+            return ['ok' => false, 'error' => 'bad_index'];
+        }
+        return $this->withClient(function ($cl) use ($idx) {
+            $r = $cl->getRules('SWITCHC');
+            if (empty($r['ok'])) {
+                return $r;
+            }
+            $v = $r['rules'][$idx] ?? self::SWITCHC_DEFAULT;
+            @$this->UpdateFormField('sEna', 'value', (bool) $v[0]);
+            @$this->UpdateFormField('sInp', 'value', (int) $v[1]);
+            @$this->UpdateFormField('sRel', 'value', (int) $v[2]);
+            @$this->UpdateFormField('sFunc', 'value', self::SWITCHC_FUNC[(int) $v[3]] ?? 'NORMAL');
+            @$this->UpdateFormField('sTime', 'value', (int) $v[4]); // Sekunden
+            @$this->UpdateFormField('sState', 'value', (int) $v[5]);
+            return ['ok' => true, 'index' => $idx, 'raw' => $v];
+        });
+    }
+
+    private function mgmtSetSwitchcRule(array $args): array
+    {
+        $idx = (int) ($args['index'] ?? -1);
+        if ($idx < 0 || $idx > 7) {
+            return ['ok' => false, 'error' => 'bad_index'];
+        }
+        return $this->gatedWrite('rules', 'setSwitchcRule', function ($cl) use ($idx, $args) {
+            $cur = $cl->getRules('SWITCHC');
+            if (empty($cur['ok'])) {
+                return ['ok' => false, 'error' => 'read_before_write_failed'];
+            }
+            $rules = $cur['rules'];
+            $func  = array_search((string) ($args['func'] ?? 'NORMAL'), self::SWITCHC_FUNC, true);
+            $rule = self::SWITCHC_DEFAULT;
+            $rule[0] = !empty($args['ena']) ? 1 : 0;
+            $rule[1] = max(0, min(15, (int) ($args['inp'] ?? 0)));
+            $rule[2] = max(0, min(15, (int) ($args['rel'] ?? 0)));
+            $rule[3] = $func === false ? 0 : (int) $func;
+            $rule[4] = max(0, (int) ($args['time'] ?? 0)); // Sekunden (PROTOCOLS.md:204)
+            $rule[5] = !empty($args['state']) ? 1 : 0;
+            $rules[$idx] = $rule;
+            return $cl->setRules('SWITCHC', $rules);
+        });
+    }
+
+    // ==================================================================
+    // S6 — Sensor-Konfig Einzelkanal (RMW) + Rechenhelfer (Impuls-Gain, 2-Punkt-Kal)
+    // Der bestehende setSensorConfig (Vollsatz) bleibt; dies ist der RMW-Einzelkanal-Pfad
+    // fuer den Editor, damit ein Kanal-Schreiben die uebrigen Kanaele NICHT auf Default zieht.
+    // ==================================================================
+
+    private function mgmtSetSensorChannel(array $args): array
+    {
+        $kind = strtolower((string) ($args['kind'] ?? ''));
+        if (!in_array($kind, ['adc', 'bnc', 'onewire', 'io'], true)) {
+            return ['ok' => false, 'error' => 'bad_kind'];
+        }
+        $i = (int) ($args['index'] ?? -1);
+        if ($i < 0) {
+            return ['ok' => false, 'error' => 'bad_index'];
+        }
+        // Leere Textfelder verwerfen (Ist-Wert behalten); numerische Felder bleiben.
+        $patch = array_filter((array) ($args['patch'] ?? []), static fn($v) => $v !== '');
+        return $this->gatedWrite('sensorcfg', 'setSensorChannel', function ($cl) use ($kind, $i, $patch) {
+            switch ($kind) {
+                case 'adc':     $cur = $cl->getAdcConfig();     $rows = $cur['channels'] ?? []; break;
+                case 'bnc':     $cur = $cl->getBncConfig();     $rows = $cur['channels'] ?? []; break;
+                case 'onewire': $cur = $cl->getOneWireConfig(); $rows = $cur['sensors']  ?? []; break;
+                default:        $cur = $cl->getIoConfig();      $rows = $cur['ios']      ?? []; break;
+            }
+            if (empty($cur['ok'])) {
+                return ['ok' => false, 'error' => 'read_before_write_failed'];
+            }
+            $rows[$i] = array_merge($rows[$i] ?? [], $patch);
+            switch ($kind) {
+                case 'adc':     return $cl->setAdcConfig($rows);
+                case 'bnc':     return $cl->setBncConfig($rows);
+                case 'onewire': return $cl->setOneWireConfig($rows);
+                default:        return $cl->setIoConfig($rows);
+            }
+        });
+    }
+
+    /** Impulszaehler-Gain fuer IOCFG (PROTOCOLS.md §13/:194). Reine Rechnung, kein Geraetezugriff. */
+    private function calcImpulseGain(float $inputValue, float $diameter, int $sensorType, int $outputUnit): array
+    {
+        $units = ['cm/s', 'm/s', 'l/min', 'l/h', 'm³/s', 'm³/min', 'm³/h'];
+        $unit  = $units[$outputUnit] ?? $units[0];
+        $gain  = 0.0;
+        if ($inputValue > 0 && $diameter > 0) {
+            $d    = $diameter / 10.0;             // mm -> cm
+            $area = ($d * $d) * M_PI / 4.0;       // cm^2
+            if ($sensorType === 0) {              // Impulse pro Liter
+                switch ($outputUnit) {
+                    case 0: $h = 1000 / 60; break;
+                    case 1: $h = 10 / 60; break;
+                    case 2: $h = 10 / 60 * ($area / 10000) * 60 * 1000; break;
+                    case 3: $h = 10 / 60 * ($area / 10000) * 60 * 60 * 1000; break;
+                    case 4: $h = 10 / 60 * ($area / 10000); break;
+                    case 5: $h = 10 / 60 * ($area / 10000) * 60; break;
+                    case 6: $h = 10 / 60 * ($area / 10000) * 60 * 60; break;
+                    default: $h = 0;
+                }
+                $gain = ($area != 0.0) ? ($h / $area) / $inputValue : 0.0;
+            } else {                              // Hz pro m/s
+                $aM = ($d * $d) * M_PI / 4.0 / 10000.0; // m^2
+                switch ($outputUnit) {
+                    case 0: $h = ($inputValue * 60) * $aM / 100; break;
+                    case 1: $h = ($inputValue * 60) * $aM; break;
+                    case 2: $h = $inputValue / 1000; break;
+                    case 3: $h = $inputValue / 60 / 1000; break;
+                    case 4: $h = $inputValue * 60; break;
+                    case 5: $h = $inputValue; break;
+                    case 6: $h = $inputValue / 60; break;
+                    default: $h = 0;
+                }
+                $gain = ($h != 0.0) ? $aM / $h : 0.0;
+            }
+        }
+        return ['gain' => $gain, 'unit' => $unit];
+    }
+
+    /** 2-Punkt-Kalibrierung fuer ADC (PROTOCOLS.md §13/:191), Rohwerte ×16. */
+    private function calcGainOffset(float $raw1, float $raw2, float $val1, float $val2): array
+    {
+        if ($raw1 === $raw2) {
+            return ['ok' => false, 'error' => 'ADC-Rohwerte muessen unterschiedlich sein'];
+        }
+        $r1     = $raw1 * 16.0;
+        $r2     = $raw2 * 16.0;
+        $gain   = ($val1 - $val2) / ($r1 - $r2);
+        $offset = $val1 - $gain * $r1;
+        return ['ok' => true, 'gain' => $gain, 'offset' => $offset];
+    }
+
+    // ==================================================================
+    // S7 — Netzwerk (RMW-Overlay; Thermokon/MAC/DLS bleiben erhalten)
+    // ==================================================================
+
+    private function mgmtSetNetworkFields(array $args): array
+    {
+        $f = (array) ($args['fields'] ?? []);
+        return $this->gatedWrite('network', 'setNetworkFields', function ($cl) use ($f) {
+            $cur = $cl->getNetwork();
+            if (empty($cur['ok'])) {
+                return ['ok' => false, 'error' => 'read_before_write_failed'];
+            }
+            $n   = $cur['network']; // enthaelt thermo*, mac, ntpDls unveraendert (RMW-Basis)
+            $oct = static function (string $s): ?array {
+                $s = trim($s);
+                if ($s === '') {
+                    return null;
+                }
+                $p = array_map('intval', explode('.', $s));
+                return count($p) === 4 ? $p : null;
+            };
+            if (array_key_exists('dhcp', $f)) { $n['dhcp']   = ((bool) $f['dhcp']) ? 1 : 0; }
+            if (array_key_exists('dls', $f))  { $n['ntpDls'] = ((bool) $f['dls']) ? 1 : 0; }
+            if (!empty($f['httpPort']))       { $n['httpPort'] = (int) $f['httpPort']; }
+            if (($v = $oct((string) ($f['ip'] ?? ''))) !== null)      { $n['ip'] = $v; }
+            if (($v = $oct((string) ($f['mask'] ?? ''))) !== null)    { $n['subnet'] = $v; $n['subnetEna'] = 1; }
+            if (($v = $oct((string) ($f['gateway'] ?? ''))) !== null) { $n['gateway'] = $v; $n['gwEna'] = 1; }
+            if (($v = $oct((string) ($f['dns'] ?? ''))) !== null)     { $n['dns'] = $v; $n['dnsEna'] = 1; }
+            if (($v = $oct((string) ($f['ntp'] ?? ''))) !== null)     { $n['ntp'] = $v; $n['ntpEna'] = 1; }
+            // Thermokon-Felder (nur ueber die schreibbaren Variablen; RMW-erhalten wenn nicht gesetzt).
+            if (array_key_exists('thermoEna', $f))     { $n['thermoEna']     = ((bool) $f['thermoEna']) ? 1 : 0; }
+            if (array_key_exists('thermoPortEna', $f)) { $n['thermoPortEna'] = ((bool) $f['thermoPortEna']) ? 1 : 0; }
+            if (array_key_exists('thermoPort1', $f))   { $n['thermoPort1']   = (int) $f['thermoPort1']; }
+            if (array_key_exists('thermoPort2', $f))   { $n['thermoPort2']   = (int) $f['thermoPort2']; }
+            if (($v = $oct((string) ($f['thermoIp'] ?? ''))) !== null) { $n['thermo'] = $v; }
+            return $cl->setNetwork($n);
+        });
+    }
+
+    // ==================================================================
+    // S8 — EMAIL-Konto / Kontakte / OTHER (RMW-Overlay) + Doppel-Gate Kalibrierung
+    // ==================================================================
+
+    private function mgmtSetEmailAccount(array $args): array
+    {
+        $f     = (array) ($args['fields'] ?? []);
+        $index = array_key_exists('index', $args) ? (int) $args['index'] : null;
+        return $this->gatedWrite('email', 'setEmailAccount', function ($cl) use ($f, $index) {
+            $cur = $cl->getEmailAccount();
+            if (empty($cur['ok'])) {
+                return ['ok' => false, 'error' => 'read_before_write_failed'];
+            }
+            $a = $cur['account'];
+            foreach (['mail', 'html', 'sms', 'debug'] as $b) {
+                if (array_key_exists($b, $f)) { $a[$b] = ((bool) $f[$b]) ? 1 : 0; }
+            }
+            foreach (['from', 'language', 'smsUser', 'smsPass', 'smsFrom', 'smsApi'] as $s) {
+                if (array_key_exists($s, $f) && (string) $f[$s] !== '') { $a[$s] = (string) $f[$s]; }
+            }
+            // Kompatibilitaet Alt-Panel: 'to0' setzt Empfaenger 0 direkt.
+            if (isset($f['to0']) && (string) $f['to0'] !== '') {
+                $a['to'][0] = ['use' => 1, 'addr' => (string) $f['to0']];
+            }
+            // Indexbasierte Empfaenger (Variablen-Pfad): toAddr[0..4] / smsToNum[0..1].
+            if (array_key_exists('toAddr', $f) && $index !== null && $index >= 0 && $index < 5) {
+                $addr = (string) $f['toAddr'];
+                $a['to'][$index] = ['use' => $addr !== '' ? 1 : 0, 'addr' => $addr];
+            }
+            if (array_key_exists('smsToNum', $f) && $index !== null && $index >= 0 && $index < 2) {
+                $num = (string) $f['smsToNum'];
+                $a['smsTo'][$index] = ['use' => $num !== '' ? 1 : 0, 'num' => $num];
+            }
+            return $cl->setEmailAccount($a);
+        });
+    }
+
+    /** SMTP-Server als RMW-Overlay (Einzelfeld-Write darf die anderen nicht leeren). */
+    private function mgmtSetEmailServer(array $args): array
+    {
+        $f = (array) ($args['server'] ?? []);
+        return $this->gatedWrite('email', 'setEmailServer', function ($cl) use ($f) {
+            $cur = $cl->getEmailServer();
+            $s   = ($cur['ok'] ?? false) ? $cur['server'] : [];
+            foreach (['smtp', 'user', 'pwd', 'from'] as $k) {
+                if (array_key_exists($k, $f)) { $s[$k] = (string) $f[$k]; }
+            }
+            // B64USR/B64PWD werden im Client neu aus user/pwd berechnet.
+            $s['b64usr'] = '';
+            $s['b64pwd'] = '';
+            return $cl->setEmailServer($s);
+        });
+    }
+
+    /**
+     * Alarm-Meldestufe eines einzelnen DTC-Codes setzen (RMW; alle uebrigen Codes +
+     * das action-Feld des Codes bleiben erhalten). level 0..3 -> (msg,email,sms).
+     */
+    private function mgmtSetDtcField(array $args): array
+    {
+        $code  = (int) ($args['code'] ?? -1);
+        $level = max(0, min(3, (int) ($args['level'] ?? 0)));
+        if ($code < 0) {
+            return ['ok' => false, 'error' => 'bad_code'];
+        }
+        return $this->gatedWrite('dtc', 'setDtcField', function ($cl) use ($code, $level) {
+            $cur = $cl->getDtc();
+            $dtc = ($cur['ok'] ?? false) ? $cur['dtc'] : [];
+            $action = (int) ($dtc[$code]['action'] ?? 0);
+            $dtc[$code] = [
+                'email'  => $level >= 2 ? 1 : 0,
+                'msg'    => $level >= 1 ? 1 : 0,
+                'sms'    => $level >= 3 ? 1 : 0,
+                'action' => $action,
+            ];
+            $count = 70;
+            if (!empty($dtc)) {
+                $count = max($count, ((int) max(array_keys($dtc))) + 1);
+            }
+            $full = [];
+            for ($i = 0; $i < $count; $i++) {
+                $full[$i] = $dtc[$i] ?? ['email' => 0, 'msg' => 0, 'sms' => 0, 'action' => 0];
+            }
+            return $cl->setDtc($full, $count);
+        });
+    }
+
+    private function mgmtSetContacts(array $args): array
+    {
+        $f = (array) ($args['contacts'] ?? []);
+        return $this->gatedWrite('contacts', 'setContacts', function ($cl) use ($f) {
+            $cur = $cl->getContacts();
+            $c   = ($cur['ok'] ?? false) ? $cur['contacts'] : array_fill(0, 5, 'name@mail.de');
+            for ($i = 0; $i < 5; $i++) {
+                if (isset($f[$i]) && (string) $f[$i] !== '') {
+                    $c[$i] = (string) $f[$i];
+                }
+            }
+            return $cl->setContacts($c);
+        });
+    }
+
+    private function mgmtSetOther(array $args): array
+    {
+        $f = (array) ($args['other'] ?? []);
+        return $this->gatedWrite('other', 'setOther', function ($cl) use ($f) {
+            $cur = $cl->getOther();
+            $o   = $cur['other'] ?? []; // 'other' traegt auch bei ok=false Defaults (RMW-Basis)
+            foreach (['timezone', 'statusMailMin', 'extRelayMode', 'flowCheck', 'dmx', 'avatar'] as $k) {
+                if (array_key_exists($k, $f)) {
+                    $o[$k] = $f[$k];
+                }
+            }
+            return $cl->setOther($o);
+        });
+    }
+
+    /** Wie gatedWrite, zusaetzlich CalibrationAllowed gefordert (Messketten-Schutz). */
+    private function gatedCalWrite(string $section, string $what, callable $fn): array
+    {
+        if (!$this->ReadPropertyBoolean('CalibrationAllowed')) {
+            $this->SendDebug('HSPC.cal', $what . ' verweigert: CalibrationAllowed=false', 0);
+            return ['ok' => false, 'error' => 'calibration_not_allowed',
+                'note' => 'Kalibrierung gesperrt (CalibrationAllowed). Schreibt direkt in die Messkette.'];
+        }
+        return $this->gatedWrite($section, $what, $fn); // zusaetzlich Armed-Gate + Semaphore
+    }
+
     private function mgmtComputeCirculation(array $args): array
     {
         $cfg  = $this->cfg();
@@ -1227,6 +2133,575 @@ class PoolController extends EntityModule
         @$this->SetValue('AutoCircOptimal', $opt);
         return ['ok' => true, 'trueTemp' => $temp, 'optimalMinutes' => $opt,
             'poolSize' => (float) ($cfg['poolSize'] ?? 0), 'flowRate' => (float) ($cfg['flowRate'] ?? 0)];
+    }
+
+    // ==================================================================
+    // $CFGVARS — zentrale, tabellengetriebene Map aller Konfig-Variablen
+    // ident => ['op','field','index','type','kind','vt','profile','label','grp','ro'].
+    //   op    = zustaendige (gegatete) mgmt-Op
+    //   field = Feldname in der Op/Config
+    //   index = semantischer Index (Kanal/Regel/Empfaenger/DTC-Code) oder null
+    //   type  = Dosier-TYPE (0=Cl,1=pH-,2=pH+) fuer setDosageFull, sonst null
+    //   kind  = Sensor-Kind (adc/bnc/onewire/io) fuer setSensorChannel, sonst null
+    //   vt    = IPS-Variablentyp (0=bool,1=int,2=float,3=string)
+    //   grp   = Sektion (rdx/ph/sensor/network/other/email/contacts/dtc/cal/tempc/adcc/switchc)
+    //   ro    = read-only (Reflect, kein EnableAction/Dispatch)
+    // Skalare Sektionen (rdx/ph/sensor/network/other/email/contacts/dtc/cal) bekommen in
+    // dieser Phase Manifest+Poll; die Regel-Sektionen (tempc/adcc/switchc) sind bereits
+    // vollstaendig gefuehrt (Dispatch via writeRuleField), Manifest/Poll folgt separat.
+    // ==================================================================
+
+    private function cfgVars(): array
+    {
+        if ($this->cfgVarsCache !== null) {
+            return $this->cfgVarsCache;
+        }
+        $m = [];
+        $add = function (string $ident, string $op, string $field, int $vt, string $profile,
+            string $label, string $grp, array $extra = []) use (&$m): void {
+            $m[$ident] = array_merge([
+                'op' => $op, 'field' => $field, 'index' => null, 'type' => null, 'kind' => null,
+                'vt' => $vt, 'profile' => $profile, 'label' => $label, 'grp' => $grp, 'ro' => false,
+            ], $extra);
+        };
+
+        // --- V1: Dosierung Cl/Redox (RDXCNTRL, type=0) ---
+        $rdx = [
+            ['DosingClAuto', 'enabled', 0, '~Switch', 'Dosierautomatik Redox'],
+            ['RedoxTarget', 'target', 2, 'HSPC.Redox', 'Redox Sollwert (mV)'],
+            ['RdxCfgSalt', 'cntrlType', 0, 'HSPC.SaltMode', 'Salzelektrolyse (DTYPE)'],
+            ['RdxCfgMin', 'lowerLimit', 2, 'HSPC.Redox', 'Redox Min (mV)'],
+            ['RdxCfgMax', 'upperLimit', 2, 'HSPC.Redox', 'Redox Max (mV)'],
+            ['RdxCfgKp', 'kp', 2, 'HSPC.KP', 'Proportionalband KP'],
+            ['RdxCfgMaxDose', 'maxQuantity', 2, 'HSPC.Milliliter', 'Max. Dosis (ml)'],
+            ['RdxCfgDelay', 'delaySec', 2, 'HSPC.Seconds', 'Nachlaufzeit/Delay (s)'],
+            ['RdxCfgRefTime', 'refTimeSec', 2, 'HSPC.Seconds', 'Zykluszeit REF_T (s)'],
+            ['RdxCfgMinTime', 'minTimeSec', 2, 'HSPC.Seconds', 'Min-Dosierzeit (s)'],
+            ['RdxCfgMaxTime', 'maxTimeSec', 2, 'HSPC.Seconds', 'Max-Dosierzeit (s)'],
+            ['RdxCfgContainer', 'containerL', 2, 'HSPC.Liter', 'Kanistergroesse (l)'],
+            ['RdxCfgPolChange', 'polChange', 0, '~Switch', 'Polwechsel aktiv (Salz)'],
+            ['RdxCfgPolRelay', 'polRelay', 1, '', 'Polwechsel-Relais-Index'],
+            ['RdxCfgPolInterval', 'polIntervalS', 2, 'HSPC.Seconds', 'Polwechsel-Intervall (s)'],
+            ['RdxCfgPolPause', 'polPauseMs', 2, 'HSPC.Millisec', 'Polwechsel-Pause (ms)'],
+            ['RdxCfgManual', 'manualSec', 2, 'HSPC.Seconds', 'Manuelle Dosierdauer (s)'],
+        ];
+        foreach ($rdx as [$id, $f, $vt, $p, $lbl]) {
+            $add($id, 'setDosageFull', $f, $vt, $p, $lbl, 'rdx', ['type' => 0]);
+        }
+
+        // --- V2: Dosierung pH- (type=1) und pH+ (type=2) ---
+        // [ident-suffix, field, vt, profile, label-suffix, ro]
+        $phFields = [
+            ['Target', 'target', 2, 'HSPC.pH', 'Sollwert', false],           // PHTarget/PHPlusTarget (Sonderfall unten)
+            ['Auto', 'enabled', 0, '~Switch', 'Dosierautomatik', false],     // DosingPHAuto/DosingPHPAuto (Sonderfall)
+            ['Lower', 'lowerLimit', 2, 'HSPC.pH', 'Grenze unten', false],
+            ['Upper', 'upperLimit', 2, 'HSPC.pH', 'Grenze oben', false],
+            ['Kp', 'kp', 2, '', 'Regelparameter Kp', false],
+            ['MaxQuant', 'maxQuantity', 1, '', 'max. Dosiermenge', false],
+            ['Delay', 'delaySec', 2, 'HSPC.Seconds', 'Verzoegerung', false],
+            ['MinTime', 'minTimeSec', 2, 'HSPC.Seconds', 'min. Dosierzeit', false],
+            ['MaxTime', 'maxTimeSec', 2, 'HSPC.Seconds', 'max. Dosierzeit', false],
+            ['Container', 'containerL', 2, 'HSPC.Liter', 'Kanisterinhalt', false],
+            ['ManualTime', 'manualSec', 2, 'HSPC.Seconds', 'manuelle Dosierdauer', false],
+            ['FilterPump', 'filterPump', 1, '', 'Filterpumpe (Relais-Idx)', false],
+            ['DosePump', 'dosagePump', 1, '', 'Dosierpumpe (Relais-Idx)', false],
+            ['FlowMl', 'flowMl', 2, 'HSPC.Milliliter', 'Foerdermenge', false],
+            ['FlowSec', 'flowSec', 2, 'HSPC.Seconds', 'Foerderzeit', false],
+            ['PoolParam1', 'poolParam1', 2, '', 'Beckenparameter 1', false],
+            ['PoolParam2', 'poolParam2', 2, '', 'Beckenparameter 2', false],
+            ['LastReset', 'lastReset', 3, '', 'letzter Kanister-Reset', true],
+        ];
+        foreach ([1 => ['PHMinus', 'pH-minus'], 2 => ['PHPlus', 'pH-plus']] as $type => [$pre, $lblpre]) {
+            foreach ($phFields as [$suf, $f, $vt, $p, $lblsuf, $ro]) {
+                // Sonderfaelle mit festen, bereits vorhandenen Idents:
+                if ($suf === 'Target') {
+                    $id = ($type === 1) ? 'PHTarget' : 'PHPlusTarget';
+                } elseif ($suf === 'Auto') {
+                    $id = ($type === 1) ? 'DosingPHAuto' : 'DosingPHPAuto';
+                } else {
+                    $id = $pre . $suf;
+                }
+                $add($id, 'setDosageFull', $f, $vt, $p, $lblpre . ' ' . $lblsuf, 'ph',
+                    ['type' => $type, 'ro' => $ro]);
+            }
+        }
+
+        // --- V5: Sensorik (setSensorChannel; kind+index) ---
+        $mkSens = function (string $prefix, string $kind, int $count, array $fields) use ($add): void {
+            for ($i = 0; $i < $count; $i++) {
+                foreach ($fields as [$suf, $f, $vt, $p, $lbl]) {
+                    $add($prefix . $i . $suf, 'setSensorChannel', $f, $vt, $p,
+                        str_replace('{i}', (string) $i, $lbl), 'sensor', ['kind' => $kind, 'index' => $i]);
+                }
+            }
+        };
+        $mkSens('CfgAdc', 'adc', 5, [
+            ['Name', 'name', 3, '', 'ADC{i} Name'],
+            ['Unit', 'unit', 3, '', 'ADC{i} Einheit'],
+            ['Offs', 'offset', 2, '', 'ADC{i} Offset'],
+            ['Gain', 'gain', 2, '', 'ADC{i} Gain'],
+        ]);
+        $mkSens('CfgBnc', 'bnc', 2, [
+            ['Name', 'name', 3, '', 'BNC{i} Name'],
+            ['Unit', 'unit', 3, '', 'BNC{i} Einheit'],
+            ['Offs', 'offset', 2, '', 'BNC{i} Offset'],
+            ['Gain', 'gain', 2, '', 'BNC{i} Gain'],
+            ['Comp', 'compIdx', 1, 'HSPC.CompIdx', 'BNC{i} Temp-Kompensation'],
+        ]);
+        $mkSens('CfgOw', 'onewire', 8, [
+            ['Code', 'code', 3, '', '1-Wire S{i} ROM-Code'],
+            ['Name', 'name', 3, '', '1-Wire S{i} Name'],
+            ['Unit', 'unit', 3, '', '1-Wire S{i} Einheit'],
+            ['Offs', 'offset', 2, '', '1-Wire S{i} Offset'],
+            ['Gain', 'gain', 2, '', '1-Wire S{i} Gain'],
+        ]);
+        $mkSens('CfgIo', 'io', 4, [
+            ['Name', 'name', 3, '', 'Digital-IO {i} Name'],
+            ['Unit', 'unit', 3, '', 'Digital-IO {i} Einheit'],
+            ['Offs', 'offset', 2, '', 'Digital-IO {i} Offset'],
+            ['Gain', 'gain', 2, '', 'Digital-IO {i} Gain'],
+            ['Dbnc', 'debounce', 1, 'HSPC.Debounce', 'Digital-IO {i} Entprellung'],
+        ]);
+
+        // --- V6: Netzwerk (setNetworkFields) + OTHER (setOther) ---
+        $net = [
+            ['NetDhcp', 'dhcp', 0, '~Switch', 'Netzwerk: DHCP aktiv'],
+            ['NetIP', 'ip', 3, '', 'Netzwerk: IP-Adresse'],
+            ['NetMask', 'mask', 3, '', 'Netzwerk: Subnetzmaske'],
+            ['NetGateway', 'gateway', 3, '', 'Netzwerk: Gateway'],
+            ['NetDns', 'dns', 3, '', 'Netzwerk: DNS-Server'],
+            ['NetNtp', 'ntp', 3, '', 'Netzwerk: NTP-Server'],
+            ['NetDls', 'dls', 0, '~Switch', 'Netzwerk: Autom. Sommerzeit'],
+            ['NetHttpPort', 'httpPort', 1, '', 'Netzwerk: HTTP-Port'],
+            ['NetThermoEna', 'thermoEna', 0, '~Switch', 'Thermokon: aktiv'],
+            ['NetThermoIp', 'thermoIp', 3, '', 'Thermokon: IP-Adresse'],
+            ['NetThermoPortEna', 'thermoPortEna', 0, '~Switch', 'Thermokon: Port aktiv'],
+            ['NetThermoPort1', 'thermoPort1', 1, '', 'Thermokon: Port 1'],
+            ['NetThermoPort2', 'thermoPort2', 1, '', 'Thermokon: Port 2'],
+        ];
+        foreach ($net as [$id, $f, $vt, $p, $lbl]) {
+            $add($id, 'setNetworkFields', $f, $vt, $p, $lbl, 'network');
+        }
+        $other = [
+            ['OtherTimezone', 'timezone', 1, '', 'Sonstiges: Zeitzone (GMT-Offset)'],
+            ['OtherStatusMailMin', 'statusMailMin', 1, 'HSPC.DayMinute', 'Sonstiges: Status-Mail Uhrzeit (Min)'],
+            ['OtherExtRelay', 'extRelayMode', 1, 'HSPC.ExtRelay', 'Sonstiges: Ext-Relais-Modus'],
+            ['OtherFlowCheck', 'flowCheck', 0, '~Switch', 'Sonstiges: Durchfluss-Check aktiv'],
+        ];
+        foreach ($other as [$id, $f, $vt, $p, $lbl]) {
+            $add($id, 'setOther', $f, $vt, $p, $lbl, 'other');
+        }
+
+        // --- V7: E-Mail-Konto / SMTP / Kontakte / DTC / Kalibrierung ---
+        $mailAcc = [
+            ['MailEnabled', 'mail', 0, '~Switch', 'Alarm-Mail aktiv'],
+            ['MailHtml', 'html', 0, '~Switch', 'HTML-Mail'],
+            ['MailSms', 'sms', 0, '~Switch', 'SMS-Versand aktiv'],
+            ['MailDebug', 'debug', 0, '~Switch', 'Mail-Debug'],
+            ['MailFrom', 'from', 3, '', 'Absender-Adresse (FROM)'],
+            ['MailLanguage', 'language', 3, '', 'Mail-Sprache (de/en)'],
+            ['SmsGwUser', 'smsUser', 3, '', 'SMS-Gateway Benutzer'],
+            ['SmsGwPass', 'smsPass', 3, '', 'SMS-Gateway Passwort'],
+            ['SmsGwFrom', 'smsFrom', 3, '', 'SMS-Gateway Absender'],
+            ['SmsGwApi', 'smsApi', 3, '', 'SMS-Gateway API-URL'],
+        ];
+        foreach ($mailAcc as [$id, $f, $vt, $p, $lbl]) {
+            $add($id, 'setEmailAccount', $f, $vt, $p, $lbl, 'email');
+        }
+        for ($i = 0; $i < 5; $i++) {
+            $add('MailTo' . $i, 'setEmailAccount', 'toAddr', 3, '', 'Empfaenger ' . ($i + 1) . ' (E-Mail)',
+                'email', ['index' => $i]);
+        }
+        for ($i = 0; $i < 2; $i++) {
+            $add('SmsTo' . $i, 'setEmailAccount', 'smsToNum', 3, '', 'SMS-Empfaenger ' . ($i + 1) . ' (Nr.)',
+                'email', ['index' => $i]);
+        }
+        $mailSrv = [
+            ['SmtpServer', 'smtp', 'SMTP-Server'],
+            ['SmtpUser', 'user', 'SMTP-Benutzer'],
+            ['SmtpPassword', 'pwd', 'SMTP-Passwort'],
+            ['SmtpFrom', 'from', 'SMTP-Absender (FROM)'],
+        ];
+        foreach ($mailSrv as [$id, $f, $lbl]) {
+            $add($id, 'setEmailServer', $f, 3, '', $lbl, 'email');
+        }
+        for ($i = 0; $i < 5; $i++) {
+            $add('Contact' . $i, 'setContacts', 'contact', 3, '', 'Kontakt ' . ($i + 1), 'contacts',
+                ['index' => $i]);
+        }
+        // DTC — je konfiguriertem Code eine Meldestufe-Variable (Property DtcCodes).
+        foreach ($this->dtcCodeList() as $code) {
+            $add('DtcLevel' . $code, 'setDtcField', 'level', 1, 'HSPC.DtcLevel',
+                'Alarm Code ' . $code . ' — Meldestufe', 'dtc', ['index' => $code]);
+        }
+        // Kalibrierung (Doppel-Gate). field = 'kanal.param'.
+        $cal = [
+            ['HwCalAdcOffs', 'setHwCal', 'adc.offs', 'HW-Kal ADC Offset (roh)'],
+            ['HwCalAdcGain', 'setHwCal', 'adc.gain', 'HW-Kal ADC Gain (roh)'],
+            ['HwCalRedoxOffs', 'setHwCal', 'redox.offs', 'HW-Kal Redox Offset (roh)'],
+            ['HwCalRedoxGain', 'setHwCal', 'redox.gain', 'HW-Kal Redox Gain (roh)'],
+            ['HwCalPhOffs', 'setHwCal', 'ph.offs', 'HW-Kal pH Offset (roh)'],
+            ['HwCalPhGain', 'setHwCal', 'ph.gain', 'HW-Kal pH Gain (roh)'],
+            ['ElCalRedoxOffs', 'setRdxPhCal', 'redox.offs', 'Elektroden-Kal Redox Offset (roh)'],
+            ['ElCalRedoxGain', 'setRdxPhCal', 'redox.gain', 'Elektroden-Kal Redox Gain (roh)'],
+            ['ElCalPhOffs', 'setRdxPhCal', 'ph.offs', 'Elektroden-Kal pH Offset (roh)'],
+            ['ElCalPhGain', 'setRdxPhCal', 'ph.gain', 'Elektroden-Kal pH Gain (roh)'],
+        ];
+        foreach ($cal as [$id, $op, $f, $lbl]) {
+            $add($id, $op, $f, 1, 'HSPC.CalRaw', $lbl, 'cal');
+        }
+
+        // --- V3/V4: Regel-Sektionen TEMPC(8x10) / ADCC(8x16) / SWITCHC(8x6) ---
+        // Vollstaendig in der Map gefuehrt; Dispatch via writeRuleField. Manifest/Poll folgt.
+        // Labels 1:1 nach ProCon.IP-GUI tempctrl.htm (label-ids/lang.js):
+        //   ena=Anwenden, rel=Ausgang, start/end=Zeit(Ein/Aus), state=Schaltzustand,
+        //   sens1/sens2=Wenn-Zeile (Vergleichs-Sensoren, sens2 kann 255=Absolut),
+        //   logic=Vergleichsoperator, diff=Regelwert, hyst=Hysterese.
+        $tempcFields = [
+            ['Active', 'ena', 0, '~Switch', 'Anwenden'],
+            ['Relay', 'rel', 1, 'HSPC.PoolRelay', 'Ausgang'],
+            ['Start', 'start', 1, 'HSPC.DayMinute', 'Zeit Ein'],
+            ['End', 'end', 1, 'HSPC.DayMinute', 'Zeit Aus'],
+            ['SwitchState', 'state', 0, '~Switch', 'Schaltzustand'],
+            ['Sensor1', 'sens1', 1, 'HSPC.TempSensor', 'Sensor'],
+            ['Sensor2', 'sens2', 1, 'HSPC.TempSensor2', 'Vergleich (Sensor/Absolut)'],
+            ['Logic', 'logic', 1, 'HSPC.RuleLogic', 'Vergleich'],
+            ['Diff', 'diff', 2, 'HSPC.TempDelta', 'Regelwert'],
+            ['Hyst', 'hyst', 2, 'HSPC.TempDelta', 'Hysterese'],
+        ];
+        for ($r = 0; $r < 8; $r++) {
+            foreach ($tempcFields as [$suf, $f, $vt, $p, $lbl]) {
+                $add('TempRule' . $r . '_' . $suf, 'setTempRule', $f, $vt, $p,
+                    'TEMPC-Regel ' . $r . ': ' . $lbl, 'tempc', ['index' => $r]);
+            }
+        }
+        // Labels 1:1 nach ProCon.IP-GUI adcctrl.htm (label-ids/lang.js):
+        //   ena=Anwenden, rel=Ausgang, state=Schaltzustand, drel="Abhängig von" (255=Uhrzeit),
+        //   start/end=Zeit(Von/Bis), sens=Wenn-Sensor, logic=Vergleichsoperator,
+        //   diff=Schwellwert (in Sensoreinheit), hyst=Hysterese,
+        //   cLow/lower="Unterer Grenzwert", cHigh/upper="Oberer Grenzwert",
+        //   bad/good=Filterzeiten "Schlecht/Gut (sec.)".
+        $adccFields = [
+            ['Ena', 'ena', 0, '~Switch', 'Anwenden'],
+            ['Rel', 'rel', 1, 'HSPC.RelayIdx', 'Ausgang'],
+            ['State', 'state', 0, '~Switch', 'Schaltzustand'],
+            ['Drel', 'drel', 1, 'HSPC.DRel', 'Abhängig von'],
+            ['Start', 'start', 1, 'HSPC.MinuteOfDay', 'Zeit Von'],
+            ['End', 'end', 1, 'HSPC.MinuteOfDay', 'Zeit Bis'],
+            ['Sens', 'sens', 1, 'HSPC.AdccSensor', 'Sensor'],
+            ['Logic', 'logic', 1, 'HSPC.RuleLogic', 'Vergleich'],
+            ['Diff', 'diff', 2, 'HSPC.AnalogThreshold', 'Schwellwert'],
+            ['Hyst', 'hyst', 2, 'HSPC.AnalogThreshold', 'Hysterese'],
+            ['CLow', 'cLow', 0, '~Switch', 'Unterer Grenzwert aktiv'],
+            ['Lower', 'lower', 2, 'HSPC.AnalogThreshold', 'Unterer Grenzwert'],
+            ['CHigh', 'cHigh', 0, '~Switch', 'Oberer Grenzwert aktiv'],
+            ['Upper', 'upper', 2, 'HSPC.AnalogThreshold', 'Oberer Grenzwert'],
+            ['Bad', 'bad', 1, '', 'Schlecht (sec.)'],
+            ['Good', 'good', 1, '', 'Gut (sec.)'],
+        ];
+        for ($r = 0; $r < 8; $r++) {
+            foreach ($adccFields as [$suf, $f, $vt, $p, $lbl]) {
+                $add('AdccR' . $r . $suf, 'setAdccRule', $f, $vt, $p,
+                    'ADCC-Regel ' . $r . ': ' . $lbl, 'adcc', ['index' => $r]);
+            }
+        }
+        // Labels 1:1 nach ProCon.IP-GUI dioctrl.htm (SWITCHC, label-ids/lang.js):
+        //   ena=Anwenden, inp=Eingang (Digital-Input-Name), rel=Ausgang,
+        //   func=Funktion (NORMAL/Stromstoß/Impuls/Impuls mit Reset),
+        //   time=Schaltdauer (Sek., Anzeige hh:mm:ss), state=Schaltzustand.
+        $swcFields = [
+            ['Ena', 'ena', 0, '~Switch', 'Anwenden'],
+            ['Inp', 'inp', 1, 'HSPC.SwitchInput', 'Eingang'],
+            ['Rel', 'rel', 1, 'HSPC.RelayIdx', 'Ausgang'],
+            ['Func', 'func', 1, 'HSPC.SwitchFunc', 'Funktion'],
+            ['Time', 'time', 1, 'HSPC.SecondsInt', 'Schaltdauer (s)'],
+            ['State', 'state', 0, '~Switch', 'Schaltzustand'],
+        ];
+        for ($r = 0; $r < 8; $r++) {
+            foreach ($swcFields as [$suf, $f, $vt, $p, $lbl]) {
+                $add('SwcR' . $r . $suf, 'setSwitchcRule', $f, $vt, $p,
+                    'SWITCHC-Regel ' . $r . ': ' . $lbl, 'switchc', ['index' => $r]);
+            }
+        }
+
+        $this->cfgVarsCache = $m;
+        return $m;
+    }
+
+    /** Liste der DTC-Codes (aus Property DtcCodes), fuer die eine Meldestufe-Variable existiert. */
+    private function dtcCodeList(): array
+    {
+        $raw = '';
+        try {
+            $raw = (string) $this->ReadPropertyString('DtcCodes');
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $out = [];
+        foreach (explode(',', $raw) as $tok) {
+            $tok = trim($tok);
+            if ($tok !== '' && ctype_digit($tok)) {
+                $out[(int) $tok] = (int) $tok;
+            }
+        }
+        ksort($out);
+        return array_values($out);
+    }
+
+    /** SetValue einer Konfig-Variable typgerecht (aus dem Poll-Spiegel). */
+    private function setCfgValue(string $ident, array $e, $v): void
+    {
+        switch ((int) $e['vt']) {
+            case 0: @$this->SetValue($ident, (bool) $v); break;
+            case 1: @$this->SetValue($ident, (int) round((float) $v)); break;
+            case 2: @$this->SetValue($ident, $this->r2((float) $v)); break;
+            default: @$this->SetValue($ident, (string) $v); break;
+        }
+    }
+
+    /** Ist-Spiegel der Dosier-Konfig (rdx/ph) aus getDosageConfig($type). */
+    private function spiegelDosage(int $type, array $res): void
+    {
+        if (empty($res['ok'])) {
+            return;
+        }
+        $cfg = $res['config'] ?? [];
+        foreach ($this->cfgVars() as $ident => $e) {
+            if (($e['grp'] !== 'rdx' && $e['grp'] !== 'ph') || (int) ($e['type'] ?? -1) !== $type) {
+                continue;
+            }
+            if (!array_key_exists($e['field'], $cfg)) {
+                continue;
+            }
+            $this->setCfgValue($ident, $e, $cfg[$e['field']]);
+        }
+    }
+
+    /** Ist-Spiegel der Sensor-Konfig (ADC/BNC/1-Wire/IO), gedrosselt 300s. */
+    private function spiegelSensorCfg(): void
+    {
+        $rt = $this->readRt();
+        if (time() - (int) ($rt['sensorCfgTs'] ?? 0) < 300) {
+            return;
+        }
+        $cl = $this->client();
+        if ($cl === null) {
+            return;
+        }
+        $data = [
+            'adc'     => ['channels', $cl->getAdcConfig()],
+            'bnc'     => ['channels', $cl->getBncConfig()],
+            'onewire' => ['sensors',  $cl->getOneWireConfig()],
+            'io'      => ['ios',      $cl->getIoConfig()],
+        ];
+        foreach ($this->cfgVars() as $ident => $e) {
+            if ($e['grp'] !== 'sensor') {
+                continue;
+            }
+            [$key, $res] = $data[$e['kind']] ?? [null, ['ok' => false]];
+            if ($key === null || empty($res['ok'])) {
+                continue;
+            }
+            $row = $res[$key][$e['index']] ?? null;
+            if (!is_array($row) || !array_key_exists($e['field'], $row)) {
+                continue;
+            }
+            $this->setCfgValue($ident, $e, $row[$e['field']]);
+        }
+        $rt = $this->readRt();
+        $rt['sensorCfgTs'] = time();
+        $this->writeRt($rt);
+    }
+
+    /** Ist-Spiegel Netzwerk + OTHER, gedrosselt 300s. */
+    private function spiegelNetOther(): void
+    {
+        $rt = $this->readRt();
+        if (time() - (int) ($rt['netTs'] ?? 0) < 300) {
+            return;
+        }
+        $cl = $this->client();
+        if ($cl === null) {
+            return;
+        }
+        $net = $cl->getNetwork();
+        if (!empty($net['ok'])) {
+            $n   = $net['network'];
+            $ip  = static fn(string $k) => implode('.', array_map('strval', (array) ($n[$k] ?? [])));
+            @$this->SetValue('NetDhcp', (bool) ($n['dhcp'] ?? 0));
+            @$this->SetValue('NetIP', $ip('ip'));
+            @$this->SetValue('NetMask', $ip('subnet'));
+            @$this->SetValue('NetGateway', $ip('gateway'));
+            @$this->SetValue('NetDns', $ip('dns'));
+            @$this->SetValue('NetNtp', $ip('ntp'));
+            @$this->SetValue('NetDls', (bool) ($n['ntpDls'] ?? 0));
+            @$this->SetValue('NetHttpPort', (int) ($n['httpPort'] ?? 80));
+            @$this->SetValue('NetThermoEna', (bool) ($n['thermoEna'] ?? 0));
+            @$this->SetValue('NetThermoIp', $ip('thermo'));
+            @$this->SetValue('NetThermoPortEna', (bool) ($n['thermoPortEna'] ?? 0));
+            @$this->SetValue('NetThermoPort1', (int) ($n['thermoPort1'] ?? 0));
+            @$this->SetValue('NetThermoPort2', (int) ($n['thermoPort2'] ?? 0));
+        }
+        $oth = $cl->getOther();
+        if (!empty($oth['ok'])) {
+            $o = $oth['other'];
+            @$this->SetValue('OtherTimezone', (int) ($o['timezone'] ?? 1));
+            @$this->SetValue('OtherStatusMailMin', (int) ($o['statusMailMin'] ?? 0));
+            @$this->SetValue('OtherExtRelay', (int) ($o['extRelayMode'] ?? 0));
+            @$this->SetValue('OtherFlowCheck', (bool) ($o['flowCheck'] ?? 0));
+        }
+        $rt = $this->readRt();
+        $rt['netTs'] = time();
+        $this->writeRt($rt);
+    }
+
+    /** Ist-Spiegel E-Mail/SMTP/Kontakte/DTC/Kalibrierung, gedrosselt 900s (SD-schonend). */
+    private function spiegelMiscCfg(): void
+    {
+        $rt = $this->readRt();
+        if (time() - (int) ($rt['cfgMiscTs'] ?? 0) < 900) {
+            return;
+        }
+        $cl = $this->client();
+        if ($cl === null) {
+            return;
+        }
+        $acc = $cl->getEmailAccount();
+        if (!empty($acc['ok'])) {
+            $a = $acc['account'];
+            @$this->SetValue('MailEnabled', (bool) ($a['mail'] ?? 0));
+            @$this->SetValue('MailHtml', (bool) ($a['html'] ?? 0));
+            @$this->SetValue('MailSms', (bool) ($a['sms'] ?? 0));
+            @$this->SetValue('MailDebug', (bool) ($a['debug'] ?? 0));
+            @$this->SetValue('MailFrom', (string) ($a['from'] ?? ''));
+            @$this->SetValue('MailLanguage', (string) ($a['language'] ?? 'de'));
+            @$this->SetValue('SmsGwUser', (string) ($a['smsUser'] ?? ''));
+            @$this->SetValue('SmsGwPass', (string) ($a['smsPass'] ?? ''));
+            @$this->SetValue('SmsGwFrom', (string) ($a['smsFrom'] ?? ''));
+            @$this->SetValue('SmsGwApi', (string) ($a['smsApi'] ?? ''));
+            for ($i = 0; $i < 5; $i++) {
+                @$this->SetValue('MailTo' . $i, (string) ($a['to'][$i]['addr'] ?? ''));
+            }
+            for ($i = 0; $i < 2; $i++) {
+                @$this->SetValue('SmsTo' . $i, (string) ($a['smsTo'][$i]['num'] ?? ''));
+            }
+        }
+        $srv = $cl->getEmailServer();
+        if (!empty($srv['ok'])) {
+            $s = $srv['server'];
+            @$this->SetValue('SmtpServer', (string) ($s['smtp'] ?? ''));
+            @$this->SetValue('SmtpUser', (string) ($s['user'] ?? ''));
+            @$this->SetValue('SmtpPassword', (string) ($s['pwd'] ?? ''));
+            @$this->SetValue('SmtpFrom', (string) ($s['from'] ?? ''));
+        }
+        $con = $cl->getContacts();
+        if (!empty($con['ok'])) {
+            for ($i = 0; $i < 5; $i++) {
+                @$this->SetValue('Contact' . $i, (string) ($con['contacts'][$i] ?? ''));
+            }
+        }
+        $dtcCodes = $this->dtcCodeList();
+        if (!empty($dtcCodes)) {
+            $dtc = $cl->getDtc();
+            if (!empty($dtc['ok'])) {
+                $d = $dtc['dtc'];
+                foreach ($dtcCodes as $code) {
+                    $row   = $d[$code] ?? null;
+                    $level = 0;
+                    if (is_array($row)) {
+                        $level = !empty($row['sms']) ? 3 : (!empty($row['email']) ? 2 : (!empty($row['msg']) ? 1 : 0));
+                    }
+                    @$this->SetValue('DtcLevel' . $code, $level);
+                }
+            }
+        }
+        $hw  = $cl->getHwCal();
+        $rp  = $cl->getRdxPhCal();
+        $hwc = ($hw['ok'] ?? false) ? $hw['hwcal'] : [];
+        $rpc = ($rp['ok'] ?? false) ? $rp['rdxphcal'] : [];
+        foreach ($this->cfgVars() as $ident => $e) {
+            if ($e['grp'] !== 'cal') {
+                continue;
+            }
+            [$ch, $param] = array_pad(explode('.', $e['field'], 2), 2, '');
+            $src = ($e['op'] === 'setHwCal') ? $hwc : $rpc;
+            if (isset($src[$ch][$param])) {
+                @$this->SetValue($ident, (int) $src[$ch][$param]);
+            }
+        }
+        $rt = $this->readRt();
+        $rt['cfgMiscTs'] = time();
+        $this->writeRt($rt);
+    }
+
+    /**
+     * Ist-Spiegel der Regel-Sektionen TEMPC/ADCC/SWITCHC in die per-Regel-Variablen,
+     * gedrosselt 300s (SD-Schonung; INI-Lesungen). Liest je Sektion einmal getRules()
+     * und spiegelt jedes Regel-Feld aus rules[index][pos] in die zugehoerige CFGVAR.
+     * Roh->Anzeige: TEMPC diff/hyst /100; ADCC diff/hyst/lower/upper = offs+gain*raw
+     * (offs/gain aus der GetState-Spalte des Regel-Sensors rule[6], je Sensor gecacht);
+     * bool-Felder via !=0; alle uebrigen roh. Mapping identisch zu writeRuleField().
+     */
+    private function spiegelRules(): void
+    {
+        $rt = $this->readRt();
+        if (time() - (int) ($rt['rulesTs'] ?? 0) < 300) {
+            return;
+        }
+        $cl = $this->client();
+        if ($cl === null) {
+            return;
+        }
+        $maps = [
+            'TEMPC'   => ['ena' => 0, 'rel' => 1, 'start' => 2, 'end' => 3, 'state' => 4,
+                'sens1' => 5, 'sens2' => 6, 'logic' => 7, 'diff' => 8, 'hyst' => 9],
+            'ADCC'    => ['ena' => 0, 'rel' => 1, 'state' => 2, 'drel' => 3, 'start' => 4, 'end' => 5,
+                'sens' => 6, 'logic' => 7, 'diff' => 8, 'hyst' => 9, 'cLow' => 10, 'lower' => 11,
+                'cHigh' => 12, 'upper' => 13, 'bad' => 14, 'good' => 15],
+            'SWITCHC' => ['ena' => 0, 'inp' => 1, 'rel' => 2, 'func' => 3, 'time' => 4, 'state' => 5],
+        ];
+        $grpSec = ['tempc' => 'TEMPC', 'adcc' => 'ADCC', 'switchc' => 'SWITCHC'];
+        $rules  = [];
+        foreach ($grpSec as $sec) {
+            $r = $cl->getRules($sec);
+            $rules[$sec] = !empty($r['ok']) ? ($r['rules'] ?? []) : null;
+        }
+        // offs/gain je ADCC-Sensor nur einmal ermitteln (adccSensorScale liest getState).
+        $scaleCache = [];
+        $scale = function (int $sens) use ($cl, &$scaleCache): array {
+            if (!array_key_exists($sens, $scaleCache)) {
+                $scaleCache[$sens] = $this->adccSensorScale($cl, $sens);
+            }
+            return $scaleCache[$sens];
+        };
+        foreach ($this->cfgVars() as $ident => $e) {
+            $grp = (string) $e['grp'];
+            if (!isset($grpSec[$grp])) {
+                continue;
+            }
+            $sec = $grpSec[$grp];
+            if (!is_array($rules[$sec] ?? null)) {
+                continue;
+            }
+            $idx   = (int) $e['index'];
+            $field = (string) $e['field'];
+            $pos   = $maps[$sec][$field] ?? null;
+            if ($pos === null || !isset($rules[$sec][$idx][$pos])) {
+                continue;
+            }
+            $raw  = $rules[$sec][$idx][$pos];
+            $disp = $raw;
+            if ($sec === 'TEMPC' && ($field === 'diff' || $field === 'hyst')) {
+                $disp = ((float) $raw) / 100.0;
+            } elseif ($sec === 'ADCC' && in_array($field, ['diff', 'hyst', 'lower', 'upper'], true)) {
+                [$offs, $gain] = $scale((int) ($rules[$sec][$idx][6] ?? 255));
+                $disp = $offs + $gain * (float) $raw;
+            }
+            $this->setCfgValue($ident, $e, $disp);
+        }
+        $rt = $this->readRt();
+        $rt['rulesTs'] = time();
+        $this->writeRt($rt);
     }
 
     // ==================================================================
@@ -1259,7 +2734,184 @@ class PoolController extends EntityModule
         $this->profileFloat('HSPC.FlowRate', ' cm/s', 2, 0, 200);
         $this->profileFloat('HSPC.Percent', ' %', 1, 0, 100);
         $this->profileFloat('HSPC.Milliliter', ' ml', 0, 0, 100000);
+        $this->profileFloat('HSPC.Seconds', ' s', 0, 0, 86400); // GetDos-Laufzeitwerte (Float)
         $this->profileRelayMode();
+
+        // --- Neue Profile fuer die tabellengetriebenen Konfig-Variablen ---
+        // Skalare Sektionen (V1/V2/V5/V6/V7):
+        $this->profileFloat('HSPC.Liter', ' l', 2, 0, 200);        // Kanistergroesse
+        $this->profileFloat('HSPC.KP', ' ', 3, 0, 100);            // Proportionalband KP_PARM
+        $this->profileFloat('HSPC.Millisec', ' ms', 0, 0, 60000);  // Polwechsel-Pause
+        $this->profileBoolAssoc('HSPC.SaltMode', 'Fluessig (NaClO)', 'Salzelektrolyse');
+        $this->profileIntSelect('HSPC.CompIdx',
+            [0 => 'aus', 7 => 'Temp S0', 8 => 'Temp S1', 9 => 'Temp S2', 10 => 'Temp S3',
+             11 => 'Temp S4', 12 => 'Temp S5', 13 => 'Temp S6', 14 => 'Temp S7'], 0, 15, '');
+        $this->profileIntPlain('HSPC.Debounce', ' ms', 0, 1000);
+        $this->profileIntSelect('HSPC.ExtRelay', [0 => 'OFF', 1 => 'SPI', 3 => 'DMX'], 0, 3, '');
+        $this->profileIntSelect('HSPC.DtcLevel',
+            [0 => 'Ignorieren', 1 => 'Nur Meldung', 2 => 'Meldung + Mail', 3 => 'Meldung + Mail + SMS'], 0, 3, '');
+        $this->profileIntPlain('HSPC.CalRaw', '', -32768, 32767);
+
+        // Regel-Sektionen (V3/V4) — Profile hier bereits anlegen, damit die Regel-Phase
+        // nur noch Manifest/Poll ergaenzt (keine doppelte RULE_LOGIC-Definition):
+        $relay = [];
+        for ($i = 0; $i < 16; $i++) {
+            $relay[$i] = self::RELAY_LABELS[$i] ?? ('R' . ($i + 1));
+        }
+        $this->profileIntSelect('HSPC.RelayIdx', $relay, 0, 15, '');
+        $this->profileIntSelect('HSPC.PoolRelay', $relay, 0, 15, '');
+        // TEMPC-Sensoren: Rohwert = Sensor-Position 0..7 (OneWire S0..S7). Namen werden
+        // zur Laufzeit dynamisch aus getOneWireConfig() nachgezogen (refreshRuleSensorProfiles);
+        // hier nur ein sauberer Fallback OHNE Index-Suffixe.
+        $this->profileIntSelect('HSPC.TempSensor',
+            [0 => 'Pool', 1 => 'Aussen', 2 => 'Solarabsorber', 3 => 'Ruecklauf', 4 => 'Pumpe',
+             5 => 'Sensor 6', 6 => 'Sensor 7', 7 => 'Sensor 8'], 0, 7, '');
+        // sens2 kennt zusaetzlich 255 = Absolutwert (GUI-Option "(absolute)"): dann gilt der
+        // Regelwert als fester Schwellwert statt eines zweiten Sensors.
+        $this->profileIntSelect('HSPC.TempSensor2',
+            [0 => 'Pool', 1 => 'Aussen', 2 => 'Solarabsorber', 3 => 'Ruecklauf', 4 => 'Pumpe',
+             5 => 'Sensor 6', 6 => 'Sensor 7', 7 => 'Sensor 8', 255 => 'Absolut (Regelwert)'], 0, 255, '');
+        // Vergleichsoperatoren exakt wie GUI (var Logic = ["<","<=","==",">",">="]), Rohwert 0..4.
+        $this->profileIntSelect('HSPC.RuleLogic',
+            [0 => '<', 1 => '<=', 2 => '==', 3 => '>', 4 => '>='], 0, 4, '');
+        $this->profileFloat('HSPC.TempDelta', ' °C', 2, 0, 50);
+        $this->profileIntPlain('HSPC.DayMinute', ' min', 0, 1439);
+        $this->profileIntPlain('HSPC.MinuteOfDay', ' min', 0, 1439);
+        // ADCC-Sensor: Rohwert = Auswahl-POSITION 0..5, zugeordnet zu den ADC-Kanaelen
+        // [1,2,3,4,5,24] (GUI: AnalogIndex/AnalogNames). Namen dynamisch aus getAdcConfig()
+        // (Pos 0..4) + getIoConfig() (Pos 5). Fallback ohne Index-Suffixe:
+        $this->profileIntSelect('HSPC.AdccSensor',
+            [0 => 'Analog 1', 1 => 'Analog 2', 2 => 'Analog 3', 3 => 'Analog 4',
+             4 => 'Analog 5', 5 => 'Analog 6'], 0, 5, '');
+        // SWITCHC-Funktion exakt wie GUI (var Func = [NORMAL,STEP,IMPULSE,IMPULSE_RESET]),
+        // Ordinal 0..3, Beschriftung wie lang.js (STROMSTOß / IMPULS / IMPULS MIT RESET).
+        $this->profileIntSelect('HSPC.SwitchFunc',
+            [0 => 'NORMAL', 1 => 'Stromstoß', 2 => 'Impuls', 3 => 'Impuls mit Reset'], 0, 3, '');
+        // SWITCHC-Eingang: Rohwert = Digital-Input-Position 0..3 (GUI nameArray[k+24]).
+        // Namen dynamisch aus getIoConfig(); Fallback ohne Suffixe:
+        $this->profileIntSelect('HSPC.SwitchInput',
+            [0 => 'Eingang 1', 1 => 'Eingang 2', 2 => 'Eingang 3', 3 => 'Eingang 4'], 0, 3, '');
+        $this->profileIntPlain('HSPC.SecondsInt', ' s', 0, 86400);
+        // ADCC-Direkt-Relais (GUI DREL): 255 = "Uhrzeit" (Zeitfenster aktiv), sonst Relais-Index.
+        $drel = [255 => 'Uhrzeit'];
+        for ($i = 0; $i < 16; $i++) {
+            $drel[$i] = self::RELAY_LABELS[$i] ?? ('Relais ' . ($i + 1));
+        }
+        $this->profileIntSelect('HSPC.DRel', $drel, 0, 255, '');
+        $this->profileFloat('HSPC.AnalogThreshold', ' ', 2, -100000, 100000);
+    }
+
+    /**
+     * Zieht die Regel-Sensor-/Eingangsprofile mit den LIVE-Namen des Geraets nach,
+     * damit die Auswahllisten (TEMPC/ADCC/SWITCHC) die echten Kanalbezeichnungen
+     * zeigen statt der statischen Fallbacks. Additiv (ueberschreibt nur Assoziationen),
+     * vollstaendig gekapselt, kein Schreibzugriff aufs Geraet. Rohwert-Semantik exakt
+     * wie ProCon-GUI: TEMPC/SWITCHC = Sensor-/Input-Position, ADCC = Auswahl-Position
+     * 0..5 -> Kanaele [1,2,3,4,5,24].
+     */
+    private function refreshRuleSensorProfiles(PoolClient $cl): void
+    {
+        if (!function_exists('IPS_SetVariableProfileAssociation')) {
+            return;
+        }
+        // --- OneWire S0..S7 -> TempSensor / TempSensor2 (Rohwert = Sensor-Index) ---
+        try {
+            $ow = $cl->getOneWireConfig();
+            if (!empty($ow['ok'])) {
+                foreach (($ow['sensors'] ?? []) as $i => $s) {
+                    $i  = (int) $i;
+                    $nm = trim((string) ($s['name'] ?? ''));
+                    if ($i < 0 || $i > 7 || $nm === '' || $nm === 'n.a.') {
+                        continue;
+                    }
+                    @\IPS_SetVariableProfileAssociation('HSPC.TempSensor', $i, $nm, '', -1);
+                    @\IPS_SetVariableProfileAssociation('HSPC.TempSensor2', $i, $nm, '', -1);
+                }
+            }
+        } catch (\Throwable $e) {
+        }
+        // getIoConfig fuer ADCC-Position 5 (nameArray[24] = IO0) UND SwitchInput.
+        $io = null;
+        try {
+            $io = $cl->getIoConfig();
+        } catch (\Throwable $e) {
+        }
+        // --- ADCC-Auswahl 0..5 -> ADC-Kanaele [1,2,3,4,5,24] ---
+        //     Pos 0..4 = getAdcConfig()['channels'][0..4], Pos 5 = getIoConfig()['ios'][0].
+        try {
+            $adc = $cl->getAdcConfig();
+            if (!empty($adc['ok'])) {
+                for ($p = 0; $p < 5; $p++) {
+                    $nm = trim((string) ($adc['channels'][$p]['name'] ?? ''));
+                    if ($nm !== '' && $nm !== 'n.a.') {
+                        @\IPS_SetVariableProfileAssociation('HSPC.AdccSensor', $p, $nm, '', -1);
+                    }
+                }
+            }
+            if (is_array($io) && !empty($io['ok'])) {
+                $nm = trim((string) ($io['ios'][0]['name'] ?? ''));
+                if ($nm !== '' && $nm !== 'n.a.') {
+                    @\IPS_SetVariableProfileAssociation('HSPC.AdccSensor', 5, $nm, '', -1);
+                }
+            }
+        } catch (\Throwable $e) {
+        }
+        // --- SWITCHC-Eingang 0..3 -> Digital-Inputs (getIoConfig ios[0..3]) ---
+        if (is_array($io) && !empty($io['ok'])) {
+            foreach (($io['ios'] ?? []) as $i => $c) {
+                $i  = (int) $i;
+                $nm = trim((string) ($c['name'] ?? ''));
+                if ($i < 0 || $i > 3 || $nm === '' || $nm === 'n.a.') {
+                    continue;
+                }
+                @\IPS_SetVariableProfileAssociation('HSPC.SwitchInput', $i, $nm, '', -1);
+            }
+        }
+    }
+
+    /** Boolean-Profil mit zwei Assoziationen (false/true). */
+    private function profileBoolAssoc(string $name, string $falseLabel, string $trueLabel): void
+    {
+        if (!function_exists('IPS_VariableProfileExists')) {
+            return;
+        }
+        if (!@\IPS_VariableProfileExists($name)) {
+            @\IPS_CreateVariableProfile($name, 0); // Boolean
+        }
+        @\IPS_SetVariableProfileAssociation($name, 0, $falseLabel, '', -1);
+        @\IPS_SetVariableProfileAssociation($name, 1, $trueLabel, '', -1);
+    }
+
+    /** Integer-Profil mit Wertebereich/Suffix, ohne Assoziationen. */
+    private function profileIntPlain(string $name, string $suffix, int $min, int $max): void
+    {
+        if (!function_exists('IPS_VariableProfileExists')) {
+            return;
+        }
+        if (!@\IPS_VariableProfileExists($name)) {
+            @\IPS_CreateVariableProfile($name, 1); // Integer
+        }
+        @\IPS_SetVariableProfileText($name, '', $suffix);
+        @\IPS_SetVariableProfileDigits($name, 0);
+        @\IPS_SetVariableProfileValues($name, $min, $max, 1);
+    }
+
+    /**
+     * Integer-Select-Profil (Assoziationen). $assoc = [value => label].
+     */
+    private function profileIntSelect(string $name, array $assoc, int $min, int $max, string $suffix = ''): void
+    {
+        if (!function_exists('IPS_VariableProfileExists')) {
+            return;
+        }
+        if (!@\IPS_VariableProfileExists($name)) {
+            @\IPS_CreateVariableProfile($name, 1); // Integer
+        }
+        @\IPS_SetVariableProfileText($name, '', $suffix);
+        @\IPS_SetVariableProfileValues($name, $min, $max, 1);
+        foreach ($assoc as $value => $label) {
+            @\IPS_SetVariableProfileAssociation($name, (int) $value, (string) $label, '', -1);
+        }
     }
 
     private function profileRelayMode(): void
@@ -1337,6 +2989,7 @@ class PoolController extends EntityModule
             'minPlausible'      => $this->ReadPropertyFloat('MinPlausible'),
             'maxPlausible'      => $this->ReadPropertyFloat('MaxPlausible'),
             'maxStaleSeconds'   => $this->ReadPropertyInteger('MaxStaleSeconds'),
+            'calibrationAllowed' => $this->ReadPropertyBoolean('CalibrationAllowed'),
         ];
     }
 
@@ -1365,7 +3018,10 @@ class PoolController extends EntityModule
 
     public function SetDosingRedoxAuto(bool $On): bool { return $this->setControlValue('DosingClAuto', $On); }
     public function SetDosingPHAuto(bool $On): bool    { return $this->setControlValue('DosingPHAuto', $On); }
+    public function SetDosingPHPAuto(bool $On): bool   { return $this->setControlValue('DosingPHPAuto', $On); }
     public function SetCircAuto(bool $On): bool        { return $this->setControlValue('CircAuto', $On); }
+    /** Test-Mail an Kontakt-Index (0..4). */
+    public function SendTestMail(int $Index = 0): bool { return $this->pcManage('sendTestMail', ['index' => max(0, $Index)]); }
 
     /** Relais 0..7 -> Modus 0=Auto/1=Manuell Aus/2=Manuell Ein. */
     public function SetRelayMode(int $Index, int $Mode): bool
@@ -1481,6 +3137,7 @@ class PoolController extends EntityModule
                 ]],
 
                 ['type' => 'CheckBox', 'name' => 'Armed', 'caption' => 'Scharf: reale Schreibzugriffe (Relais/Dosierung) erlauben — sonst nur Schatten-Modus'],
+                ['type' => 'CheckBox', 'name' => 'CalibrationAllowed', 'caption' => 'Kalibrierung erlauben (schreibt DIREKT in die ADC/Elektroden-Messkette — nur fuer Fachpersonal)'],
             ],
 
             'actions' => [
@@ -1501,7 +3158,7 @@ class PoolController extends EntityModule
                     ['type' => 'Button', 'caption' => 'Relais setzen', 'onClick' =>
                         'echo HSPC_Manage($id, json_encode(["op"=>"setRelayMode","args"=>["index"=>$relIdx,"mode"=>$relMode]]));'],
                 ]],
-                ['type' => 'Label', 'caption' => '— Manuelle Dosierung / Sollwerte (nur bei "scharf") —'],
+                ['type' => 'Label', 'caption' => '— Manuelle Dosierung (nur bei "scharf"; Sollwerte jetzt ueber Visu-Variablen) —'],
                 ['type' => 'RowLayout', 'items' => [
                     ['type' => 'Select', 'name' => 'dosType', 'caption' => 'Regler', 'value' => 0, 'options' => [
                         ['caption' => 'Chlor/Redox', 'value' => 0], ['caption' => 'pH-minus', 'value' => 1], ['caption' => 'pH-plus', 'value' => 2],
@@ -1509,12 +3166,6 @@ class PoolController extends EntityModule
                     ['type' => 'NumberSpinner', 'name' => 'dosSec', 'caption' => 'Dosierdauer (s, 0=Stop)', 'value' => 0, 'minimum' => 0, 'maximum' => 600],
                     ['type' => 'Button', 'caption' => 'Dosieren', 'onClick' =>
                         'echo HSPC_Manage($id, json_encode(["op"=>"doDosage","args"=>["type"=>$dosType,"seconds"=>$dosSec]]));'],
-                    ['type' => 'NumberSpinner', 'name' => 'dcTarget', 'caption' => 'Sollwert', 'value' => 7.2, 'digits' => 2],
-                    ['type' => 'NumberSpinner', 'name' => 'dcLow', 'caption' => 'Min', 'value' => 6.6, 'digits' => 2],
-                    ['type' => 'NumberSpinner', 'name' => 'dcHigh', 'caption' => 'Max', 'value' => 7.6, 'digits' => 2],
-                    ['type' => 'Button', 'caption' => 'Sollwerte setzen', 'onClick' =>
-                        'echo HSPC_Manage($id, json_encode(["op"=>"setDosageConfig","args"=>["type"=>$dosType,'
-                        . '"config"=>["enabled"=>true,"target"=>$dcTarget,"lowerLimit"=>$dcLow,"upperLimit"=>$dcHigh]]]));'],
                 ]],
                 ['type' => 'RowLayout', 'items' => [
                     ['type' => 'Button', 'caption' => 'Fehlerlog lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"readErrors"]));'],
@@ -1527,6 +3178,63 @@ class PoolController extends EntityModule
                 ['type' => 'RowLayout', 'items' => [
                     ['type' => 'Button', 'caption' => 'Wochenplan-Status', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"scheduleStatus"]));'],
                     ['type' => 'Button', 'caption' => 'Wochenplan an Controller senden', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"sendSchedule"]));'],
+                    ['type' => 'NumberSpinner', 'name' => 'FilterRuleCount', 'caption' => 'Wochenplan: Anzahl Regeln (je Wochentag-Gruppe eine)', 'minimum' => 1, 'maximum' => 7],
+                ]],
+
+
+
+
+                // ==========================================================
+                // S6 — Sensor-Konfiguration ADC/BNC/1-Wire/IO (Einzelkanal-RMW) + Rechenhelfer
+                // ==========================================================
+                ['type' => 'ExpansionPanel', 'caption' => 'Sensor-Diagnose & Rechenhelfer (ADC/BNC/1-Wire/IO)', 'items' => [
+                    ['type' => 'Label', 'caption' => 'Die Sensor-Konfiguration erfolgt jetzt ueber die schreibbaren Sensor-Variablen. Hier nur Lesen (Diagnose) und Rechenhelfer (2-Punkt-Kalibrierung, Impulszaehler-Gain).'],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'Button', 'caption' => 'Alle Sektionen lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getSensorConfig"]));'],
+                        ['type' => 'Button', 'caption' => '1-Wire ROM-Codes lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getRomCodes"]));'],
+                    ]],
+                    ['type' => 'Label', 'caption' => '  ADC 2-Punkt-Kalibrierung (rechnet gain/offset — Ergebnis in die ADC-Gain/Offset-Variablen eintragen):'],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'NumberSpinner', 'name' => 'cRaw1', 'caption' => 'Roh 1', 'digits' => 3],
+                        ['type' => 'NumberSpinner', 'name' => 'cVal1', 'caption' => 'Anzeige 1', 'digits' => 3],
+                        ['type' => 'NumberSpinner', 'name' => 'cRaw2', 'caption' => 'Roh 2', 'digits' => 3],
+                        ['type' => 'NumberSpinner', 'name' => 'cVal2', 'caption' => 'Anzeige 2', 'digits' => 3],
+                        ['type' => 'Button', 'caption' => 'Gain/Offset berechnen', 'onClick' =>
+                            'echo HSPC_Manage($id, json_encode(["op"=>"calcGainOffset","args"=>["raw1"=>$cRaw1,"raw2"=>$cRaw2,"val1"=>$cVal1,"val2"=>$cVal2]]));'],
+                    ]],
+                    ['type' => 'Label', 'caption' => '  Impulszaehler-Gain berechnen (Ergebnis in die IO-Gain-Variable eintragen):'],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'Select', 'name' => 'icType', 'caption' => 'Sensortyp', 'value' => 0, 'options' => [
+                            ['caption' => 'Impulse/Liter', 'value' => 0], ['caption' => 'Hz pro m/s', 'value' => 1]]],
+                        ['type' => 'NumberSpinner', 'name' => 'icInput', 'caption' => 'Kennwert (Imp/l bzw. Hz/(m/s))', 'digits' => 4],
+                        ['type' => 'NumberSpinner', 'name' => 'icDia', 'caption' => 'Rohr-Innen-Ø (mm)', 'digits' => 2],
+                        ['type' => 'Select', 'name' => 'icUnit', 'caption' => 'Ausgabeeinheit', 'value' => 6, 'options' => [
+                            ['caption' => 'cm/s', 'value' => 0], ['caption' => 'm/s', 'value' => 1], ['caption' => 'l/min', 'value' => 2],
+                            ['caption' => 'l/h', 'value' => 3], ['caption' => 'm³/s', 'value' => 4], ['caption' => 'm³/min', 'value' => 5], ['caption' => 'm³/h', 'value' => 6]]],
+                        ['type' => 'Button', 'caption' => 'Impuls-Gain berechnen', 'onClick' =>
+                            'echo HSPC_Manage($id, json_encode(["op"=>"calcImpulseGain","args"=>["sensorType"=>$icType,"inputValue"=>$icInput,"diameter"=>$icDia,"outputUnit"=>$icUnit]]));'],
+                    ]],
+                ]],
+
+
+                // ==========================================================
+                // S8 — Alarme / E-Mail / Kontakte / OTHER / Kalibrierung
+                // ==========================================================
+                ['type' => 'ExpansionPanel', 'caption' => 'Alarme / E-Mail / Kontakte / Sonstiges — Diagnose (Lesen; Bearbeitung ueber Visu-Variablen)', 'items' => [
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'Button', 'caption' => 'E-Mail/Alarm lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getEmail"]));'],
+                        ['type' => 'Button', 'caption' => 'Kontakte lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getContacts"]));'],
+                        ['type' => 'Button', 'caption' => 'Alarm-Matrix lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getDtc"]));'],
+                        ['type' => 'Button', 'caption' => 'Sonstiges lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getOther"]));'],
+                    ]],
+                    ['type' => 'RowLayout', 'items' => [
+                        ['type' => 'NumberSpinner', 'name' => 'tmIdx', 'caption' => 'Test-Mail an Kontakt-Index (0..4)', 'value' => 0, 'minimum' => 0, 'maximum' => 4],
+                        ['type' => 'Button', 'caption' => 'Test-Mail senden', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"sendTestMail","args"=>["index"=>$tmIdx]]));'],
+                    ]],
+                ]],
+                ['type' => 'ExpansionPanel', 'caption' => 'Kalibrierung (Messkette) — Diagnose (Lesen)', 'items' => [
+                    ['type' => 'Label', 'caption' => 'Kalibrier-Offset/Gain (ADC bzw. Redox/pH-Elektroden) werden jetzt ueber die schreibbaren Kalibrier-Variablen gesetzt (Doppel-Gate: "scharf" + "Kalibrierung erlauben"). Hier nur Lesen.'],
+                    ['type' => 'Button', 'caption' => 'Kalibrierung lesen', 'onClick' => 'echo HSPC_Manage($id, json_encode(["op"=>"getCal"]));'],
                 ]],
             ],
 
