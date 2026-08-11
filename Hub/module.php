@@ -1224,20 +1224,20 @@ class HomeSuiteHub extends EntityModule
         if (!function_exists('CC_GetUrl')) {
             return '';
         }
-        $cid = 0;
-        foreach (@IPS_GetInstanceList() ?: [] as $iid) {
-            $mi = @IPS_GetInstance($iid)['ModuleInfo']['ModuleName'] ?? '';
-            if ($mi === 'Symcon Connect') {
-                $cid = $iid;
-                break;
+        // Connect-Instanz robust ueber die Modul-GUID finden (ModuleName variiert:
+        // "Connect Control" statt "Symcon Connect"). Erste mit gueltiger URL nehmen.
+        $CONNECT = '{9486D575-BE8C-4ED8-B5B5-20930E26DE6F}';
+        foreach (@\IPS_GetInstanceListByModuleID($CONNECT) ?: [] as $iid) {
+            try {
+                $u = rtrim((string) @CC_GetUrl($iid), '/');
+            } catch (\Throwable $e) {
+                $u = '';
+            }
+            if ($u !== '') {
+                return $u;
             }
         }
-        try {
-            $u = (string) @CC_GetUrl($cid ?: 0);
-        } catch (\Throwable $e) {
-            $u = '';
-        }
-        return rtrim($u, '/');
+        return '';
     }
 
     /** Redirect-URI fuer Spotify (Connect-URL + fester Hook). */
