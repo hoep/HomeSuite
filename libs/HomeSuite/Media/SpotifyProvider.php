@@ -99,7 +99,7 @@ final class SpotifyProvider implements IMediaProvider
                     (string) ($a['name'] ?? ''), (string) ($a['artists'][0]['name'] ?? ''), '',
                     (string) ($a['images'][0]['url'] ?? ''), '', 0, true);
             }
-            return $out;
+            return ContentRef::sortByArtistTitle($out); // Interpret -> Album
         }
         if (strncmp($containerId, 'pl:', 3) === 0) {
             $j = $this->api('/playlists/' . rawurlencode(substr($containerId, 3)) . '/tracks?limit=' . $limit . '&offset=' . $offset);

@@ -66,7 +66,8 @@ final class PlexProvider implements IMediaProvider
         }
         if (strncmp($containerId, 'sec:', 4) === 0) {
             $j = $this->get('/library/sections/' . rawurlencode(substr($containerId, 4)) . '/all?type=9'); // 9=album
-            return $this->mapMeta($j['MediaContainer']['Metadata'] ?? [], true);
+            // Alben/Hoerbuecher nach Interpret/Autor, dann Titel (statt nur Titel).
+            return ContentRef::sortByArtistTitle($this->mapMeta($j['MediaContainer']['Metadata'] ?? [], true));
         }
         if (strncmp($containerId, 'key:', 4) === 0) {
             $j = $this->get(substr($containerId, 4)); // Container-Kinder (Album/Playlist-Items)

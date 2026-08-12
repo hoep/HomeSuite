@@ -234,6 +234,26 @@ final class ContentRef
     }
 
     /**
+     * Sortiert eine Liste von ContentRefs nach Interpret/Autor, dann Titel (case-insensitive,
+     * natuerliche Reihenfolge). Fuer Alben- und Hoerbuch-Listen — NICHT fuer Tracks (Reihenfolge!)
+     * oder Playlists (die bleiben in Zuletzt-/API-Reihenfolge). Leerer Interpret sortiert ans Ende.
+     *
+     * @param ContentRef[] $refs
+     * @return ContentRef[]
+     */
+    public static function sortByArtistTitle(array $refs): array
+    {
+        $key = static function (string $s): string {
+            $s = trim($s);
+            return $s === '' ? "\u{10FFFF}" : mb_strtolower($s, 'UTF-8');
+        };
+        usort($refs, static function (ContentRef $a, ContentRef $b) use ($key): int {
+            return [$key($a->artist), $key($a->title)] <=> [$key($b->artist), $key($b->title)];
+        });
+        return $refs;
+    }
+
+    /**
      * ContentRef -> AudioSourceRef (fuer IAudioRenderer::playSource). Die eigentliche
      * Uebersetzung macht der Renderer anhand metadata.contentKind (url|dlna|spotify|
      * station|container|...). kind bleibt hier bewusst grob (STATION nur fuer Radio).

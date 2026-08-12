@@ -94,7 +94,8 @@ final class AudiobookshelfProvider implements IMediaProvider
     private function libraryItems(string $libId, int $offset, int $limit): array
     {
         $page = (int) floor($offset / max(1, $limit));
-        $j = json_decode($this->http('/api/libraries/' . rawurlencode($libId) . '/items?limit=' . $limit . '&page=' . $page . '&sort=media.metadata.title'), true);
+        // Serverseitig nach Autor sortieren (paginierungs-stabil ueber Seiten), Titel als Feinsortierung folgt clientseitig.
+        $j = json_decode($this->http('/api/libraries/' . rawurlencode($libId) . '/items?limit=' . $limit . '&page=' . $page . '&sort=media.metadata.authorName'), true);
         $out = [];
         foreach ((array) ($j['results'] ?? []) as $it) {
             $md = (array) (($it['media']['metadata'] ?? []));
@@ -102,7 +103,7 @@ final class AudiobookshelfProvider implements IMediaProvider
                 '', (string) ($md['title'] ?? ''), (string) ($md['authorName'] ?? ''), '',
                 $this->coverUrl((string) $it['id']), '', (int) round((float) (($it['media']['duration'] ?? 0))), true);
         }
-        return $out;
+        return ContentRef::sortByArtistTitle($out); // Autor -> Titel
     }
 
     /** Audiospuren eines Hoerbuchs als abspielbare (URL-)Items. */
@@ -144,7 +145,7 @@ final class AudiobookshelfProvider implements IMediaProvider
                     $this->coverUrl((string) ($it['id'] ?? '')), '', 0, true);
             }
         }
-        return $out;
+        return ContentRef::sortByArtistTitle($out); // Autor -> Titel
     }
 
     public function resolve(ContentRef $ref): ContentRef
