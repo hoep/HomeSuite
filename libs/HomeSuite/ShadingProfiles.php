@@ -40,7 +40,8 @@ final class ShadingProfiles
                 'azimuthEnd'    => ['type' => 'int',   'min' => 0,   'max' => 360, 'label' => 'Azimut bis (°)'],
                 'elevation'     => ['type' => 'int',   'min' => -10, 'max' => 90,  'label' => 'Elevations-Schwelle (°)'],
                 'brightnessMin' => ['type' => 'int',   'min' => 0,   'max' => 200000, 'label' => 'Helligkeit min (0=aus)'],
-                'closePct'      => ['type' => 'int',   'min' => 0,   'max' => 100, 'label' => 'Ziel-Position bei Sonne (%)'],
+                // closePct (Schliessgrad) ist PRO ROLLO (Baum-Var SunClose, im Besonnung-Widget
+                // einstellbar) - bewusst NICHT im geteilten Profil-Schema, sonst doppelt.
             ]],
             ['id' => 'weather', 'title' => 'Wetterschutz', 'editor' => 'fields', 'schema' => [
                 'windMaxKmh' => ['type' => 'int',  'min' => 0, 'max' => 200, 'label' => 'Wind max (km/h)'],

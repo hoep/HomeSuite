@@ -172,6 +172,15 @@ class ShadingDevice extends EntityModule
                     'role' => 'shading:sunElev', 'label' => 'Sonne Elevation-Schwelle',
                     'varType' => 1, 'unit' => '°', 'min' => -10, 'max' => 90, 'step' => 1, 'actionable' => true,
                 ],
+                // Per-Rollo Sonnen-Schliessgrad: wie weit dieses Rollo bei Sonne im
+                // Fenster schliesst (0..100 %). Ueberschreibt den geteilten Profilwert
+                // -> West 100 %, andere 75/50 % moeglich (wie IPSShadowing shadowingPos).
+                [
+                    'ident' => 'SunClose', 'type' => ControlContract::T_LEVEL,
+                    'role' => 'shading:sunClose', 'label' => 'Sonne Schließgrad',
+                    'varType' => 1, 'unit' => '%', 'min' => 0, 'max' => 100, 'step' => 5, 'actionable' => true,
+                    'profile' => '~Intensity.100',
+                ],
                 [
                     'ident' => 'Online', 'type' => ControlContract::T_REFLECT,
                     'role' => 'shading:online', 'label' => 'Online',
@@ -1030,8 +1039,11 @@ class ShadingDevice extends EntityModule
             $el  = (int) @$this->GetValue('SunElev');
             if ($bgn !== 0 || $end !== 0 || $el !== 0) {
                 $st = $this->cfgVal('geoProfile', null); $st = is_array($st) ? $st : [];
+                // Schliessgrad pro Rollo aus SunClose (Wahrheit); 0/fehlend -> Store bzw. 100.
+                $cp = @$this->GetIDForIdent('SunClose') ? (int) @$this->GetValue('SunClose') : 0;
+                if ($cp <= 0) { $cp = (int) ($st['closePct'] ?? 100); }
                 return ['azimuthBgn' => $bgn, 'azimuthEnd' => $end, 'elevation' => $el,
-                        'closePct' => (int) ($st['closePct'] ?? 100), 'brightnessMin' => (int) ($st['brightnessMin'] ?? 0)];
+                        'closePct' => $cp, 'brightnessMin' => (int) ($st['brightnessMin'] ?? 0)];
             }
         }
         $st = $this->cfgVal('geoProfile', null);
@@ -1045,6 +1057,11 @@ class ShadingDevice extends EntityModule
         @$this->SetValue('SunAzBgn', (int) ($gp['azimuthBgn'] ?? 0));
         @$this->SetValue('SunAzEnd', (int) ($gp['azimuthEnd'] ?? 0));
         @$this->SetValue('SunElev', (int) ($gp['elevation'] ?? 0));
+        // Schliessgrad nur seeden, wenn noch nicht sinnvoll gesetzt (>0), damit ein
+        // per-Rollo-Override nicht bei jeder Profilzuweisung ueberschrieben wird.
+        if (@$this->GetIDForIdent('SunClose') && (int) @$this->GetValue('SunClose') <= 0) {
+            @$this->SetValue('SunClose', (int) ($gp['closePct'] ?? 100));
+        }
     }
 
     /** Dreht das Zonen-Sonnenprofil (Baum-Variablen SunAzBgn/End) um deltaDeg (Nordausrichtung). */
@@ -1073,11 +1090,15 @@ class ShadingDevice extends EntityModule
         $armed  = (bool) $this->cfgVal('armed', false);
         $target = $d['target'];
         $drift  = ($d['cur'] === IShutter::POS_UNKNOWN) || ($target !== null && abs($d['cur'] - $target) > self::POS_TOLERANCE);
+        // Ist-Position fuer die Anzeige: bei rueckmeldungslosen Treibern (Somfy) auf die
+        // gespiegelte ActualPosition (IPSShadowing-Position) zurueckfallen statt UNKNOWN.
+        $curIst = $d['cur'];
+        if ($curIst === IShutter::POS_UNKNOWN) { $ap = @$this->GetValue('ActualPosition'); if (is_numeric($ap)) { $curIst = (int) $ap; } }
         return [
             'ok'           => true,
             'driverActive' => true,
             'armed'        => $armed,
-            'current'      => $d['cur'],
+            'current'      => $curIst,
             'target'       => $target,
             'wouldMove'    => ($armed && $target !== null && $drift && !$d['blockedByDoor']),
             'doorOpen'     => $d['doorOpen'],
@@ -1631,7 +1652,7 @@ class ShadingDevice extends EntityModule
         // Tuer-Guard: Zufahren gegen offene Tuer blocken (Auffahren/Sturm bleibt erlaubt).
         if ($d['blockedByDoor']) {
             $this->SendDebug('HSSH.guard', 'Tuer offen -> Zufahren auf ' . $target . '% blockiert', 0);
-            $this->logDecision((int) $cur, (int) $target, 'Tür blockiert', $armed, 'auto');
+            if ($armed) { $this->logDecision((int) $cur, (int) $target, 'Tür blockiert', true, 'auto'); } // nur echte (scharfe) Ereignisse loggen
             $rt['blockedTs'] = time();
             $this->writeRt($rt);
             return;
@@ -1652,7 +1673,8 @@ class ShadingDevice extends EntityModule
             $this->SendDebug('HSSH.shadow', 'Ziel ' . $target . '% (ist ' . $cur . '%, '
                 . ($d['storm'] ? 'STURM' : ($d['sunTarget'] !== null ? 'Sonne' : 'Zeitplan')) . ') - nicht scharf | '
                 . $this->drivePreview($drv, (int) $target, (int) $cur), 0);
-            $this->logDecision((int) $cur, (int) $target, $this->reasonOf($d), false, 'auto');
+            // KEIN Log im Schatten-Modus: es faehrt nichts -> waeren nur hypothetische
+            // Wiederholungen (Rauschen). Geloggt werden nur echte Fahrten (armed) + Manuell.
             $rt['shadowTarget'] = $target;
             $rt['shadowTs']     = time();
             $this->writeRt($rt);
