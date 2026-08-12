@@ -62,6 +62,13 @@ abstract class EntityModule extends \IPSModule
     /** Lazy-Store-Instanz. */
     private ?Store $storeInstance = null;
 
+    /**
+     * Lazy-Cache Ident => ObjektID fuer den GESAMTEN Instanz-Teilbaum (inkl.
+     * Gruppen-Kategorien). Ermoeglicht subtree-faehige Ident-Aufloesung, damit
+     * in Kategorien einsortierte Statusvariablen weiter per Ident gefunden werden.
+     */
+    private ?array $identMap = null;
+
     // ==================================================================
     // Lebenszyklus
     // ==================================================================
@@ -91,7 +98,16 @@ abstract class EntityModule extends \IPSModule
         // Controls aus dem Manifest materialisieren: Variablen anlegen,
         // EnableAction (auch fuer command! F5).
         $this->controlCache = null;
-        $this->registerControls();
+        $this->identMap     = null;
+        if ($this->usesVariableGroups()) {
+            // Statusvariablen in beschriftete Kategorien einsortieren (IDs bleiben
+            // erhalten). Ersetzt registerControls(), das per SDK-RegisterVariable
+            // gruppierte Variablen sonst flach NEU anlegen wuerde (nur direkte
+            // Kinder werden gefunden) -> Dubletten.
+            $this->materializeControlsGrouped();
+        } else {
+            $this->registerControls();
+        }
 
         // Baum-Transparenz: sichtbare Links auf die gebundenen Quell-Variablen/
         // Aktoren anlegen/pflegen, damit im Symcon-Objektbaum nachvollziehbar ist,
@@ -1183,6 +1199,233 @@ abstract class EntityModule extends \IPSModule
 
             $pos++;
         }
+    }
+
+    // ==================================================================
+    // Variablen-Gruppierung (Baum-Struktur) + subtree-faehige Aufloesung
+    // ==================================================================
+
+    /**
+     * Ob dieses Modul seine Statusvariablen in beschriftete Kategorien gruppiert.
+     * Default: nein (flache Ablage wie bisher). Domaenen mit sehr vielen
+     * Variablen (z. B. PoolController) ueberschreiben mit true + controlGroup().
+     */
+    protected function usesVariableGroups(): bool
+    {
+        return false;
+    }
+
+    /**
+     * Liefert den Gruppen-/Kategorienamen fuer ein Control (nur relevant, wenn
+     * usesVariableGroups() true ist). Default: eine Sammelgruppe.
+     */
+    protected function controlGroup(string $ident, Control $c): string
+    {
+        return 'Allgemein';
+    }
+
+    /**
+     * Materialisiert die Manifest-Controls und sortiert ihre Statusvariablen in
+     * beschriftete Kategorien unter der Instanz. BESTEHENDE Variablen werden
+     * wiederverwendet (per Ident im Teilbaum gesucht) und nur verschoben -> die
+     * Objekt-IDs bleiben erhalten (LVB-Referenzen bleiben gueltig). Idempotent.
+     */
+    private function materializeControlsGrouped(): void
+    {
+        $m        = $this->manifest();
+        $controls = (isset($m['controls']) && is_array($m['controls'])) ? $m['controls'] : [];
+
+        // 1) Controls nach Gruppe bucketieren (Manifest-Reihenfolge erhalten).
+        $buckets = [];
+        $order   = [];
+        foreach ($controls as $descriptor) {
+            if (!is_array($descriptor) || !isset($descriptor['ident'])) {
+                continue;
+            }
+            $c = Control::fromArray($descriptor);
+            $g = $this->controlGroup($c->ident, $c);
+            if ($g === '') {
+                $g = 'Allgemein';
+            }
+            if (!isset($buckets[$g])) {
+                $buckets[$g] = [];
+                $order[]     = $g;
+            }
+            $buckets[$g][] = $c;
+        }
+
+        // 2) Kategorien sicherstellen und Variablen einsortieren.
+        $catPos = 0;
+        foreach ($order as $g) {
+            $cat = $this->ensureGroupCategory($g, $catPos++);
+            $pos = 0;
+            foreach ($buckets[$g] as $c) {
+                $vid = $this->resolveIdentDeep($c->ident);
+                if (!$vid) {
+                    // Neu anlegen (Sonderfall: sollte bei bestehender Instanz nicht
+                    // vorkommen — alle 518 existieren bereits flach).
+                    $vid = @IPS_CreateVariable($c->varType);
+                    if ($vid) {
+                        @IPS_SetIdent($vid, $c->ident);
+                        if (($c->profile ?? '') !== '') {
+                            @IPS_SetVariableCustomProfile($vid, $c->profile);
+                        }
+                    }
+                }
+                if (!$vid) {
+                    continue;
+                }
+                // Name (idempotent nachziehen).
+                if ($c->label !== '' && @IPS_GetName($vid) !== $c->label) {
+                    @IPS_SetName($vid, $c->label);
+                }
+                // In die Zielkategorie verschieben (ID bleibt erhalten).
+                if (@IPS_GetParent($vid) !== $cat) {
+                    @IPS_SetParent($vid, $cat);
+                }
+                @IPS_SetPosition($vid, $pos++);
+                // Aktion: actionable Controls muessen RequestAction dieser Instanz
+                // ausloesen (Modul-Aktion VariableAction, NICHT CustomAction — die
+                // nimmt nur Skripte an). EnableAction loest den Ident aber ueber
+                // direkte Kinder auf; die Variable liegt in einer Kategorie. Daher
+                // nur bei fehlender/falscher Aktion kurz als direktes Kind halten,
+                // EnableAction, zurueck. Fuer die bestehenden 518 ist VA bereits
+                // gesetzt -> dieser Zweig wird uebersprungen (kein Churn).
+                if ($c->actionable) {
+                    $va = @IPS_GetVariable($vid)['VariableAction'] ?? 0;
+                    if ((int) $va !== $this->InstanceID) {
+                        @IPS_SetParent($vid, $this->InstanceID);
+                        @$this->EnableAction($c->ident);
+                        @IPS_SetParent($vid, $cat);
+                        @IPS_SetPosition($vid, $pos - 1);
+                    }
+                }
+            }
+        }
+
+        // Ident-Cache verwerfen — die Variablen liegen jetzt (teilweise) in
+        // Kategorien; Aufloesung erfolgt ab sofort ueber den Teilbaum.
+        $this->identMap = null;
+    }
+
+    /**
+     * Stellt eine beschriftete Gruppen-Kategorie direkt unter der Instanz sicher
+     * (stabiler Ident aus dem Namen, damit wiederverwendbar/umbenennbar).
+     */
+    private function ensureGroupCategory(string $name, int $pos): int
+    {
+        $ident = 'hsgrp_' . substr(md5($name), 0, 12);
+        $cid   = @IPS_GetObjectIDByIdent($ident, $this->InstanceID);
+        if ($cid === false) {
+            $cid = IPS_CreateCategory();
+            IPS_SetParent($cid, $this->InstanceID);
+            IPS_SetIdent($cid, $ident);
+        }
+        if (@IPS_GetName($cid) !== $name) {
+            @IPS_SetName($cid, $name);
+        }
+        @IPS_SetPosition($cid, $pos);
+        return (int) $cid;
+    }
+
+    /**
+     * Baut (lazy, pro Prozess) die Abbildung Ident => ObjektID fuer den gesamten
+     * Instanz-Teilbaum. Steigt in Kategorien ab, NICHT in Kind-Instanzen (die
+     * haben einen eigenen Ident-Namensraum).
+     */
+    private function identMap(): array
+    {
+        if ($this->identMap !== null) {
+            return $this->identMap;
+        }
+        $map = [];
+        $this->collectIdents($this->InstanceID, $map);
+        $this->identMap = $map;
+        return $map;
+    }
+
+    /** Rekursiver Sammler fuer identMap(). */
+    private function collectIdents(int $parent, array &$map): void
+    {
+        foreach (IPS_GetChildrenIDs($parent) as $cid) {
+            $o = IPS_GetObject($cid);
+            $ident = $o['ObjectIdent'];
+            if ($ident !== '' && !isset($map[$ident])) {
+                $map[$ident] = $cid;
+            }
+            // Nur in Kategorien absteigen (Typ 0). Kind-Instanzen (Typ 1) haben
+            // einen eigenen Ident-Namensraum und werden nicht durchsucht.
+            if ($o['ObjectType'] === 0) {
+                $this->collectIdents($cid, $map);
+            }
+        }
+    }
+
+    /**
+     * Loest einen Ident im GESAMTEN Instanz-Teilbaum auf: erst direktes Kind
+     * (schnell, deckt flache Module vollstaendig ab), sonst ueber den Teilbaum-
+     * Cache. Liefert 0, wenn nicht gefunden.
+     */
+    private function resolveIdentDeep(string $ident): int
+    {
+        $d = @IPS_GetObjectIDByIdent($ident, $this->InstanceID);
+        if ($d !== false) {
+            return (int) $d;
+        }
+        $m = $this->identMap();
+        if (isset($m[$ident]) && @IPS_ObjectExists($m[$ident])) {
+            return (int) $m[$ident];
+        }
+        // Cache koennte veraltet sein -> einmal neu aufbauen und erneut pruefen.
+        $this->identMap = null;
+        $m = $this->identMap();
+        return (isset($m[$ident]) && @IPS_ObjectExists($m[$ident])) ? (int) $m[$ident] : 0;
+    }
+
+    /**
+     * Override der SDK-Ident-Aufloesung: subtree-faehig. Fuer flache Module
+     * verhaelt sich das identisch (direktes Kind wird immer zuerst gefunden);
+     * fuer gruppierte Module werden in Kategorien einsortierte Variablen
+     * ebenfalls gefunden. Liefert false, wenn nicht vorhanden (SDK-kompatibel
+     * fuer die durchgaengig genutzten @-/!==false-Aufrufer).
+     */
+    protected function GetIDForIdent($Ident)
+    {
+        $d = @IPS_GetObjectIDByIdent($Ident, $this->InstanceID);
+        if ($d !== false) {
+            return $d;
+        }
+        if (!$this->usesVariableGroups()) {
+            return false;
+        }
+        $id = $this->resolveIdentDeep((string) $Ident);
+        return $id > 0 ? $id : false;
+    }
+
+    /**
+     * Override: liest den Wert per subtree-faehiger Ident-Aufloesung.
+     * Signatur UNTYPISIERT — muss exakt zu IPSModule::GetValue($Ident) passen.
+     */
+    protected function GetValue($Ident)
+    {
+        $id = $this->GetIDForIdent($Ident);
+        if ($id === false) {
+            throw new \Exception("Ident '{$Ident}' nicht gefunden");
+        }
+        return GetValue($id);
+    }
+
+    /**
+     * Override: schreibt den Wert per subtree-faehiger Ident-Aufloesung.
+     * Signatur UNTYPISIERT — muss exakt zu IPSModule::SetValue($Ident,$Value) passen.
+     */
+    protected function SetValue($Ident, $Value)
+    {
+        $id = $this->GetIDForIdent($Ident);
+        if ($id === false) {
+            throw new \Exception("Ident '{$Ident}' nicht gefunden");
+        }
+        return SetValue($id, $Value);
     }
 
     /**

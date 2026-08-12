@@ -300,6 +300,50 @@ class PoolController extends EntityModule
     }
 
     // ==================================================================
+    // Variablen-Gruppierung (Baum-Struktur)
+    // ==================================================================
+
+    /**
+     * Das Pool-Modul fuehrt ~500 Statusvariablen. Statt flacher Ablage werden
+     * sie in beschriftete Kategorien einsortiert (EntityModule::materializeControlsGrouped).
+     */
+    protected function usesVariableGroups(): bool
+    {
+        return true;
+    }
+
+    /**
+     * Klassifiziert einen Control-Ident in eine Baum-Kategorie (Erst-Treffer
+     * gewinnt; Praefix- oder Exakt-Match). Sammelgruppe „Messwerte".
+     */
+    protected function controlGroup(string $ident, Control $c): string
+    {
+        static $rules = [
+            ['Relais',             ['Relay']],
+            ['Regeln Filter',      ['FilterSchedule', 'ProgFilterMin', 'AutoCircOptimal', 'CircAuto', 'FilterRuntime']],
+            ['Regeln Solar-Temp',  ['TempRule']],
+            ['Regeln Analog',      ['AdccR']],
+            ['Regeln Digital-IO',  ['SwcR']],
+            ['Dosierung Chlor',    ['RdxCfg', 'ClDos', 'ClPole', 'ClConsumption', 'ClDosing', 'ClLevel', 'RedoxTarget', 'DosingClAuto', 'Redox']],
+            ['Dosierung pH-minus', ['PHMinus', 'PHTarget', 'DosingPHAuto']],
+            ['Dosierung pH-plus',  ['PHPlus', 'DosingPHPAuto']],
+            ['Sensorik',           ['CfgOw', 'CfgAdc', 'CfgIo', 'CfgBnc']],
+            ['Netzwerk',           ['Net']],
+            ['Alarme & Meldung',   ['Mail', 'Smtp', 'Sms', 'Contact', 'ErrorText', 'ErrorCount', 'StatusFlag', 'Dtc']],
+            ['Kalibrierung',       ['HwCal', 'ElCal']],
+            ['System & Verbindung', ['CpuTemp', 'OperatingHours', 'Firmware', 'LinkOK']],
+        ];
+        foreach ($rules as [$name, $prefixes]) {
+            foreach ($prefixes as $p) {
+                if ($ident === $p || strncmp($ident, $p, strlen($p)) === 0) {
+                    return $name;
+                }
+            }
+        }
+        return 'Messwerte';
+    }
+
+    // ==================================================================
     // Lebenszyklus
     // ==================================================================
 
