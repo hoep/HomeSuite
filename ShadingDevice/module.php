@@ -51,6 +51,7 @@ class ShadingDevice extends EntityModule
     /** Positions-Grenzen (%) — IShutter-Konvention 0=offen/oben .. 100=zu/unten. */
     private const POS_MIN = 0;
     private const POS_MAX = 100;
+    private const LOG_MAX = 80;               // Ringpuffer-Groesse des Entscheidungs-/Befehls-Logs je Rollo
 
     /**
      * Zeitplan-Achsen (umschaltbare Plaene). Zwei Achsen (Nutzerwunsch „beides
@@ -218,6 +219,7 @@ class ShadingDevice extends EntityModule
                 ['op' => 'command',            'label' => 'Bedienen (Position/Fahrt/Modus)'],
                 ['op' => 'referenceRun',       'label' => 'Referenzfahrt (kalibrieren)'],
                 ['op' => 'validate',           'label' => 'Bindung pruefen (Diagnose)'],
+                ['op' => 'getLog',             'label' => 'Entscheidungs-/Befehls-Log lesen'],
             ],
 
             // ---- Konfig-Felder (Treiberwahl; im LVB gesetzt) ----
@@ -254,6 +256,7 @@ class ShadingDevice extends EntityModule
     public function Create()
     {
         parent::Create();
+        $this->RegisterAttributeString('DecisionLog', '[]'); // Ringpuffer: Automatik-Entscheidungen + manuelle Befehle (nur echte Fahrten)
         $this->RegisterPropertyString('Driver', '');
         $this->RegisterPropertyBoolean('Invert', false);
         $this->RegisterPropertyInteger('PositionId', 0);
@@ -481,6 +484,18 @@ class ShadingDevice extends EntityModule
      */
     protected function applyControl(Control $c, $value, ActionContext $ctx): void
     {
+        // Manuellen Befehl protokollieren (auch im Schatten-Modus als Intent; nur bei echter Aenderung).
+        if ($c->ident === 'Position' || $c->ident === 'Movement') {
+            $frm = -1;
+            try { $mdrv = $this->driver(); if ($mdrv instanceof IShutter) { $frm = (int) $mdrv->readPosition(); } } catch (\Throwable $e) {}
+            if ($c->ident === 'Position') {
+                $mto = (int) max(self::POS_MIN, min(self::POS_MAX, (int) round((float) $value)));
+                if ($frm < 0 || $mto !== $frm) { $this->logDecision($frm, $mto, 'Manuell', $this->armed(), 'manuell'); }
+            } else {
+                $mv = (int) $value; $mto = $mv === 1 ? self::POS_MIN : ($mv === 2 ? self::POS_MAX : $frm);
+                $this->logDecision($frm, $mto, $mv === 0 ? 'Manuell (Stopp)' : 'Manuell', $this->armed(), 'manuell');
+            }
+        }
         // Schatten-Modus: KEIN reales Fahren/Bus-Telegramm bis armed=true (sonst
         // Kollision mit IPSShadowing auf demselben Socket 45711). Optimistischer
         // SetValue der Basis bleibt (Anzeige folgt), real passiert nichts.
@@ -588,6 +603,9 @@ class ShadingDevice extends EntityModule
     protected function mgmt(string $op, array $args, array $ctx): array
     {
         switch ($op) {
+            case 'getLog':
+                $entries = json_decode((string) $this->ReadAttributeString('DecisionLog'), true);
+                return ['ok' => true, 'room' => \IPS_GetName($this->InstanceID), 'entries' => is_array($entries) ? $entries : []];
             case 'configureDriver':
                 return $this->mgmtConfigureDriver($args, $ctx);
             case 'configureAutomation':
@@ -1613,6 +1631,7 @@ class ShadingDevice extends EntityModule
         // Tuer-Guard: Zufahren gegen offene Tuer blocken (Auffahren/Sturm bleibt erlaubt).
         if ($d['blockedByDoor']) {
             $this->SendDebug('HSSH.guard', 'Tuer offen -> Zufahren auf ' . $target . '% blockiert', 0);
+            $this->logDecision((int) $cur, (int) $target, 'Tür blockiert', $armed, 'auto');
             $rt['blockedTs'] = time();
             $this->writeRt($rt);
             return;
@@ -1626,16 +1645,42 @@ class ShadingDevice extends EntityModule
             $this->writeRt($rt);
             // Absolut-Treiber: moveTo. Travel-only (Somfy): zeitbasiert ueber driveTo.
             $this->driveTo($drv, (int) $target);
+            $this->logDecision((int) $cur, (int) $target, $this->reasonOf($d), true, 'auto');
         } else {
             // Schatten-Modus: nur protokollieren, kein Geraeteschreiben. Fuer den
             // Trockenlauf wird der geplante Fahrbefehl inkl. Telegramm-Vorschau geloggt.
             $this->SendDebug('HSSH.shadow', 'Ziel ' . $target . '% (ist ' . $cur . '%, '
                 . ($d['storm'] ? 'STURM' : ($d['sunTarget'] !== null ? 'Sonne' : 'Zeitplan')) . ') - nicht scharf | '
                 . $this->drivePreview($drv, (int) $target, (int) $cur), 0);
+            $this->logDecision((int) $cur, (int) $target, $this->reasonOf($d), false, 'auto');
             $rt['shadowTarget'] = $target;
             $rt['shadowTs']     = time();
             $this->writeRt($rt);
         }
+    }
+
+    /** Grund der Automatik-Entscheidung (Vorrang Sturm > Sonne > Zeitplan). */
+    private function reasonOf(array $d): string
+    {
+        if (!empty($d['storm'])) { return 'Sturm'; }
+        if (($d['sunTarget'] ?? null) !== null) { return 'Sonne'; }
+        if (($d['schedTarget'] ?? null) !== null) { return 'Zeitplan'; }
+        return 'Automatik';
+    }
+
+    /**
+     * Einen Eintrag in den Ringpuffer des Entscheidungs-/Befehls-Logs schreiben.
+     * Nur echte Fahrten/Befehle. src: 'auto'|'manuell'; armed: true=scharf gefahren, false=Schatten (nur berechnet).
+     */
+    private function logDecision(int $from, ?int $to, string $why, bool $armed, string $src): void
+    {
+        try {
+            $log = json_decode((string) $this->ReadAttributeString('DecisionLog'), true);
+            if (!is_array($log)) { $log = []; }
+            $log[] = ['t' => time(), 'from' => $from, 'to' => $to, 'why' => $why, 'armed' => $armed ? 1 : 0, 'src' => $src];
+            if (count($log) > self::LOG_MAX) { $log = array_slice($log, -self::LOG_MAX); }
+            $this->WriteAttributeString('DecisionLog', json_encode($log, JSON_UNESCAPED_UNICODE));
+        } catch (\Throwable $e) { /* Log darf den Betrieb nie stoeren */ }
     }
 
     /**

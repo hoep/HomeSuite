@@ -433,6 +433,8 @@ class HomeSuiteHub extends EntityModule
             'label' => 'Medienquellen konfigurieren', 'destructive' => false, 'fields' => []]);
         $m->addManagementAction(['op' => 'spotifyAuthUrl', 'verb' => 'spotifyAuthUrl', 'target' => 'hub',
             'label' => 'Spotify-Login-Link erzeugen', 'destructive' => false, 'fields' => []]);
+        $m->addManagementAction(['op' => 'shadeLog', 'verb' => 'shadeLog', 'target' => 'hub',
+            'label' => 'Beschattungs-Log (alle Raeume) lesen', 'destructive' => false, 'fields' => []]);
         foreach ([['mediaProviders', 'Provider auflisten'], ['mediaBrowse', 'Bibliothek browsen'],
                   ['mediaSearch', 'Bibliothek suchen'], ['mediaResolve', 'Inhalt aufloesen']] as $ma) {
             $m->addManagementAction(['op' => $ma[0], 'verb' => $ma[0], 'target' => 'hub',
@@ -737,6 +739,9 @@ class HomeSuiteHub extends EntityModule
 
             case 'spotifyAuthUrl':
                 return $this->mgmtSpotifyAuthUrl();
+
+            case 'shadeLog':
+                return $this->mgmtShadeLog($args);
 
             case 'mediaProviders':
                 $ps = [];
@@ -1375,6 +1380,33 @@ class HomeSuiteHub extends EntityModule
     }
 
     /** Provider browsen/suchen -> ContentRef-Liste (Array). */
+    /**
+     * Aggregiert den Entscheidungs-/Befehls-Log ALLER ShadingDevice-Instanzen (alle Raeume),
+     * chronologisch (neueste zuerst), gedeckelt. Jede Instanz haelt einen eigenen Ringpuffer;
+     * hier wird beim Lesen zusammengefuehrt (kein zentraler Schreib-Kopplungspunkt).
+     */
+    private function mgmtShadeLog(array $args): array
+    {
+        $limit = max(1, min(1000, (int) ($args['limit'] ?? 300)));
+        $ids   = @\IPS_GetInstanceListByModuleID('{A9645ED8-CB55-43B8-869B-BFF6ACFC8DC1}') ?: [];
+        $all   = [];
+        foreach ($ids as $id) {
+            if (!function_exists('HSSH_Manage')) { break; }
+            $r = @json_decode((string) @\HSSH_Manage((int) $id, json_encode(['op' => 'getLog'])), true);
+            if (!is_array($r) || empty($r['ok'])) { continue; }
+            $room = (string) ($r['room'] ?? \IPS_GetName((int) $id));
+            foreach ((array) ($r['entries'] ?? []) as $e) {
+                if (!is_array($e)) { continue; }
+                $e['room'] = $room;
+                $e['id']   = (int) $id;
+                $all[]     = $e;
+            }
+        }
+        usort($all, static fn($a, $b) => ((int) ($b['t'] ?? 0)) <=> ((int) ($a['t'] ?? 0)));
+        if (count($all) > $limit) { $all = array_slice($all, 0, $limit); }
+        return ['ok' => true, 'count' => count($all), 'entries' => $all];
+    }
+
     private function mgmtMediaBrowse(array $args, bool $search = false): array
     {
         $pid = (string) ($args['provider'] ?? '');
