@@ -288,6 +288,7 @@ class ShadingDevice extends EntityModule
         $this->RegisterPropertyFloat('Lon', 0.0);
         $this->RegisterPropertyBoolean('Armed', false);   // Schatten-Modus bis Cutover
         $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
+        $this->RegisterPropertyInteger('QueryInterval', 30); // Abfrage-Intervall in SEKUNDEN (Default = REFRESH_MS/1000)
     }
 
     /**
@@ -436,7 +437,8 @@ class ShadingDevice extends EntityModule
         $envLabels = ['sunAzId'=>'Sonnen-Azimut','sunElId'=>'Sonnen-Elevation','windId'=>'Wind','rainId'=>'Regen','brightId'=>'Helligkeit'];
         foreach ($envLabels as $k => $lab) { $add('bl_env_' . $k, $lab, (int) ($env[$k] ?? 0)); }
         $tg = is_array($cfg['tempGate'] ?? null) ? $cfg['tempGate'] : [];
-        $add('bl_tempSensor', 'Temp-Gate-Sensor', (int) ($tg['sensorId'] ?? 0));
+        $add('bl_tempSensor', 'Temp-Gate-Sensor innen', (int) ($tg['sensorId'] ?? 0));
+        $add('bl_tempSensorOut', 'Temp-Gate-Sensor außen', (int) ($tg['outSensorId'] ?? 0));
         $i = 0;
         foreach ((array) ($cfg['doorIds'] ?? []) as $d) { $add('bl_Door' . $i, 'Tür-Kontakt', (int) $d); $i++; }
         return $out;
@@ -523,10 +525,14 @@ class ShadingDevice extends EntityModule
                     $this->SendDebug('HSSH.guard', 'Tuer offen -> manuelles Zufahren auf ' . $p . '% blockiert', 0);
                     break;
                 }
-                $drv->moveTo((float) $p);
+                $this->driveTo($drv, $p); // ueber den Executor: zeitbasiert bei Somfy, mit Ramp + Positions-Rueckmeldung
                 break;
             case 'Movement':
-                $drv->move((int) $value === 1 ? 'up' : ((int) $value === 2 ? 'down' : 'stop'));
+                // Auf/Zu ueber den Executor (Endanschlag, selbstkalibrierend + Rueckmeldung); Stopp beendet die laufende Fahrt.
+                $mv = (int) $value;
+                if ($mv === 1)      { $this->driveTo($drv, self::POS_MIN); }   // auf
+                elseif ($mv === 2)  { $this->driveTo($drv, self::POS_MAX); }   // zu
+                else                { $rtm = $this->readRt(); if (!empty($rtm['moving'])) { $this->finishMove(true); } else { $drv->move('stop'); } }
                 break;
         }
     }
@@ -1127,6 +1133,13 @@ class ShadingDevice extends EntityModule
         $this->RegisterTimer(self::TIMER_MOVE, 0, 'HSSH_MoveDone($_IPS[\'TARGET\']);');
     }
 
+    // Effektives Refresh-Intervall in ms aus der Property QueryInterval (Sekunden).
+    // Untergrenze 2s, damit ein versehentlicher 0-Wert keine Endlosschleife ausloest.
+    private function refreshMs(): int
+    {
+        return max(2, $this->ReadPropertyInteger('QueryInterval')) * 1000;
+    }
+
     public function ApplyChanges()
     {
         parent::ApplyChanges();
@@ -1135,7 +1148,7 @@ class ShadingDevice extends EntityModule
 
         $drv    = $this->driver();
         $active = $drv instanceof IShutter;
-        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
+        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? $this->refreshMs() : 0);
         $this->registerWatches($drv);
         $this->syncReferences();
         $this->updateHealth();
@@ -1229,6 +1242,7 @@ class ShadingDevice extends EntityModule
         return json_encode(['elements' => [
             ['type' => 'Label', 'caption' => 'Beschattung — Geraete-Bindung. Sicherheits-Schwellen, Sonnen- und '
                 . 'Wetterprofile kommen aus den geteilten Profilen (LiveViewBuilder), nicht hier.'],
+            ['type' => 'NumberSpinner', 'name' => 'QueryInterval', 'caption' => 'Abfrage-Intervall (s)'],
             ['type' => 'Select', 'name' => 'cfgDriver', 'caption' => 'Treiber',
                 'value' => (string) ($cfg['driver'] ?? 'generic-shutter'), 'options' => [
                     ['caption' => '(keiner / Schatten-Modus)', 'value' => ''],
@@ -1401,9 +1415,14 @@ class ShadingDevice extends EntityModule
             $this->finishMove(true);
         }
         $from = $this->estPos();
+        $endstop = ($target === self::POS_MIN || $target === self::POS_MAX);
         if ($from === IShutter::POS_UNKNOWN) {
-            $this->SendDebug('HSSH.move', 'estPos unbekannt -> keine Absolutfahrt (Referenzfahrt noetig)', 0);
-            return false;
+            if (!$endstop) {
+                $this->SendDebug('HSSH.move', 'estPos unbekannt -> Mittelstellung erst nach voller Auf-/Zufahrt (Kalibrierung)', 0);
+                return false;
+            }
+            // Endanschlag ohne bekannte Position: vom Gegen-Endanschlag voll durchfahren (selbstkalibrierend).
+            $from = ($target === self::POS_MIN) ? self::POS_MAX : self::POS_MIN;
         }
         $steps = ShadeKinematics::steps($from, $target, [
             'timeOpening'    => (float) $this->cfgVal('timeOpening', 0),
@@ -1428,7 +1447,9 @@ class ShadingDevice extends EntityModule
         $rt['moveStartTs'] = time();
         $rt['moveDurMs']   = $first->durationMs;
         $this->writeRt($rt);
-        $this->SetTimerInterval(self::TIMER_MOVE, $first->durationMs);
+        if ($from >= 0) { $this->pushPosition($from); } // Startlage sofort spiegeln
+        // Periodischer Tick (~1 s, oder kuerzer bei sehr kurzer Fahrt) -> laufende Rueckmeldung + Abschluss.
+        $this->SetTimerInterval(self::TIMER_MOVE, (int) min(1000, max(200, $first->durationMs)));
         return true;
     }
 
@@ -1465,12 +1486,28 @@ class ShadingDevice extends EntityModule
         $this->writeRt($rt);
         $this->setEstPos($newPos, true);
         $this->SetValue('Position', $newPos);
+        $this->pushPosition($newPos);            // Endlage sofort an Kachel + Spiegel zurueckmelden
     }
 
-    /** Timer-Callback (prefix HSSH_MoveDone): beendet die zeitbasierte Fahrt reglaer. */
+    /**
+     * Timer-Callback (prefix HSSH_MoveDone): periodischer Fahr-Tick (~1 s). Interpoliert die Position
+     * aus verstrichener Fahrzeit und meldet sie laufend zurueck (Ramp); am Ende regulaerer Abschluss.
+     */
     public function MoveDone(): void
     {
-        $this->finishMove(false);
+        $rt = $this->readRt();
+        if (empty($rt['moving'])) { $this->SetTimerInterval(self::TIMER_MOVE, 0); return; }
+        $start = (int) ($rt['moveStartTs'] ?? 0);
+        $durMs = max(1, (int) ($rt['moveDurMs'] ?? 1));
+        $elapsedMs = max(0, (time() - $start) * 1000);
+        if ($elapsedMs >= $durMs) { $this->finishMove(false); return; }   // fertig -> Endlage + Stop
+        $from   = (int) ($rt['moveFrom'] ?? 0);
+        $target = (int) ($rt['moveTarget'] ?? 0);
+        if ($from < 0) { return; } // unkalibriert (Referenzfahrt): kein Zwischen-Ramp, erst am Endanschlag
+        $frac   = min(1.0, $elapsedMs / $durMs);
+        $interp = (int) round($from + ($target - $from) * $frac);
+        $this->setEstPos($interp, true);
+        $this->pushPosition($interp);
     }
 
     /** Geschaetzte Ist-Position (nur wenn kalibriert), sonst POS_UNKNOWN. */
@@ -1487,6 +1524,22 @@ class ShadingDevice extends EntityModule
         $rt['estPos']   = max(self::POS_MIN, min(self::POS_MAX, $pos));
         $rt['posKnown'] = $known;
         $this->writeRt($rt);
+    }
+
+    /**
+     * Geschaetzte Ist-Position live zurueckmelden (Somfy hat KEIN Feedback, wie IPSShadowing selbst
+     * rechnen): ActualPosition (daran haengt die Kachel) + IPSShadowing-Spiegelvariable (positionId).
+     */
+    private function pushPosition(int $pos): void
+    {
+        $pos = max(self::POS_MIN, min(self::POS_MAX, $pos));
+        $this->setReflect('ActualPosition', $pos);
+        $this->setReflect('Online', true);
+        $lp = (int) $this->cfgVal('positionId', 0);
+        if ($lp > 0 && function_exists('IPS_VariableExists') && @\IPS_VariableExists($lp)) {
+            $cur = @GetValue($lp);
+            if (!is_numeric($cur) || (int) round((float) $cur) !== $pos) { @SetValue($lp, $pos); }
+        }
     }
 
     /**
@@ -1726,10 +1779,23 @@ class ShadingDevice extends EntityModule
             : null;
         $sunTarget = $this->debounceSun($rawSun, $persist);
         // Temp-Gate: Sonnen-Beschattung nur, wenn Temperatur ueber Schwelle (IPSShadowing shadowingByTemp).
+        // Zwei Schwellen wie in IPSShadowing ProfileTemp: Innen (sensorId>=aboveC) UND Aussen
+        // (outSensorId>=outAboveC). Eine Schwelle mit fehlendem Sensor/Wert (null) gilt als erfuellt
+        // ('ignore'), sodass z. B. das Schlafzimmer nur nach Aussentemperatur schattet.
         $tg = $this->cfgVal('tempGate', null);
         if (is_array($tg) && $sunTarget !== null) {
-            $tv = $this->tempNow($tg);
-            if ($tv !== null && $tv < (float) ($tg['aboveC'] ?? 24)) { $sunTarget = null; }
+            $block = false;
+            $inId = (int) ($tg['sensorId'] ?? 0);
+            if ($inId > 0 && isset($tg['aboveC']) && $tg['aboveC'] !== null) {
+                $tv = $this->tempOf($inId);
+                if ($tv !== null && $tv < (float) $tg['aboveC']) { $block = true; }
+            }
+            $outId = (int) ($tg['outSensorId'] ?? 0);
+            if (!$block && $outId > 0 && isset($tg['outAboveC']) && $tg['outAboveC'] !== null) {
+                $ov = $this->tempOf($outId);
+                if ($ov !== null && $ov < (float) $tg['outAboveC']) { $block = true; }
+            }
+            if ($block) { $sunTarget = null; }
         }
 
         // Zeitplan (sonnen-verankerte Grenzen werden fuer den Tag aufgeloest).
@@ -1809,7 +1875,12 @@ class ShadingDevice extends EntityModule
     /** Aktuelle Temperatur fuer das Temp-Gate (tg.sensorId; null = kein Sensor -> kein Gate). */
     private function tempNow(array $tg): ?float
     {
-        $id = (int) ($tg['sensorId'] ?? 0);
+        return $this->tempOf((int) ($tg['sensorId'] ?? 0));
+    }
+
+    /** Aktuelle Temperatur einer Sensor-Variable (oder null, wenn ungueltig/leer). */
+    private function tempOf(int $id): ?float
+    {
         if ($id <= 0 || !function_exists('IPS_VariableExists') || !@\IPS_VariableExists($id)) { return null; }
         $v = @GetValue($id);
         return is_numeric($v) ? (float) $v : null;

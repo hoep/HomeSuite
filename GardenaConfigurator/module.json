@@ -1,0 +1,12 @@
+{
+    "id": "{7C3A1E44-2B9D-4F16-A8E1-9C0F5B7A2D31}",
+    "name": "GardenaConfigurator",
+    "type": 4,
+    "vendor": "Hoep",
+    "aliases": ["GardenaConfigurator", "Gardena Cloud", "HomeSuite Gardena Cloud"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSGX",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}

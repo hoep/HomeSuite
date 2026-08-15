@@ -209,7 +209,7 @@ class AudioZone extends EntityModule
         $this->driverInstance = null;
 
         $active = $this->driver() instanceof IAudioRenderer;
-        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
+        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? $this->refreshIntervalMs() : 0);
         $this->syncReferences();
         $this->syncBindingLinks(); // Baum-Transparenz: sichtbare bl_-Links (nur generic-audio)
         $this->updateHealth();
@@ -1128,6 +1128,7 @@ class AudioZone extends EntityModule
         return json_encode(['elements' => [
             ['type' => 'Label', 'caption' => 'Audio/Media — Steuerung ueber generischen Treiber (Sonos im Uebergang '
                 . 'ueber IPSSonos-Raum-Variablen; spaeter nativ sonos-upnp/heos). Verwaltung/Visu im LiveViewBuilder.'],
+            ['type' => 'NumberSpinner', 'name' => 'QueryInterval', 'caption' => 'Abfrage-Intervall (s)'],
             ['type' => 'SelectInstance', 'name' => 'cfgRoom', 'caption' => 'IPSSonos-Raum-Instanz (Import)'],
             ['type' => 'Button', 'caption' => 'Aus IPSSonos importieren (Schatten)', 'onClick' =>
                 'echo HSAU_Manage($id, json_encode(["op"=>"importLegacy","args"=>["roomInstanceId"=>$cfgRoom]]));'],
@@ -1159,6 +1160,13 @@ class AudioZone extends EntityModule
         $this->RegisterPropertyString('Driver', '');
         $this->RegisterPropertyBoolean('Armed', false);
         $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
+        $this->RegisterPropertyInteger('QueryInterval', 5); // Abfrage-Intervall in SEKUNDEN (Default = REFRESH_MS/1000)
+    }
+
+    /** Effektives Refresh-Intervall in ms; Boden 2s, damit eine 0 keinen Hot-Loop verursacht. */
+    private function refreshIntervalMs(): int
+    {
+        return max(2, $this->ReadPropertyInteger('QueryInterval')) * 1000;
     }
 
     private const PROP_MAP = ['driver' => ['Driver', 's'], 'armed' => ['Armed', 'b']];

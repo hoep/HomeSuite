@@ -61,9 +61,11 @@ final class ShadingProfiles
                 'pos'    => ['type' => 'int',   'min' => 0, 'max' => 100, 'label' => 'Position nachts (%)'],
             ]],
             ['id' => 'temp', 'title' => 'Temperatur-Gate', 'editor' => 'fields', 'schema' => [
-                'aboveC'     => ['type' => 'float', 'min' => -20, 'max' => 50, 'label' => 'Beschatten ab (°C)'],
-                'requireSun' => ['type' => 'bool',  'label' => 'Nur bei Sonne'],
-                'sensorId'   => ['type' => 'objid', 'label' => 'Temperatur-Variable (0=Raum)'],
+                'aboveC'      => ['type' => 'float', 'min' => -20, 'max' => 50, 'label' => 'Beschatten ab innen (°C, leer=aus)'],
+                'sensorId'    => ['type' => 'objid', 'label' => 'Innen-Temperatur-Variable'],
+                'outAboveC'   => ['type' => 'float', 'min' => -20, 'max' => 50, 'label' => 'und ab außen (°C, leer=aus)'],
+                'outSensorId' => ['type' => 'objid', 'label' => 'Außen-Temperatur-Variable'],
+                'requireSun'  => ['type' => 'bool',  'label' => 'Nur bei Sonne'],
             ]],
         ];
     }
@@ -98,11 +100,17 @@ final class ShadingProfiles
                     'rainClose'    => (bool) ($f['rainClose'] ?? true),
                 ];
             case 'temp':
-                return ['tempGate' => [
-                    'aboveC'     => (float) ($f['aboveC'] ?? 24),
-                    'requireSun' => (bool) ($f['requireSun'] ?? true),
-                    'sensorId'   => (int) ($f['sensorId'] ?? 0),
-                ]];
+                // Innen- UND Außen-Schwelle (wie IPSShadowing ProfileTemp). Leeres Feld = Schwelle aus
+                // (null). ShadingDevice.reconcile blockt, wenn eine gesetzte Schwelle unterschritten wird.
+                $has = static fn($k) => isset($f[$k]) && $f[$k] !== '' && $f[$k] !== null;
+                $tg = [
+                    'aboveC'      => $has('aboveC') ? (float) $f['aboveC'] : null,
+                    'sensorId'    => (int) ($f['sensorId'] ?? 0),
+                    'outAboveC'   => $has('outAboveC') ? (float) $f['outAboveC'] : null,
+                    'outSensorId' => (int) ($f['outSensorId'] ?? 0),
+                    'requireSun'  => (bool) ($f['requireSun'] ?? true),
+                ];
+                return ['tempGate' => $tg];
             case 'dayBegin':
                 return ['dayBegin' => ['mode' => (string) ($f['mode'] ?? 'sunrise'), 'time' => (string) ($f['time'] ?? '07:00'), 'offset' => (int) ($f['offset'] ?? 0), 'pos' => (int) ($f['pos'] ?? 0)]];
             case 'dayEnd':

@@ -31,6 +31,7 @@ class AudioZoneBridged extends AudioZone
         parent::Create();
         $this->RegisterPropertyString('PID', '');    // HEOS Player-ID (aus der Bridge-Playerliste)
         $this->RegisterPropertyString('Vendor', 'heos');
+        $this->RegisterPropertyInteger('QueryInterval', 15); // Abfrage-Intervall in SEKUNDEN (default = RX_MS/1000)
         $this->ConnectParent(self::HSBH);            // unter die HEOS-Bridge haengen
     }
 
@@ -48,7 +49,13 @@ class AudioZoneBridged extends AudioZone
         $this->driverResolved = false;
         $this->driverInstance = null;
         // Push-Treiber: dezenter Refresh-Poll als Sicherheitsnetz (HEOS liefert primaer Events).
-        $this->SetTimerInterval('Refresh', $this->driver() instanceof IAudioRenderer ? self::RX_MS : 0);
+        $this->SetTimerInterval('Refresh', $this->driver() instanceof IAudioRenderer ? $this->rxMs() : 0);
+    }
+
+    /** Effektives Refresh-Intervall in ms aus der QueryInterval-Eigenschaft (Boden 2 s gegen Hot-Loop). */
+    private function rxMs(): int
+    {
+        return max(2, $this->ReadPropertyInteger('QueryInterval')) * 1000;
     }
 
     /** PUSH-Treiber (heos): Kommandos ueber die Bridge (SendDataToParent). */
@@ -147,6 +154,7 @@ class AudioZoneBridged extends AudioZone
             ['type' => 'Label', 'caption' => 'HEOS-Player (Kind der HEOS-Bridge). PID aus der Bridge-Playerliste eintragen. '
                 . 'Bedienung/Visu laufen wie bei AudioZone im LiveViewBuilder (?api=audio findet HSAU + HSAUX).'],
             ['type' => 'ValidationTextBox', 'name' => 'PID', 'caption' => 'HEOS Player-ID (pid)', 'value' => $this->ReadPropertyString('PID')],
+            ['type' => 'NumberSpinner', 'name' => 'QueryInterval', 'caption' => 'Abfrage-Intervall (s)'],
         ]], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     }
 }

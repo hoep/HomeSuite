@@ -5,3 +5,8 @@ Thumbs.db
 scratch/
 *.tmp
 scripts_backup/
+*.bak
+*.bak-*
+*.bak.[0-9]*
+backup/
+scripts/backup/

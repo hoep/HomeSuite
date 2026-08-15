@@ -133,6 +133,13 @@ class LightDevice extends EntityModule
         $this->RegisterPropertyBoolean('Armed', false);
         // Migrations-Marker: 0 = alte FabricStore-Config, 1 = auf Properties migriert.
         $this->RegisterPropertyInteger('ConfigSchema', 0);
+        $this->RegisterPropertyInteger('QueryInterval', 30);  // Abfrage-Intervall in SEKUNDEN (default = REFRESH_MS/1000)
+    }
+
+    /** Effektives Refresh-Intervall in Millisekunden aus der Property (Untergrenze 2 s gegen Hot-Loop). */
+    private function refreshIntervalMs(): int
+    {
+        return max(2, $this->ReadPropertyInteger('QueryInterval')) * 1000;
     }
 
     /** Bindungs-Links (Baum-Transparenz) auf die gebundenen Quell-Variablen/Skripte — aus Properties. */
@@ -167,7 +174,7 @@ class LightDevice extends EntityModule
         $this->driverInstance = null;
 
         $active = $this->driver() instanceof ILight;
-        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
+        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? $this->refreshIntervalMs() : 0);
         $this->syncReferences();
         $this->updateHealth();
     }
@@ -531,6 +538,7 @@ class LightDevice extends EntityModule
                     ['caption' => '— keiner (Schatten-Modus) —', 'value' => ''],
                     ['caption' => 'Generisch (Variable/Skript)', 'value' => 'generic-light'],
                 ]],
+                ['type' => 'NumberSpinner', 'name' => 'QueryInterval', 'caption' => 'Abfrage-Intervall (s)'],
                 ['type' => 'ExpansionPanel', 'caption' => 'An/Aus (Variable ODER Skript)', 'expanded' => true, 'items' => [
                     ['type' => 'SelectVariable', 'name' => 'SwitchVarId', 'caption' => 'Schalt-Variable (bool)'],
                     ['type' => 'RowLayout', 'items' => [

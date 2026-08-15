@@ -174,13 +174,19 @@ class IrrigationCircuit extends EntityModule
         }
 
         $active = $this->driver() instanceof IValve;
-        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
+        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? $this->refreshMs() : 0);
         $this->syncReferences();
         $this->updateHealth();
 
         // Nativer Symcon-Wochenplan (Ereignis Typ 2) als Zeitplan-Wahrheit anlegen +
         // einmalig aus dem ScheduleEngine-Store migrieren (dann liest runSchedule das Ereignis).
         $this->ensureScheduleEvent();
+    }
+
+    /** Effektives Refresh-Intervall in ms aus der QueryInterval-Property (Boden 2s gegen Hot-Loop). */
+    private function refreshMs(): int
+    {
+        return max(2, (int) $this->ReadPropertyInteger('QueryInterval')) * 1000;
     }
 
     /** Ereignis-ID des nativen Bewaesserungs-Wochenplans (0 = keiner). */
@@ -988,6 +994,7 @@ class IrrigationCircuit extends EntityModule
                     ['caption' => 'Schalt-Variable (bool on/off, Modul timt)', 'value' => 'switch'],
                     ['caption' => 'Skript (Start/Stop)', 'value' => 'script'],
                 ]],
+            ['type' => 'NumberSpinner', 'name' => 'QueryInterval', 'caption' => 'Abfrage-Intervall (s)'],
             ['type' => 'Label', 'caption' => '— Dauer-Variable —'],
             ['type' => 'SelectVariable', 'name' => 'cfgStartVarId', 'caption' => 'Start (Sekunden, aktionsfaehig)',
                 'value' => (int) ($cfg['startVarId'] ?? 0)],
@@ -1063,6 +1070,7 @@ class IrrigationCircuit extends EntityModule
         $this->RegisterPropertyBoolean('Invert', false);
         $this->RegisterPropertyBoolean('Armed', false);   // Schatten-Modus bis Cutover
         $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
+        $this->RegisterPropertyInteger('QueryInterval', 30); // Abfrage-Intervall in SEKUNDEN (default = REFRESH_MS/1000)
     }
 
     private const PROP_MAP = [

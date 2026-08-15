@@ -1,0 +1,12 @@
+{
+    "id": "{9B5DB5AD-B39A-4270-873A-D168F52C9ECA}",
+    "name": "RainRadar",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["RainRadar", "RR", "Regenradar"],
+    "url": "https://github.com/hoep/RainRadar",
+    "prefix": "RR",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}

@@ -575,7 +575,7 @@ abstract class EntityModule extends \IPSModule
     protected function armGateIdent(): string
     {
         $m = ['Licht' => 'ArmLight', 'Heizung' => 'ArmHeating', 'Beschattung' => 'ArmShading',
-              'Bewässerung' => 'ArmIrrigation', 'Audio' => 'ArmAudio', 'Pool' => 'ArmPool'];
+              'Bewässerung' => 'ArmIrrigation', 'Audio' => 'ArmAudio', 'Pool' => 'ArmPool', 'Mäher' => 'ArmMower'];
         return $m[$this->entityLabel()] ?? '';
     }
 
@@ -590,6 +590,13 @@ abstract class EntityModule extends \IPSModule
         if ($hub <= 0 || !function_exists('IPS_GetObjectIDByIdent')) {
             return null;
         }
+        // 3-Zustand-Master (Vorrang): <ident>Mode 0=Aus(alle Schatten), 1=Auto(per-Instanz), 2=Scharf(alle real).
+        $mv = @\IPS_GetObjectIDByIdent($id . 'Mode', $hub);
+        if (is_int($mv) && $mv > 0) {
+            $m = (int) @\GetValue($mv);
+            return $m === 1 ? null : ($m >= 2); // Auto -> null (Einzelinstanz entscheidet)
+        }
+        // Fallback: alter Bool-Master (ON=alle real, OFF=alle Schatten).
         $gv = @\IPS_GetObjectIDByIdent($id, $hub);
         if (!is_int($gv) || $gv <= 0) {
             return null;

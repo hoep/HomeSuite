@@ -104,6 +104,7 @@ class HomeSuiteHub extends EntityModule
 
         // Einmal-Seed-Flag fuer die Scharf-Master (ArmLight etc. aus per-Instanz-Armed).
         $this->RegisterAttributeBoolean('ArmSeeded', false);
+        $this->RegisterAttributeBoolean('ArmModeSeeded', false);
 
         // --- Globale, domaenenweite Einstellungen (zentrales Config-Formular) ---
         // Alle Instanzen einer Domaene teilen sich diese Werte (statt Duplikat je
@@ -318,15 +319,17 @@ class HomeSuiteHub extends EntityModule
         // Scharf-Schaltungen je Domaene (Master): Zustand + Buttons. Schaltet die Baum-
         // Variablen (ArmLight etc.), die alle Instanzen der Domaene live lesen.
         $armDefs = [['ArmLight', 'Licht'], ['ArmHeating', 'Heizung'], ['ArmShading', 'Beschattung'],
-                    ['ArmIrrigation', 'Bewässerung'], ['ArmAudio', 'Audio'], ['ArmPool', 'Pool']];
-        $armItems = [['type' => 'Label', 'caption' => 'ON = ganze Domäne schaltet REAL, OFF = Schatten (nur Anzeige/Log). Wirkt sofort; Zustand nach Klick durch Neu-Öffnen des Formulars aktualisieren.']];
+                    ['ArmIrrigation', 'Bewässerung'], ['ArmAudio', 'Audio'], ['ArmPool', 'Pool'], ['ArmMower', 'Mäher']];
+        $armItems = [['type' => 'Label', 'caption' => 'Aus = ganze Domäne Schatten (nur Anzeige/Log). Auto = jede Zone entscheidet selbst (Property „Armed"). Scharf = ganze Domäne schaltet REAL. Wirkt sofort; Zustand nach Klick durch Neu-Öffnen des Formulars aktualisieren.']];
+        $armLbl = [0 => '○ Aus', 1 => '◐ Auto', 2 => '● Scharf'];
         foreach ($armDefs as $ad) {
-            $vid = @$this->GetIDForIdent($ad[0]);
-            $on  = ($vid && $vid > 0) ? (bool) @\GetValue($vid) : false;
+            $mid = @$this->GetIDForIdent($ad[0] . 'Mode');
+            $mode = ($mid && $mid > 0) ? (int) @\GetValue($mid) : 0;
             $armItems[] = ['type' => 'RowLayout', 'items' => [
-                ['type' => 'Label', 'width' => '200px', 'caption' => $ad[1] . ':  ' . ($on ? '● scharf' : '○ Schatten')],
-                ['type' => 'Button', 'caption' => 'scharf',   'onClick' => 'HSH_SetControl($id, "' . $ad[0] . '", "1"); echo "' . $ad[1] . ' scharf — Formular neu öffnen";'],
-                ['type' => 'Button', 'caption' => 'Schatten', 'onClick' => 'HSH_SetControl($id, "' . $ad[0] . '", "0"); echo "' . $ad[1] . ' Schatten — Formular neu öffnen";'],
+                ['type' => 'Label', 'width' => '190px', 'caption' => $ad[1] . ':  ' . ($armLbl[$mode] ?? '?')],
+                ['type' => 'Button', 'caption' => 'Aus',    'onClick' => 'HSH_SetArmMode($id, "' . $ad[0] . '", 0); echo "' . $ad[1] . ' Aus — Formular neu öffnen";'],
+                ['type' => 'Button', 'caption' => 'Auto',   'onClick' => 'HSH_SetArmMode($id, "' . $ad[0] . '", 1); echo "' . $ad[1] . ' Auto — Formular neu öffnen";'],
+                ['type' => 'Button', 'caption' => 'Scharf', 'onClick' => 'HSH_SetArmMode($id, "' . $ad[0] . '", 2); echo "' . $ad[1] . ' Scharf — Formular neu öffnen";'],
             ]];
         }
         $form['elements'][] = ['type' => 'ExpansionPanel', 'caption' => 'Scharf-Schaltungen (je Domäne)', 'items' => $armItems];
@@ -493,7 +496,7 @@ class HomeSuiteHub extends EntityModule
         // Scharf-Master je Domaene: jede Entitaet liest ihren Gate live ueber
         // EntityModule::armed() (Hub-Vorrang). ON = ganze Domaene schaltet real.
         foreach ([['ArmLight','Licht scharf'],['ArmHeating','Heizung scharf'],['ArmShading','Beschattung scharf'],
-                  ['ArmIrrigation','Bewässerung scharf'],['ArmAudio','Audio scharf'],['ArmPool','Pool scharf']] as $ag) {
+                  ['ArmIrrigation','Bewässerung scharf'],['ArmAudio','Audio scharf'],['ArmPool','Pool scharf'],['ArmMower','Mäher scharf']] as $ag) {
             $m->addControl([
                 'ident' => $ag[0], 'type' => \Hoep\HomeSuite\ControlContract::T_SWITCH,
                 'role' => 'hub:arm', 'label' => $ag[1], 'varType' => 0,
@@ -528,6 +531,7 @@ class HomeSuiteHub extends EntityModule
                 'ArmIrrigation' => '{D264A82B-DE31-45CC-8AF2-8F4C5D076508}',
                 'ArmAudio'      => '{C4F2639D-2A87-453D-8175-B586BF605A38}',
                 'ArmPool'       => '{878CA345-86D1-84FC-B196-5B3224C067CF}',
+                'ArmMower'      => '{D1FB2D11-21F3-4B22-8341-E88D512A9B61}',
             ];
             foreach ($doms as $ident => $guid) {
                 $on = false;
@@ -538,6 +542,10 @@ class HomeSuiteHub extends EntityModule
             }
             $this->WriteAttributeBoolean('ArmSeeded', true);
         }
+
+        // 3-Zustand-Scharf-Master (Aus/Auto/Scharf): Integer-Mode-Var je Domaene sicherstellen
+        // und einmalig aus dem alten Bool-Master seeden (Zustand bleibt exakt erhalten).
+        $this->ensureArmModes();
 
         // Licht-Automatik: Timer + Bewegungs-Messages entsprechend Konfig einrichten.
         $this->lightAutoWire();
@@ -558,6 +566,54 @@ class HomeSuiteHub extends EntityModule
         $this->WriteAttributeString('ShadeNorthApplied', (string) $want);
         // Baum-Variable (Slider) mit der Property synchron halten.
         if (@$this->GetIDForIdent('ShadeNorth')) { @$this->SetValue('ShadeNorth', $want); }
+    }
+
+    /** Idents der Scharf-Master je Domaene (Bool-Master + Integer-Mode-Var <ident>Mode). */
+    private const ARM_IDENTS = ['ArmLight', 'ArmHeating', 'ArmShading', 'ArmIrrigation', 'ArmAudio', 'ArmPool', 'ArmMower'];
+
+    /**
+     * 3-Zustand-Master (Aus/Auto/Scharf): Profil + je Domaene eine Integer-Mode-Variable <ident>Mode
+     * sicherstellen und EINMALIG aus dem alten Bool-Master seeden (false->0 Aus, true->2 Scharf), damit
+     * der bisherige Live/Schatten-Zustand exakt erhalten bleibt. Additiv: der Bool bleibt bestehen
+     * (Alt-Bindungen) und wird bei Mode-Wechsel synchron gehalten. hubArmGate liest Mode zuerst.
+     */
+    private function ensureArmModes(): void
+    {
+        $pn = 'HSSuite.ArmMode';
+        if (function_exists('IPS_VariableProfileExists') && !@\IPS_VariableProfileExists($pn)) {
+            @\IPS_CreateVariableProfile($pn, 1);
+            @\IPS_SetVariableProfileValues($pn, 0, 2, 1);
+            @\IPS_SetVariableProfileAssociation($pn, 0, 'Aus (alle Schatten)', '', -1);
+            @\IPS_SetVariableProfileAssociation($pn, 1, 'Auto (je Zone)', '', 0x00CDAB);
+            @\IPS_SetVariableProfileAssociation($pn, 2, 'Scharf (alle real)', '', 0xE5484D);
+        }
+        $pos = 90;
+        foreach (self::ARM_IDENTS as $id) {
+            if (!@$this->GetIDForIdent($id . 'Mode')) {
+                $this->RegisterVariableInteger($id . 'Mode', $id . ' Modus', $pn, $pos);
+            }
+            $pos++;
+        }
+        if (!$this->ReadAttributeBoolean('ArmModeSeeded')) {
+            foreach (self::ARM_IDENTS as $id) {
+                $bv = @$this->GetIDForIdent($id);
+                $on = ($bv && $bv > 0) ? (bool) @\GetValue($bv) : false;
+                if (@$this->GetIDForIdent($id . 'Mode')) { @$this->SetValue($id . 'Mode', $on ? 2 : 0); }
+            }
+            $this->WriteAttributeBoolean('ArmModeSeeded', true);
+        }
+    }
+
+    /**
+     * Setzt den 3-Zustand-Master einer Domaene (0=Aus, 1=Auto, 2=Scharf) und haelt den alten
+     * Bool-Master synchron (bool = mode>=2). Public: aus dem Konfig-Formular aufgerufen.
+     */
+    public function SetArmMode(string $ident, int $mode): void
+    {
+        if (!in_array($ident, self::ARM_IDENTS, true)) { return; }
+        $mode = max(0, min(2, $mode));
+        if (@$this->GetIDForIdent($ident . 'Mode')) { @$this->SetValue($ident . 'Mode', $mode); }
+        if (@$this->GetIDForIdent($ident))          { @$this->SetValue($ident, $mode >= 2); }
     }
 
     /**
@@ -966,6 +1022,7 @@ class HomeSuiteHub extends EntityModule
             '{D264A82B-DE31-45CC-8AF2-8F4C5D076508}', // Irrigation
             '{A9645ED8-CB55-43B8-869B-BFF6ACFC8DC1}', // Shading
             '{AC059357-088A-4DF8-ABBC-F8724BC78769}', // Heating
+            '{D1FB2D11-21F3-4B22-8341-E88D512A9B61}', // Mower
         ];
         foreach ($domains as $g) {
             foreach (@\IPS_GetInstanceListByModuleID($g) ?: [] as $iid) {

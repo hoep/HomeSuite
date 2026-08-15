@@ -53,6 +53,7 @@ $__hs_files = [
     'HAL/IShutter.php',                // Beschattungs-HAL
     'HAL/IValve.php',                  // Bewaesserungs-HAL
     'HAL/ILight.php',                  // Beleuchtungs-HAL (switch/dim/color/cct)
+    'HAL/IMower.php',                  // Maeher-HAL (start/park/pause/resume/schedule/status)
     'HAL/IAudioRenderer.php',          // Audio-HAL (Codec, Vertrag 3)
 
     // --- HAL: selbst-enthaltener CCU-Transport (kein ext-xmlrpc/Legacy) ---
@@ -77,6 +78,11 @@ $__hs_files = [
     'Drivers/HomeMaticThermostat.php',
     'Drivers/SomfyRtsShutter.php',
     'Drivers/HomeMaticShutter.php',
+
+    // --- Maeher-Treiber (self-registriert 'husqvarna-app' via Factory) ---
+    'Drivers/Mower/HusqvarnaAppApi.php',
+    'Drivers/Gardena/GardenaAppApi.php',
+    'Drivers/Gardena/GardenaDevApi.php',
 
     // --- Engines ---
     'Engines/ProfileEngine.php',       // Anlegen/Bearbeiten/Zuweisen von Profilen (getrennt)

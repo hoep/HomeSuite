@@ -416,6 +416,13 @@ class HeatingZone extends EntityModule
         $this->RegisterPropertyFloat('FrostTemp', self::FROST_DEFAULT);
         $this->RegisterPropertyBoolean('Armed', false);    // Schatten-Modus bis Cutover
         $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
+        $this->RegisterPropertyInteger('QueryInterval', 30); // Abfrage-Intervall in SEKUNDEN (default = REFRESH_MS/1000)
+    }
+
+    /** Effektives Refresh-Intervall in Millisekunden aus QueryInterval (Boden 2s gegen Hot-Loop). */
+    private function refreshIntervalMs(): int
+    {
+        return max(2, $this->ReadPropertyInteger('QueryInterval')) * 1000;
     }
 
     /** Bindungs-Links (Baum-Transparenz) auf Sollwert/Ist bzw. HM-Gerät — aus Properties. */
@@ -498,7 +505,7 @@ class HeatingZone extends EntityModule
 
         $drv    = $this->driver();
         $active = $drv instanceof IThermostat;
-        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? self::REFRESH_MS : 0);
+        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? $this->refreshIntervalMs() : 0);
 
         // Manual-Override-Erkennung: auf Aenderungen der GERAETE-Sollwertvariable
         // lauschen (jemand verstellt am Geraet/HM-Oberflaeche).
@@ -592,6 +599,7 @@ class HeatingZone extends EntityModule
                     ['caption' => 'HomeMatic HM-CC-RT-DN (Heizkoerper)', 'value' => 'hm-HM-CC-RT-DN'],
                     ['caption' => 'HomeMatic HM-CC-TC', 'value' => 'hm-HM-CC-TC'],
                 ]],
+                ['type' => 'NumberSpinner', 'name' => 'QueryInterval', 'caption' => 'Abfrage-Intervall (s)'],
                 ['type' => 'SelectObject', 'name' => 'TargetId', 'caption' => 'Ziel (Variable bei generic, CCU-Instanz bei hm-*)'],
                 ['type' => 'SelectObject', 'name' => 'SensorId', 'caption' => 'Ist-Sensor (optional: Variable bzw. CCU-Instanz)'],
                 ['type' => 'NumberSpinner', 'name' => 'FrostTemp', 'caption' => 'Frostschutz-Solltemperatur (°C)', 'digits' => 1, 'minimum' => 3, 'maximum' => 15],

@@ -1,0 +1,8 @@
+{
+    "elements": [],
+    "actions": [],
+    "status": [
+        { "code": 102, "icon": "active", "caption": "Aktiv" },
+        { "code": 200, "icon": "error", "caption": "Fehler beim Radar-Lauf" }
+    ]
+}

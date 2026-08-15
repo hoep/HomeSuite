@@ -1,0 +1,12 @@
+{
+    "id": "{D1FB2D11-21F3-4B22-8341-E88D512A9B61}",
+    "name": "MowerDevice",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["MowerDevice", "HSMW", "HomeSuite Maeher"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSMW",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}

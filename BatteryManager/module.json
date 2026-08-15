@@ -1,0 +1,13 @@
+{
+    "id": "{E1F670B8-2C59-493E-BE02-6C53779193CB}",
+    "name": "BatteryManager",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["BatteryManager", "Batterie Manager", "Batterien", "Akku"],
+    "url": "https://github.com/hoep/BatteryManager",
+    "prefix": "BM",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "hidden": false
+}

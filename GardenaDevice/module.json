@@ -1,0 +1,12 @@
+{
+    "id": "{2DB05F36-BBD0-AC2E-85A8-369B88CD242F}",
+    "name": "GardenaDevice",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["GardenaDevice", "HSGA", "HomeSuite Gardena"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSGA",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}
