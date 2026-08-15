@@ -138,7 +138,7 @@ Alle Schaltvorgaenge respektieren Scharf-Modus (im Schatten nur Debug-Protokoll 
 | `setSleep` / `cancelSleep` | Sleep-Timer |
 | `computeProbe` | Trockenlauf: Zeitplan/Regel-Vorschau (onNow, VolumeCap, armed, sleepUntil) |
 | `radioNow` | Radio: laufender Titel + Song-Cover (20 s gecacht, Fallback Sender-Logo) |
-| `playDirect` | Werbefreien HQ-Direktstream eines Senders spielen (statt TuneIn) |
+| `playDirect` | HQ-Direktstream eines Senders spielen (statt TuneIn) |
 | `radioStations` | Senderliste (RadioNow) |
 | `playContent` | Bibliotheks-Inhalt (ContentRef, ueber Hub `mediaResolve` aufgeloest) abspielen |
 
@@ -173,7 +173,7 @@ Alle Setter gehen intern ueber `RequestAction`; real nur bei `Armed`.
 ```php
 HSAU_SetVolume(11994, 20);
 HSAU_Play(11994);
-HSAU_PlayDirectRadio(11994, 'oe3');   // werbefreier HQ-Stream
+HSAU_PlayDirectRadio(11994, 'oe3');   // HQ-Direktstream
 HSAU_SetSleep(11994, 30);             // in 30 Min aus
 ```
 

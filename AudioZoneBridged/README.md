@@ -157,7 +157,7 @@ Realer Effekt nur bei effektivem `Armed = true` + aktivem `heos`-Treiber (PID ge
 | `bool HSAUX_PlayFavorite(int $id, int $Index)` | Favorit nach Index |
 | `bool HSAUX_PlayRadio(int $id, int $Index)` | Radiosender nach Index |
 | `bool HSAUX_PlayPlaylist(int $id, int $Index)` | Playlist nach Index |
-| `bool HSAUX_PlayDirectRadio(int $id, string $StationKey)` | werbefreier HQ-Direktstream (Sender-Key) |
+| `bool HSAUX_PlayDirectRadio(int $id, string $StationKey)` | HQ-Direktstream (Sender-Key) |
 
 ### Sleep, Multiroom & Cutover
 | Funktion | Zweck |

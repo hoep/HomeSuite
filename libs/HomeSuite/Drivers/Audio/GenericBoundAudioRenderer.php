@@ -291,7 +291,7 @@ final class GenericBoundAudioRenderer implements IAudioRenderer, IAudioStateRead
         $r = (array) ($this->cfg['reflect'] ?? []);
         $repeatRaw = $this->readVar((int) ($r['repeat'] ?? 0));
         return new AudioState(
-            $this->readBool($r['playState'] ?? 0),
+            $this->readPlaying($r['playState'] ?? 0),
             $this->readVarStr((int) ($r['title'] ?? 0)),
             $this->readVarStr((int) ($r['artist'] ?? 0)),
             $this->readVarStr((int) ($r['album'] ?? 0)),
@@ -405,6 +405,53 @@ final class GenericBoundAudioRenderer implements IAudioRenderer, IAudioStateRead
     {
         $v = $this->readVar((int) $vid);
         return is_numeric($v) ? (float) $v : 0.0;
+    }
+
+    /**
+     * Spielt gerade? Eine Transport-Variable ist KEIN Ja/Nein: bei IPSSonos steht 1 fuer
+     * Wiedergabe, 2 fuer Pause, 3 fuer Stop. Ein einfacher Bool-Cast machte daraus
+     * "spielt" fuer JEDEN Wert ausser 0 - Pause und Stop eingeschlossen. Dann zeigte die
+     * Steuerung immer den Pause-Knopf und nie einen zum Starten.
+     *
+     * Zulaessige Angaben:
+     *   playState => 4711                              nur wahr/falsch bzw. 0/ungleich 0
+     *   playState => ['varId'=>4711,'playValues'=>[1]] genau diese Werte heissen "spielt"
+     *
+     * Ohne ausdrueckliche Liste wird die Zuordnung der Variablen befragt: heisst der
+     * aktuelle Eintrag "Play"/"Wiedergabe" (und nicht "Pause"), gilt das als Wiedergabe.
+     */
+    private function readPlaying($spec): bool
+    {
+        $vid = is_array($spec) ? (int) ($spec['varId'] ?? 0) : (int) $spec;
+        if ($vid <= 0) { return false; }
+        $v = $this->readVar($vid);
+        if (is_bool($v)) { return $v; }
+        if (!is_numeric($v)) { return false; }
+        $n = (float) $v;
+
+        if (is_array($spec) && isset($spec['playValues']) && is_array($spec['playValues'])) {
+            foreach ($spec['playValues'] as $pv) { if ((float) $pv === $n) { return true; } }
+            return false;
+        }
+        // Kein Mapping angegeben: ueber die Profil-Zuordnung entscheiden.
+        if (function_exists('IPS_GetVariable') && IPS_VariableExists($vid)) {
+            $var  = IPS_GetVariable($vid);
+            $prof = $var['VariableCustomProfile'] ?: $var['VariableProfile'];
+            if ($prof !== '' && IPS_VariableProfileExists($prof)) {
+                $ass = IPS_GetVariableProfile($prof)['Associations'];
+                if ($ass) {
+                    foreach ($ass as $a) {
+                        if ((float) $a['Value'] !== $n) { continue; }
+                        $nm = mb_strtolower((string) $a['Name']);
+                        if (strpos($nm, 'pause') !== false) { return false; }
+                        return (strpos($nm, 'play') !== false || strpos($nm, 'wiederg') !== false
+                             || strpos($nm, 'an') === 0);
+                    }
+                    return false;                    // Wert kommt in der Zuordnung nicht vor
+                }
+            }
+        }
+        return $n != 0.0;                            // letzter Rueckfall wie bisher
     }
 
     private function readBool($vid): bool

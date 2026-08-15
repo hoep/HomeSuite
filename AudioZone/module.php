@@ -170,7 +170,7 @@ class AudioZone extends EntityModule
                 ['op' => 'cancelSleep',     'label' => 'Sleep-Timer abbrechen'],
                 ['op' => 'computeProbe',    'label' => 'Zeitplan/Regel-Vorschau (Trockenlauf)'],
                 ['op' => 'radioNow',        'label' => 'Radio: laufender Titel + Cover'],
-                ['op' => 'playDirect',      'label' => 'Radio: werbefreien HQ-Stream direkt spielen'],
+                ['op' => 'playDirect',      'label' => 'Radio: HQ-Direktstream spielen'],
                 ['op' => 'radioStations',   'label' => 'Radio: Senderliste'],
                 ['op' => 'playContent',     'label' => 'Bibliotheks-Inhalt abspielen (ContentRef)'],
             ],
@@ -705,7 +705,9 @@ class AudioZone extends EntityModule
                 'coverUri'     => $id('COVERURI'),
                 'positionTime' => $id('POSITION'),
                 'duration'     => $id('DURATION'),
-                'playState'    => $transport, // Naeherung; nativer Treiber liefert echten PlayState
+                // IPSSonos-TRANSPORT: 1=Play, 2=Pause, 3=Stop. Nur die 1 heisst Wiedergabe -
+                // ohne diese Angabe galt auch Stop als "spielt" (Bool-Cast von 3).
+                'playState'    => ['varId' => $transport, 'playValues' => [1]],
                 'volume'       => $id('VOLUME'),
                 'mute'         => $id('MUTE'),
                 'repeat'       => $id('REPEAT'),
@@ -860,7 +862,7 @@ class AudioZone extends EntityModule
     }
 
     // ==================================================================
-    // Radio: laufender Titel + Song-Cover (RadioNow) + werbefreier Direktstream
+    // Radio: laufender Titel + Song-Cover (RadioNow) + HQ-Direktstream
     // ==================================================================
 
     /** Speaker-IP/RINCON aus der gebundenen Raum-Instanz (bind.transport-Variable -> Parent). */
@@ -949,7 +951,7 @@ class AudioZone extends EntityModule
         return ['ok' => true, 'title' => $ref->title, 'provider' => $ref->provider, 'kind' => $ref->kind];
     }
 
-    /** Werbefreien HQ-Direktstream eines Senders auf diesem Speaker spielen (statt TuneIn). */
+    /** HQ-Direktstream eines Senders auf diesem Speaker spielen (statt TuneIn). */
     private function mgmtPlayDirect(array $args): array
     {
         $key = (string) ($args['station'] ?? '');
@@ -1084,7 +1086,7 @@ class AudioZone extends EntityModule
     public function PlayRadio(int $Index): bool    { return $this->setControlValue('SourceRadio', $Index); }
     public function PlayPlaylist(int $Index): bool { return $this->setControlValue('SourcePlaylist', $Index); }
 
-    /** Werbefreier HQ-Direktstream (Sender-Key). */
+    /** HQ-Direktstream (Sender-Key). */
     public function PlayDirectRadio(string $StationKey): bool
     {
         $r = json_decode($this->Manage(json_encode(['op' => 'playDirect', 'args' => ['station' => $StationKey]])), true);
