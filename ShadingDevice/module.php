@@ -76,6 +76,7 @@ class ShadingDevice extends EntityModule
     private const POS_TOLERANCE   = 3;        // % Drift, bevor gefahren wird
     private const SAFE_POS        = 0;        // Sturm-/Regen-sichere Position (offen/eingefahren)
     private const SUN_DWELL       = 300;      // Min-Dwell (s) gegen Sonnen-Flattern
+    private const CAL_TIMEOUT     = 900;      // Kalibrier-Lock: Not-Aus nach 15 Min ohne Abschluss
 
     /** Umgebungs-Sensoren (Standort-Defaults; per config.env ueberschreibbar). */
     private const SUN_AZ_ID      = 15291;    // Azimut (Location #<ID>)
@@ -227,6 +228,10 @@ class ShadingDevice extends EntityModule
                 ['op' => 'getConfig',          'label' => 'Konfiguration lesen (Diagnose)'],
                 ['op' => 'command',            'label' => 'Bedienen (Position/Fahrt/Modus)'],
                 ['op' => 'referenceRun',       'label' => 'Referenzfahrt (kalibrieren)'],
+                ['op' => 'calMove',            'label' => 'Kalibrierfahrt: rohes Fahren (auf/ab)'],
+                ['op' => 'calStop',            'label' => 'Kalibrierfahrt: Stopp'],
+                ['op' => 'calSetTime',         'label' => 'Kalibrierfahrt: gemessene Fahrzeit uebernehmen'],
+                ['op' => 'calAbort',           'label' => 'Kalibrierfahrt: abbrechen (Automatik wieder frei)'],
                 ['op' => 'validate',           'label' => 'Bindung pruefen (Diagnose)'],
                 ['op' => 'getLog',             'label' => 'Entscheidungs-/Befehls-Log lesen'],
             ],
@@ -268,6 +273,9 @@ class ShadingDevice extends EntityModule
         $this->RegisterAttributeString('DecisionLog', '[]'); // Ringpuffer: Automatik-Entscheidungen + manuelle Befehle (nur echte Fahrten)
         $this->RegisterPropertyString('Driver', '');
         $this->RegisterPropertyBoolean('Invert', false);
+        // Geraeteart: 'shutter' = Rollo (Default) | 'awning' = Markise. Rein semantisch —
+        // steuert Beschriftung/Darstellung im Frontend (Ein/Aus + Ausfahrgrad statt Auf/Zu).
+        $this->RegisterPropertyString('DeviceKind', 'shutter');
         $this->RegisterPropertyInteger('PositionId', 0);
         $this->RegisterPropertyInteger('AutomaticId', 0);
         $this->RegisterPropertyInteger('SocketId', 0);
@@ -302,6 +310,7 @@ class ShadingDevice extends EntityModule
         $props = [
             'driver'       => $this->ReadPropertyString('Driver'),
             'invert'       => $this->ReadPropertyBoolean('Invert'),
+            'deviceKind'   => $this->ReadPropertyString('DeviceKind'),
             'positionId'   => $this->ReadPropertyInteger('PositionId'),
             'automaticId'  => $this->ReadPropertyInteger('AutomaticId'),
             'socketId'     => $this->ReadPropertyInteger('SocketId'),
@@ -331,7 +340,12 @@ class ShadingDevice extends EntityModule
         if ($hw > 0) { $merged['windStormKmh'] = $hw; }
         $hs = (int) $this->hubProp('ShadeSafePos', 0);
         if ($hs > 0) { $merged['safePos'] = $hs; }
-        $merged['rainClose'] = $this->hubPropBool('ShadeRainClose', (bool) ($merged['rainClose'] ?? true));
+        // REGEN IST OPT-IN JE GERAET (Vorgabe): hier hat frueher der Hub-Schalter
+        // ShadeRainClose bedingungslos gewonnen -> Regen haette ALLE 17 Rollos gefahren,
+        // obwohl in IPSShadowing nur die Markise ein Wetterprofil hatte. Der Hub-Override
+        // ist deshalb entfernt: massgeblich ist allein die Instanz-Property RainClose
+        // (oben in $props, gewinnt ueber array_merge). Wind/Sturm bleibt bewusst haus-weit,
+        // weil er die Mechanik schuetzt und nicht dem Komfort dient.
         $env = is_array($merged['env'] ?? null) ? $merged['env'] : [];
         foreach (['sunAzId'=>'ShadeSunAzId','sunElId'=>'ShadeSunElId','windId'=>'ShadeWindId','rainId'=>'ShadeRainId','brightId'=>'ShadeBrightId'] as $k => $hp) {
             $g = (int) $this->hubProp($hp, 0);
@@ -360,7 +374,7 @@ class ShadingDevice extends EntityModule
 
     /** Map flache Config-Keys -> [PropertyName, Typ]. */
     private const PROP_MAP = [
-        'driver'=>['Driver','s'], 'invert'=>['Invert','b'], 'positionId'=>['PositionId','i'],
+        'driver'=>['Driver','s'], 'invert'=>['Invert','b'], 'deviceKind'=>['DeviceKind','s'], 'positionId'=>['PositionId','i'],
         'automaticId'=>['AutomaticId','i'], 'socketId'=>['SocketId','i'], 'channel'=>['Channel','i'],
         'repeat'=>['Repeat','i'], 'stopRepeat'=>['StopRepeat','i'], 'gapMs'=>['GapMs','i'],
         'timeOpening'=>['TimeOpening','i'], 'timeClosing'=>['TimeClosing','i'], 'instanceId'=>['InstanceId','i'],
@@ -485,6 +499,32 @@ class ShadingDevice extends EntityModule
     }
 
     /**
+     * MANUELL-VORRANG: einen Nutzer-Eingriff in den dauerhaften Modus MANUELL
+     * uebersetzen (Vorgabe: "manuell hat immer hoechste Prio und stellt das Rollo
+     * auf manuell, bis es wieder auf Automatik gestellt wird").
+     *
+     * Wirkung ueber den bestehenden Mode-Control (0 Auto, 1 Manuell, 2 Sonne):
+     * computeDecision setzt sunOn/schedOn nur fuer Mode 0/2 -> bei Mode 1 liefert
+     * evalRules kein Komfort-Ziel mehr. Das Safety-Tier (Sturm/Regen) ist davon
+     * unberuehrt und faehrt weiterhin. Ist der Modus bereits 1, passiert nichts
+     * (kein unnoetiges Schreiben/Event).
+     *
+     * Zusaetzlich wird der kurze manualHold gesetzt: er deckt den Moment ab, bevor
+     * der Modus wirkt, und traegt die Handbedienung auch dann, wenn der Nutzer
+     * bewusst im Automatikmodus bleiben will (Movement ist T_COMMAND und bekommt
+     * in RequestAction von Haus aus KEINEN Hold).
+     */
+    private function enterManualMode(): void
+    {
+        $vid = @$this->GetIDForIdent('Mode');
+        if ($vid && (int) @GetValue($vid) !== 1) {
+            $this->SetValue('Mode', 1);
+            $this->SendDebug('HSSH.manual', 'Handbedienung -> Modus MANUELL (bleibt bis der Nutzer auf Automatik zurueckstellt)', 0);
+        }
+        $this->manualHold('Position', $this->secondsToNextBoundary($this->activeVariant()));
+    }
+
+    /**
      * Vertrag 1 — realer Umsetzungs-Hook. Die Basis hat den Wert optimistisch
      * bereits in die MODUL-Statusvariable geschrieben; hier wird er an den HAL-
      * Treiber weitergereicht (Position -> moveTo, Fahrt -> move).
@@ -507,6 +547,25 @@ class ShadingDevice extends EntityModule
                 $this->logDecision($frm, $mto, $mv === 0 ? 'Manuell (Stopp)' : 'Manuell', $this->armed(), 'manuell');
             }
         }
+        // MANUELL HAT IMMER VORRANG (Vorgabe): jeder Nutzer-Eingriff schaltet das Rollo
+        // dauerhaft in den Modus MANUELL (Mode=1) - nicht nur ein Zeitfenster. Sonne und
+        // Zeitplan sind damit aus (computeDecision: sunOn/schedOn), Sturm/Sicherheit bleibt
+        // (eigener Tier). Zurueck in die Automatik NUR durch den Nutzer (Modus-Icon der
+        // Kachel bzw. Mode-Control). Das ist die IPSShadowing-Semantik (ManualChange), aber
+        // sichtbar und ohne deren stille Resets. Der kurze manualHold bleibt zusaetzlich als
+        // Schutz fuer den Moment, in dem der Modus noch nicht gegriffen hat.
+        // Reconcile/Automatikfahrten laufen NICHT hier durch (die rufen driveTo direkt),
+        // koennen den Modus also nicht versehentlich setzen.
+        if ($c->ident === 'Position' || $c->ident === 'Movement') {
+            $this->enterManualMode();
+        }
+        // Gegenrichtung: schaltet der Nutzer bewusst zurueck auf Automatik (0) oder
+        // Sonne (2), muss die manuelle Sperre WEG - sonst bliebe die Automatik trotz
+        // Auto-Modus bis zur naechsten Zeitplan-Grenze blockiert (genau der Zustand,
+        // der nach einer Kalibrierung sichtbar war).
+        if ($c->ident === 'Mode' && (int) $value !== 1) {
+            $this->releaseAutoHold();
+        }
         // Schatten-Modus: KEIN reales Fahren/Bus-Telegramm bis armed=true (sonst
         // Kollision mit IPSShadowing auf demselben Socket 45711). Optimistischer
         // SetValue der Basis bleibt (Anzeige folgt), real passiert nichts.
@@ -518,10 +577,15 @@ class ShadingDevice extends EntityModule
         if (!$drv instanceof IShutter) {
             return; // kein (Shutter-)Treiber gebunden -> Schatten-Modus
         }
+        // Ist-Lage fuer den Tuer-Guard: readPosition() liefert bei rueckmeldungslosen
+        // Treibern (Somfy) IMMER -1, damit lief der Guard im Handbetrieb ins Leere.
+        // estPos() nimmt die geschaetzte/gespiegelte Lage und macht ihn wirksam.
+        $curForGuard = $drv->readPosition();
+        if ($curForGuard === IShutter::POS_UNKNOWN) { $curForGuard = $this->estPos(); }
         switch ($c->ident) {
             case 'Position':
                 $p = (int) max(self::POS_MIN, min(self::POS_MAX, (int) round((float) $value)));
-                if ($this->closeBlockedByDoor($drv->readPosition(), $p)) {
+                if ($this->closeBlockedByDoor($curForGuard, $p)) {
                     $this->SendDebug('HSSH.guard', 'Tuer offen -> manuelles Zufahren auf ' . $p . '% blockiert', 0);
                     break;
                 }
@@ -529,9 +593,17 @@ class ShadingDevice extends EntityModule
                 break;
             case 'Movement':
                 // Auf/Zu ueber den Executor (Endanschlag, selbstkalibrierend + Rueckmeldung); Stopp beendet die laufende Fahrt.
+                // Zufahren unterliegt demselben Tuer-Guard wie der Positionsbefehl (vorher lief
+                // Movement komplett daran vorbei -> Rollo konnte in die offene Tuer fahren).
                 $mv = (int) $value;
                 if ($mv === 1)      { $this->driveTo($drv, self::POS_MIN); }   // auf
-                elseif ($mv === 2)  { $this->driveTo($drv, self::POS_MAX); }   // zu
+                elseif ($mv === 2)  {
+                    if ($this->closeBlockedByDoor($curForGuard, self::POS_MAX)) {
+                        $this->SendDebug('HSSH.guard', 'Tuer offen -> manuelles Zufahren (Taste Zu) blockiert', 0);
+                        break;
+                    }
+                    $this->driveTo($drv, self::POS_MAX);
+                }   // zu
                 else                { $rtm = $this->readRt(); if (!empty($rtm['moving'])) { $this->finishMove(true); } else { $drv->move('stop'); } }
                 break;
         }
@@ -649,6 +721,14 @@ class ShadingDevice extends EntityModule
                 return $this->mgmtRotateGeo($args);
             case 'referenceRun':
                 return $this->mgmtReferenceRun($args);
+            case 'calMove':
+                return $this->mgmtCalMove($args);
+            case 'calStop':
+                return $this->mgmtCalStop();
+            case 'calSetTime':
+                return $this->mgmtCalSetTime($args);
+            case 'calAbort':
+                return $this->mgmtCalAbort();
             case 'validate':
                 return $this->mgmtValidate();
             default:
@@ -1271,11 +1351,15 @@ class ShadingDevice extends EntityModule
             ['type' => 'Label', 'caption' => '— Homematic-Rollo/Markise (LEVEL-Datenpunkt, absolut) —'],
             ['type' => 'SelectInstance', 'name' => 'cfgHmInstance', 'caption' => 'Homematic-Instanz (LEVEL/STOP)',
                 'value' => (int) ($cfg['instanceId'] ?? 0)],
+            ['type' => 'Select', 'name' => 'cfgKind', 'caption' => 'Art des Beschattungselements',
+                'options' => [['caption' => 'Rollo / Jalousie', 'value' => 'shutter'],
+                              ['caption' => 'Markise', 'value' => 'awning']],
+                'value' => (string) ($cfg['deviceKind'] ?? 'shutter')],
             ['type' => 'CheckBox', 'name' => 'cfgInvert', 'caption' => 'Richtung invertieren (auf/ab bzw. LEVEL 1=offen / 0=zu..100=offen)',
                 'value' => (bool) ($cfg['invert'] ?? false)],
             ['type' => 'Button', 'caption' => 'Bindung uebernehmen', 'onClick' =>
                 'echo HSSH_Manage($id, json_encode(["op"=>"configureDriver","args"=>['
-                . '"driver"=>$cfgDriver,"invert"=>$cfgInvert,'
+                . '"driver"=>$cfgDriver,"invert"=>$cfgInvert,"deviceKind"=>$cfgKind,'
                 . '"positionId"=>$cfgPositionId,"automaticId"=>$cfgAutomaticId,'
                 . '"socketId"=>$cfgSocketId,"channel"=>$cfgChannel,"repeat"=>$cfgRepeat,'
                 . '"timeOpening"=>$cfgTimeOpening,"timeClosing"=>$cfgTimeClosing,'
@@ -1357,7 +1441,12 @@ class ShadingDevice extends EntityModule
         if (!$drv instanceof IShutter) {
             return;
         }
-        $this->reflectFromDriver($drv);
+        // Waehrend der Kalibrierung nicht spiegeln: die Ist-Lage ist per Definition
+        // unbekannt (roher Motorlauf ohne Bookkeeping) - reconcile() entscheidet
+        // selbst, ob Sturm den Lock bricht.
+        if (!$this->calLocked()) {
+            $this->reflectFromDriver($drv);
+        }
         $this->reconcile($drv);
     }
 
@@ -1510,6 +1599,52 @@ class ShadingDevice extends EntityModule
         $this->pushPosition($interp);
     }
 
+    // ==================================================================
+    // Kalibrier-Lock: ab dem ersten calMove bis calSetTime (Speichern) ODER
+    // calAbort darf die Automatik das Rollo NICHT anfassen. Der Lock lebt im
+    // RtState (also im Modul, nicht im Widget) und ueberlebt einen Neustart;
+    // ein Not-Aus nach CAL_TIMEOUT verhindert ein dauerhaft gesperrtes Rollo,
+    // falls der Nutzer nie abschliesst (Browser zu, Tab weg).
+    // ==================================================================
+
+    /** Laeuft gerade eine Kalibrierung? Abgelaufene Locks werden dabei selbst aufgeraeumt. */
+    private function calLocked(): bool
+    {
+        $rt = $this->readRt();
+        if (empty($rt['calLock'])) { return false; }
+        $until = (int) ($rt['calUntil'] ?? 0);
+        if ($until > 0 && time() > $until) {
+            $this->calUnlock('Timeout');   // Not-Aus: Motor stoppen + Lock loesen
+            return false;
+        }
+        return true;
+    }
+
+    /** Lock setzen/verlaengern. $phase: 'moving' (Motor laeuft) | 'stopped' (Messung steht, wartet auf Uebernehmen). */
+    private function calLock(string $phase): void
+    {
+        $rt = $this->readRt();
+        $rt['calLock']  = true;
+        $rt['calPhase'] = $phase;
+        $rt['calUntil'] = time() + self::CAL_TIMEOUT;
+        $this->writeRt($rt);
+        $this->SendDebug('HSSH.cal', 'Kalibrier-Lock ' . $phase . ' (bis ' . date('H:i:s', $rt['calUntil']) . ')', 0);
+    }
+
+    /** Lock aufheben. Bei $stopMotor stoppt zusaetzlich eine evtl. laufende Messfahrt. */
+    private function calUnlock(string $why, bool $stopMotor = true): void
+    {
+        $rt = $this->readRt();
+        $was = !empty($rt['calLock']) ? (string) ($rt['calPhase'] ?? '') : '';
+        unset($rt['calLock'], $rt['calPhase'], $rt['calUntil']);
+        $this->writeRt($rt);
+        if ($stopMotor && $was === 'moving') {
+            $drv = $this->driver();
+            if ($drv instanceof IShutter) { $drv->move('stop'); }
+        }
+        if ($was !== '') { $this->SendDebug('HSSH.cal', 'Kalibrier-Lock frei (' . $why . ')', 0); }
+    }
+
     /** Geschaetzte Ist-Position (nur wenn kalibriert), sonst POS_UNKNOWN. */
     private function estPos(): int
     {
@@ -1538,7 +1673,20 @@ class ShadingDevice extends EntityModule
         $lp = (int) $this->cfgVal('positionId', 0);
         if ($lp > 0 && function_exists('IPS_VariableExists') && @\IPS_VariableExists($lp)) {
             $cur = @GetValue($lp);
-            if (!is_numeric($cur) || (int) round((float) $cur) !== $pos) { @SetValue($lp, $pos); }
+            if (!is_numeric($cur) || (int) round((float) $cur) !== $pos) {
+                // SELBST-SCHREIBVORGANG MARKIEREN, BEVOR geschrieben wird: die gespiegelte
+                // Positions-Variable ist zugleich die von MessageSink UEBERWACHTE Variable.
+                // Ohne diese Markierung deutet das Modul jeden eigenen Ramp-Zwischenwert als
+                // externen Eingriff und holdet sich selbst -> nach EINER Automatikfahrt war
+                // die Komfort-Automatik bis zur naechsten Slot-Grenze tot. Der Marker muss
+                // je Schreibvorgang mitlaufen (nicht nur einmal je Fahrt), weil eine Fahrt
+                // 17-33 s dauert und aus dem 10-s-Fenster faellt.
+                $rt = $this->readRt();
+                $rt['selfWriteTs']  = time();
+                $rt['selfWriteVal'] = $pos;
+                $this->writeRt($rt);
+                @SetValue($lp, $pos);
+            }
         }
     }
 
@@ -1602,6 +1750,101 @@ class ShadingDevice extends EntityModule
         $this->writeRt($rt);
         $this->SetTimerInterval(self::TIMER_MOVE, $durMs);
         return ['ok' => true, 'dir' => $dir, 'endstop' => $endstop, 'settleMs' => $durMs];
+    }
+
+    // ------------------------------------------------------------------
+    // Kalibrierfahrt (fuers LVB-Kalibrier-Widget): ROHES Fahren/Stoppen ueber den
+    // Treiber (NICHT driveTo mit Auto-Stop) — nur so misst das Widget die echte
+    // Fahrzeit. calSetTime uebernimmt die gemessene Zeit in TimeOpening/TimeClosing.
+    // ------------------------------------------------------------------
+    private function mgmtCalMove(array $args): array
+    {
+        $dir = strtolower((string) ($args['dir'] ?? ''));
+        if (!in_array($dir, ['up', 'down'], true)) {
+            throw new ContractException('dir muss up|down sein');
+        }
+        $drv = $this->driver();
+        if (!$drv instanceof IShutter) {
+            throw new ContractException('kein Treiber gebunden');
+        }
+        if ($this->stormActive($this->readInputs())) {
+            throw new ContractException('Sturm/Regen aktiv -> Kalibrierfahrt gesperrt (Safety)');
+        }
+        // rohes Motor-AN in die Richtung; laeuft bis calStop (bzw. bis zum Endanschlag des Motors).
+        $ok = (bool) $drv->move($dir);
+        // laufende zeitbasierte Fahrt-Bookkeeping beenden, damit estPos nicht dazwischenfunkt
+        $rt = $this->readRt(); if (!empty($rt['moving'])) { $rt['moving'] = false; $this->writeRt($rt); $this->SetTimerInterval(self::TIMER_MOVE, 0); }
+        // AUTOMATIK SPERREN bis Uebernehmen/Abbrechen (Vorgabe) ...
+        $this->calLock('moving');
+        // ... und die Positionsschaetzung als UNBEKANNT markieren: der Motor laeuft roh,
+        // ohne Bookkeeping - jede weiter gefuehrte Zahl waere gelogen und wuerde die
+        // naechste Automatikfahrt von falscher Ausgangslage rechnen lassen.
+        $this->setEstPos(0, false);
+        return ['ok' => $ok, 'dir' => $dir, 'locked' => true];
+    }
+
+    private function mgmtCalStop(): array
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof IShutter) {
+            throw new ContractException('kein Treiber gebunden');
+        }
+        $ok = (bool) $drv->move('stop');
+        // Lock BLEIBT: der Nutzer entscheidet erst jetzt (Uebernehmen oder Verwerfen).
+        // Timeout laeuft neu, damit ein langes Ueberlegen den Lock nicht platzen laesst.
+        $this->calLock('stopped');
+        return ['ok' => $ok, 'locked' => true];
+    }
+
+    /**
+     * Kalibrierung abbrechen (Widget "Verwerfen" / Not-Aus): Motor stoppen, Lock
+     * loesen, nichts uebernehmen. Ohne diese Op bliebe die Automatik nach einem
+     * abgebrochenen Messvorgang bis zum Timeout gesperrt.
+     */
+    private function mgmtCalAbort(): array
+    {
+        $this->calUnlock('Abbruch durch Nutzer');   // stoppt den Motor, falls er noch laeuft
+        $this->releaseAutoHold();                   // wie beim Speichern: Automatik wieder frei
+        return ['ok' => true, 'locked' => false];
+    }
+
+    /**
+     * Manuelle Sperre komplett aufheben -> die Automatik uebernimmt beim naechsten
+     * Reconcile wieder. Gegenstueck zu enterManualMode(). Wird bewusst NUR durch
+     * eine ausdrueckliche Nutzer-Handlung ausgeloest: Kalibrierung speichern/abbrechen
+     * oder Rueckschalten auf Automatik.
+     */
+    private function releaseAutoHold(): void
+    {
+        $this->clearManualHold('Position');
+        $this->clearManualHold('Mode');
+        $this->SendDebug('HSSH.manual', 'Manuelle Sperre aufgehoben -> Automatik uebernimmt wieder', 0);
+    }
+
+    private function mgmtCalSetTime(array $args): array
+    {
+        $dir = strtolower((string) ($args['dir'] ?? ''));
+        if (!in_array($dir, ['up', 'down'], true)) {
+            throw new ContractException('dir muss up|down sein');
+        }
+        $sec = (int) round((float) ($args['seconds'] ?? 0));
+        if ($sec < 1 || $sec > 300) {
+            throw new ContractException('seconds muss 1..300 sein');
+        }
+        $key = ($dir === 'up') ? 'timeOpening' : 'timeClosing'; // up=Auf=Fahrzeit AUF, down=Zu=Fahrzeit ZU
+        $this->applyConfigProperties([$key => $sec], true);
+        // Die Messfahrt endete per Definition in der Endlage der gemessenen Richtung
+        // -> die Lage ist jetzt EXAKT bekannt (up=0=offen, down=100=zu). Damit ist das
+        // Rollo referenziert und kann anschliessend Zwischenpositionen anfahren.
+        $this->setEstPos(($dir === 'up') ? self::POS_MIN : self::POS_MAX, true);
+        $this->calUnlock('Fahrzeit uebernommen', false);   // Automatik wieder frei
+        // SPEICHERN gibt die Automatik VOLLSTAENDIG frei: der manualHold, den die
+        // Messfahrt ausgeloest hat, waere sonst bis zur naechsten Zeitplan-Grenze
+        // aktiv und die Automatik trotz geloestem Lock weiter blockiert.
+        $this->releaseAutoHold();
+        return ['ok' => true, 'dir' => $dir, 'seconds' => $sec, 'locked' => false,
+            'timeOpening' => $this->ReadPropertyInteger('TimeOpening'),
+            'timeClosing' => $this->ReadPropertyInteger('TimeClosing')];
     }
 
     /** Diagnose: prueft die Bindung dieser Instanz (op=validate + Konsolen-Button). */
@@ -1684,6 +1927,22 @@ class ShadingDevice extends EntityModule
     {
         $d = $this->computeDecision($drv, true);
         $target = $d['target'];
+        // Kalibrierung laeuft -> die Automatik fasst das Rollo NICHT an. Ausnahme: STURM
+        // steht ueber der Kalibrierung (Sachschadenschutz) und bricht sie hart ab.
+        if ($this->calLocked()) {
+            if (empty($d['storm'])) { return; }
+            $this->calUnlock('Sturm bricht Kalibrierung ab');
+        }
+        // LAUFENDE FAHRT NIEMALS ZERHACKEN: driveTo() beendet als erstes jede laufende
+        // Fahrt (finishMove -> STOP). Da MessageSink bei JEDER Wind-/Regen-Aktualisierung
+        // ein Reconcile ausloest (Windsensor liefert alle 2 s!), wurde eine 13-Sekunden-
+        // Fahrt in ~7 Stop/Start-Zyklen zerlegt: das Rollo kam physisch kaum vom Fleck,
+        // waehrend die zeitbasierte Schaetzung bis zum Ziel hochlief (0->12->24->...->75).
+        // Waehrend einer Fahrt wird deshalb nichts nachgeregelt - nur Sturm darf abbrechen.
+        $rtMove = $this->readRt();
+        if (!empty($rtMove['moving']) && empty($d['storm'])) {
+            return;
+        }
         // Globaler Automatik-Schalter (Hub) aus -> keine Komfort-Automatik; Sturm/Safety bleibt.
         if (!$this->automationEnabled() && empty($d['storm'])) {
             return;
@@ -2044,16 +2303,36 @@ class ShadingDevice extends EntityModule
             if ($newVal === null) {
                 return;
             }
+            // Waehrend einer EIGENEN zeitbasierten Fahrt bzw. einer Kalibrierung stammt
+            // jede Aenderung dieser Variable vom Modul selbst (Ramp-Rueckmeldung) - nie
+            // als Fremdeingriff werten, sonst holdet sich das Modul selbst.
+            if (!empty($rt['moving']) || $this->calLocked()) {
+                return;
+            }
             $selfTs  = (int) ($rt['selfWriteTs'] ?? 0);
             $selfVal = isset($rt['selfWriteVal']) ? (float) $rt['selfWriteVal'] : null;
             if ($selfVal !== null && abs($selfVal - $newVal) < 1.0 && (time() - $selfTs) <= 10) {
                 return; // Self-Write (das war das Modul)
             }
-            $this->manualHold('Position', $this->secondsToNextBoundary($this->activeVariant()));
+            // Echter Fremdeingriff (Legacy-Automatik, Skript, Visu): Handbedienung -> MANUELL.
+            $this->enterManualMode();
             $this->SendDebug('HSSH.override', 'Externe Position ' . $newVal . '% -> Hold bis Slot-Grenze', 0);
             return;
         }
         if (($windVid > 0 && (int) $Sender === $windVid) || ($rainVid > 0 && (int) $Sender === $rainVid)) {
+            // NUR bei echter Sturm-FLANKE sofort reagieren. Die Wetterstation
+            // aktualisiert alle 2 s; ein Reconcile je Update ist reine Last (und war
+            // in Kombination mit dem Fahrt-Abbruch der Grund fuer zerhackte Fahrten).
+            // Der normale 30-s-Tick deckt alles Uebrige ab.
+            $storm = $this->stormActive($this->readInputs());
+            $rtS   = $this->readRt();
+            $was   = !empty($rtS['stormWas']);
+            if ($storm === $was) {
+                return;
+            }
+            $rtS['stormWas'] = $storm;
+            $this->writeRt($rtS);
+            $this->SendDebug('HSSH.safety', 'Sturm-Flanke: ' . ($storm ? 'AKTIV' : 'vorbei') . ' -> Sofort-Reconcile', 0);
             $drv = $this->driver();
             if ($drv instanceof IShutter) {
                 $this->reconcile($drv); // Sofort-Safety (Schatten-Modus bis armed)
