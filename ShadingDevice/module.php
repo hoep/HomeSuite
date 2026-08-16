@@ -277,6 +277,12 @@ class ShadingDevice extends EntityModule
     // ==================================================================
     public function Create()
     {
+        // Globalstrahlung als Sonnen-Gate. Die Geometrie allein sagt nur, WO die Sonne steht -
+        // nicht, ob sie scheint. Ohne diese Bindung meldet ein Fenster auch bei geschlossener
+        // Wolkendecke "Sonne", sobald der Sonnenstand ins Azimutfenster faellt.
+        // 0 = nicht gebunden bzw. Schwelle aus -> Verhalten unveraendert wie bisher.
+        $this->RegisterPropertyInteger('SunRadId', 0);
+        $this->RegisterPropertyFloat('SunRadMin', 0.0);
         parent::Create();
         $this->RegisterAttributeString('DecisionLog', '[]'); // Ringpuffer: Automatik-Entscheidungen + manuelle Befehle (nur echte Fahrten)
         $this->RegisterPropertyString('Driver', '');
@@ -1406,6 +1412,11 @@ class ShadingDevice extends EntityModule
                 ['type' => 'SelectVariable', 'name' => 'cfgEnvBright', 'caption' => 'Helligkeit',
                     'value' => $envBright],
             ]],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'SelectVariable', 'name' => 'SunRadId', 'caption' => 'Globalstrahlung (W/m²)'],
+                ['type' => 'NumberSpinner', 'name' => 'SunRadMin', 'caption' => 'Sonne erst ab (W/m²)', 'digits' => 0],
+            ]],
+            ['type' => 'Label', 'caption' => 'Sonnen-Gate: liegt die gemessene Strahlung unter der Schwelle, gilt die Sonnenregel als NICHT erfuellt - unabhaengig vom Sonnenstand. 0 = aus. Richtwert 250-350 W/m². Diese beiden Felder sind echte Instanz-Eigenschaften und gelten sofort mit "Uebernehmen" (kein Button noetig).'],
             ['type' => 'Button', 'caption' => 'Umgebungs-Sensoren uebernehmen', 'onClick' =>
                 'echo HSSH_Manage($id, json_encode(["op"=>"configureAutomation","args"=>["env"=>['
                 . '"sunAzId"=>$cfgEnvSunAz,"sunElId"=>$cfgEnvSunEl,"windId"=>$cfgEnvWind,'
@@ -2064,6 +2075,17 @@ class ShadingDevice extends EntityModule
         $rawSun = (is_array($geo) && $inp['el'] !== null)
             ? $this->schedules()->evalGeo((float) ($inp['az'] ?? 0), (float) $inp['el'], (float) ($inp['bright'] ?? 0), $geo)
             : null;
+        // Strahlungs-Gate: die Geometrie sagt, WO die Sonne steht - die Strahlung, OB sie
+        // scheint. Bei geschlossener Decke faellt die Sonnenregel damit weg, obwohl der
+        // Sonnenstand im Fenster liegt. Greift nur, wenn Variable UND Schwelle gesetzt sind.
+        $radMin = (float) $this->ReadPropertyFloat('SunRadMin');
+        if ($rawSun !== null && $radMin > 0) {
+            $rad = $inp['rad'] ?? null;
+            if ($rad !== null && $rad < $radMin) {
+                $this->SendDebug('HSSH.sun', sprintf('Sonne verworfen: %.0f W/m2 < %.0f W/m2', $rad, $radMin), 0);
+                $rawSun = null;
+            }
+        }
         $sunTarget = $this->debounceSun($rawSun, $persist);
         // Temp-Gate: Sonnen-Beschattung nur, wenn Temperatur ueber Schwelle (IPSShadowing shadowingByTemp).
         // Zwei Schwellen wie in IPSShadowing ProfileTemp: Innen (sensorId>=aboveC) UND Aussen
@@ -2201,6 +2223,7 @@ class ShadingDevice extends EntityModule
             'az'     => $this->envNum('sunAzId', self::SUN_AZ_ID),
             'el'     => $this->envNum('sunElId', self::SUN_EL_ID),
             'bright' => $this->envNum('brightId', self::BRIGHT_ID),
+            'rad'    => $this->radNow(),
             'wind'   => $this->envNum('windId', self::WIND_ID),
             'rain'   => $this->envBool('rainId', self::RAIN_ID),
         ];
@@ -2211,6 +2234,15 @@ class ShadingDevice extends EntityModule
         $env = $this->cfgVal('env', []);
         $env = is_array($env) ? $env : [];
         return (int) ($env[$key] ?? $def);
+    }
+
+    /** Gemessene Globalstrahlung (W/m2) der gebundenen Variablen, sonst null. */
+    private function radNow(): ?float
+    {
+        $id = (int) $this->ReadPropertyInteger('SunRadId');
+        if ($id <= 0 || !@\IPS_VariableExists($id)) { return null; }
+        $v = @GetValue($id);
+        return is_numeric($v) ? (float) $v : null;
     }
 
     private function envNum(string $key, int $def): ?float
