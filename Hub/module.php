@@ -436,6 +436,8 @@ class HomeSuiteHub extends EntityModule
             'label' => 'Medienquellen konfigurieren', 'destructive' => false, 'fields' => []]);
         $m->addManagementAction(['op' => 'spotifyAuthUrl', 'verb' => 'spotifyAuthUrl', 'target' => 'hub',
             'label' => 'Spotify-Login-Link erzeugen', 'destructive' => false, 'fields' => []]);
+        $m->addManagementAction(['op' => 'shadeLogClear', 'verb' => 'shadeLogClear', 'target' => 'hub',
+            'label' => 'Beschattungs-Log leeren (alle Zonen oder entityId)']);
         $m->addManagementAction(['op' => 'shadeLog', 'verb' => 'shadeLog', 'target' => 'hub',
             'label' => 'Beschattungs-Log (alle Raeume) lesen', 'destructive' => false, 'fields' => []]);
         foreach ([['mediaProviders', 'Provider auflisten'], ['mediaBrowse', 'Bibliothek browsen'],
@@ -798,6 +800,9 @@ class HomeSuiteHub extends EntityModule
 
             case 'shadeLog':
                 return $this->mgmtShadeLog($args);
+
+            case 'shadeLogClear':
+                return $this->mgmtShadeLogClear($args);
 
             case 'mediaProviders':
                 $ps = [];
@@ -1442,6 +1447,32 @@ class HomeSuiteHub extends EntityModule
      * chronologisch (neueste zuerst), gedeckelt. Jede Instanz haelt einen eigenen Ringpuffer;
      * hier wird beim Lesen zusammengefuehrt (kein zentraler Schreib-Kopplungspunkt).
      */
+    /**
+     * Beschattungs-Log leeren - alle Zonen oder eine einzelne (args.entityId).
+     * Das Log dient nur der Nachvollziehbarkeit; Leeren aendert nichts am Betrieb.
+     */
+    private function mgmtShadeLogClear(array $args): array
+    {
+        // WICHTIG: "eine bestimmte Zone" wird am VORHANDENSEIN des Schluessels erkannt, nicht
+        // an seinem Wert. Frueher galt `if ($only > 0 && ...)` - ein unsinniger Wert wie -1 fiel
+        // damit durch die Bedingung und leerte ALLE Zonen. Genau so ist mir bei einer Probe der
+        // komplette Verlauf verloren gegangen.
+        $hasOnly = array_key_exists('entityId', $args);
+        $only    = (int) ($args['entityId'] ?? 0);
+        $ids     = @\IPS_GetInstanceListByModuleID('{A9645ED8-CB55-43B8-869B-BFF6ACFC8DC1}') ?: [];
+        if ($hasOnly && ($only <= 0 || !in_array($only, array_map('intval', $ids), true))) {
+            return ['ok' => false, 'error' => 'unbekannte entityId', 'zones' => 0, 'cleared' => 0];
+        }
+        $n = 0; $zonen = 0;
+        foreach ($ids as $id) {
+            if ($hasOnly && (int) $id !== $only) { continue; }
+            if (!function_exists('HSSH_Manage')) { break; }
+            $r = @json_decode((string) @\HSSH_Manage((int) $id, json_encode(['op' => 'clearLog'])), true);
+            if (is_array($r) && !empty($r['ok'])) { $zonen++; $n += (int) ($r['cleared'] ?? 0); }
+        }
+        return ['ok' => true, 'zones' => $zonen, 'cleared' => $n];
+    }
+
     private function mgmtShadeLog(array $args): array
     {
         $limit = max(1, min(1000, (int) ($args['limit'] ?? 300)));

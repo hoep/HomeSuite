@@ -242,6 +242,7 @@ class ShadingDevice extends EntityModule
                 ['op' => 'calAbort',           'label' => 'Kalibrierfahrt: abbrechen (Automatik wieder frei)'],
                 ['op' => 'validate',           'label' => 'Bindung pruefen (Diagnose)'],
                 ['op' => 'getLog',             'label' => 'Entscheidungs-/Befehls-Log lesen'],
+                ['op' => 'clearLog',           'label' => 'Entscheidungs-/Befehls-Log LEEREN'],
             ],
 
             // ---- Konfig-Felder (Treiberwahl; im LVB gesetzt) ----
@@ -283,6 +284,7 @@ class ShadingDevice extends EntityModule
         // 0 = nicht gebunden bzw. Schwelle aus -> Verhalten unveraendert wie bisher.
         $this->RegisterPropertyInteger('SunRadId', 0);
         $this->RegisterPropertyFloat('SunRadMin', 0.0);
+        $this->RegisterPropertyFloat('SunRadOff', 0.0);   // Hysterese: Ausschalt-Schwelle (0 = keine)
         parent::Create();
         $this->RegisterAttributeString('DecisionLog', '[]'); // Ringpuffer: Automatik-Entscheidungen + manuelle Befehle (nur echte Fahrten)
         $this->RegisterPropertyString('Driver', '');
@@ -707,6 +709,13 @@ class ShadingDevice extends EntityModule
             case 'getLog':
                 $entries = json_decode((string) $this->ReadAttributeString('DecisionLog'), true);
                 return ['ok' => true, 'room' => \IPS_GetName($this->InstanceID), 'entries' => is_array($entries) ? $entries : []];
+            case 'clearLog':
+                // Das Log ist reine Nachvollziehbarkeit, keine Betriebsgrundlage - Leeren
+                // aendert am Verhalten der Zone nichts. Zahl der verworfenen Eintraege
+                // zurueckgeben, damit der Aufrufer weiss, dass wirklich etwas passiert ist.
+                $vorher = json_decode((string) $this->ReadAttributeString('DecisionLog'), true);
+                $this->WriteAttributeString('DecisionLog', '[]');
+                return ['ok' => true, 'cleared' => is_array($vorher) ? count($vorher) : 0];
             case 'configureDriver':
                 return $this->mgmtConfigureDriver($args, $ctx);
             case 'configureAutomation':
@@ -1415,6 +1424,7 @@ class ShadingDevice extends EntityModule
             ['type' => 'RowLayout', 'items' => [
                 ['type' => 'SelectVariable', 'name' => 'SunRadId', 'caption' => 'Globalstrahlung (W/m²)'],
                 ['type' => 'NumberSpinner', 'name' => 'SunRadMin', 'caption' => 'Sonne erst ab (W/m²)', 'digits' => 0],
+                ['type' => 'NumberSpinner', 'name' => 'SunRadOff', 'caption' => 'Sonne AUS unter (W/m²)', 'digits' => 0],
             ]],
             ['type' => 'Label', 'caption' => 'Sonnen-Gate: liegt die gemessene Strahlung unter der Schwelle, gilt die Sonnenregel als NICHT erfuellt - unabhaengig vom Sonnenstand. 0 = aus. Richtwert 250-350 W/m². Diese beiden Felder sind echte Instanz-Eigenschaften und gelten sofort mit "Uebernehmen" (kein Button noetig).'],
             ['type' => 'Button', 'caption' => 'Umgebungs-Sensoren uebernehmen', 'onClick' =>
@@ -2072,6 +2082,14 @@ class ShadingDevice extends EntityModule
 
         // Sonne: Sonnenstandsvergleich gegen das Raum-Sonnenprofil (evalGeo) + Min-Dwell.
         $geo = $this->geoProfile(); // Baum-Variablen = Wahrheit
+        // HYSTERESE: solange die Beschattung LAEUFT, gilt die niedrigere Ausschalt-Schwelle.
+        // Sonst schaltet dieselbe Schwelle ein und aus, und bei durchziehenden Wolken pumpt
+        // die Anlage - jede Aufhellung faehrt zu, jede Wolke wieder auf.
+        $rtH = $this->readRt();
+        if (is_array($geo) && !empty($rtH['sunOn'])) {
+            $off = (float) ($geo['brightnessOff'] ?? 0);
+            if ($off > 0) { $geo['brightnessMin'] = $off; }
+        }
         $rawSun = (is_array($geo) && $inp['el'] !== null)
             ? $this->schedules()->evalGeo((float) ($inp['az'] ?? 0), (float) $inp['el'], (float) ($inp['bright'] ?? 0), $geo)
             : null;
@@ -2079,6 +2097,9 @@ class ShadingDevice extends EntityModule
         // scheint. Bei geschlossener Decke faellt die Sonnenregel damit weg, obwohl der
         // Sonnenstand im Fenster liegt. Greift nur, wenn Variable UND Schwelle gesetzt sind.
         $radMin = (float) $this->ReadPropertyFloat('SunRadMin');
+        $radOff = (float) $this->ReadPropertyFloat('SunRadOff');
+        // Gleiche Logik wie im Profil: laeuft die Beschattung, zaehlt die Ausschalt-Schwelle.
+        if ($radMin > 0 && $radOff > 0 && !empty($rtH['sunOn'])) { $radMin = $radOff; }
         if ($rawSun !== null && $radMin > 0) {
             $rad = $inp['rad'] ?? null;
             if ($rad !== null && $rad < $radMin) {

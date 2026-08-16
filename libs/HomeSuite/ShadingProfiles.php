@@ -40,6 +40,10 @@ final class ShadingProfiles
                 'azimuthEnd'    => ['type' => 'int',   'min' => 0,   'max' => 360, 'label' => 'Azimut bis (°)'],
                 'elevation'     => ['type' => 'int',   'min' => -10, 'max' => 90,  'label' => 'Elevations-Schwelle (°)'],
                 'brightnessMin' => ['type' => 'int',   'min' => 0,   'max' => 200000, 'label' => 'Helligkeit min (0=aus)'],
+                // HYSTERESE: Einschalten bei brightnessMin, Ausschalten erst unter brightnessOff.
+                // Ohne diesen Abstand pumpt die Anlage bei durchziehenden Wolken - jede Boee
+                // Helligkeit faehrt zu, jede Wolke wieder auf. 0 = keine Hysterese (wie bisher).
+                'brightnessOff' => ['type' => 'int',   'min' => 0,   'max' => 200000, 'label' => 'Sonne AUS unter (0=aus)'],
                 // closePct (Schliessgrad) ist PRO ROLLO (Baum-Var SunClose, im Besonnung-Widget
                 // einstellbar) - bewusst NICHT im geteilten Profil-Schema, sonst doppelt.
             ]],
@@ -90,6 +94,7 @@ final class ShadingProfiles
                     'azimuthEnd'    => (int) ($f['azimuthEnd'] ?? 360),
                     'elevation'     => (int) ($f['elevation'] ?? 0),
                     'brightnessMin' => (int) ($f['brightnessMin'] ?? 0),
+                    'brightnessOff' => (int) ($f['brightnessOff'] ?? 0),
                     'closePct'      => (int) ($f['closePct'] ?? 100),
                     'profile'       => true,
                 ]];

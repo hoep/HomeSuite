@@ -31,9 +31,9 @@ namespace Hoep\HomeSuite\HAL;
  *
  * config (bind):
  *   'channel'    int    1..16  RTS-Kanal (= Device-Index der Altkonfiguration)
- *   'repeat'     int    Sendewiederholungen je Kommando (Default 3)
- *   'stopRepeat' int    Wiederholungen fuer STOP (Default 4, mind. repeat)
- *   'gapMs'      int    Pause zwischen den Wiederholungen in ms (Default 50)
+ *   'repeat'     int    Sendewiederholungen je Kommando (Default 5)
+ *   'stopRepeat' int    Wiederholungen fuer STOP (Default 7, mind. repeat)
+ *   'gapMs'      int    Pause zwischen den Wiederholungen in ms (Default 60)
  *   'invert'     bool   up/down vertauschen (Default false)
  */
 final class SomfyRtsShutter implements IShutter
@@ -138,11 +138,18 @@ final class SomfyRtsShutter implements IShutter
         }
         // Reliabilitaet: Kommando MEHRFACH senden (Telegramme gehen sonst verloren).
         // STOP kritischer -> mehr Wiederholungen. Kleine Pause zwischen den Sends.
-        $repeat = max(1, (int) ($this->cfg['repeat'] ?? 3));
+        // Voreinstellung von 3 auf 5 angehoben (STOP 4 -> 7): RTS quittiert nichts, ein
+        // verlorenes Telegramm faellt nur dadurch auf, dass das Rollo stehen bleibt - und
+        // beim Betrieb ueber ein TCP-Gateway gehen einzelne Sendungen erfahrungsgemaess
+        // verloren. Wiederholungen sind unschaedlich, weil AUF/AB/STOP idempotent sind:
+        // ein zweites "AB" an ein bereits fahrendes Rollo aendert nichts. Bei 60 ms Abstand
+        // kostet ein Kommando so rund 0,3 s. Pro Rollo ueber 'repeat'/'stopRepeat'/'gapMs'
+        // weiter frei einstellbar.
+        $repeat = max(1, (int) ($this->cfg['repeat'] ?? 5));
         if ($dir === 'stop') {
-            $repeat = max($repeat, (int) ($this->cfg['stopRepeat'] ?? 4));
+            $repeat = max($repeat, (int) ($this->cfg['stopRepeat'] ?? 7));
         }
-        $gapMs = max(0, (int) ($this->cfg['gapMs'] ?? 50));
+        $gapMs = max(0, (int) ($this->cfg['gapMs'] ?? 60));
         for ($i = 0; $i < $repeat; $i++) {
             ($this->send)($frame);
             if ($gapMs > 0 && $i < $repeat - 1 && function_exists('IPS_Sleep')) {
