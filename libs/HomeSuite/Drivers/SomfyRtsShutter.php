@@ -34,6 +34,7 @@ namespace Hoep\HomeSuite\HAL;
  *   'repeat'     int    Sendewiederholungen je Kommando (Default 5)
  *   'stopRepeat' int    Wiederholungen fuer STOP (Default 7, mind. repeat)
  *   'gapMs'      int    Pause zwischen den Wiederholungen in ms (Default 60)
+ *   'busGapMs'   int    Mindestabstand zum Telegramm EINER ANDEREN Zone (Default 500)
  *   'invert'     bool   up/down vertauschen (Default false)
  */
 final class SomfyRtsShutter implements IShutter
@@ -150,10 +151,45 @@ final class SomfyRtsShutter implements IShutter
             $repeat = max($repeat, (int) ($this->cfg['stopRepeat'] ?? 7));
         }
         $gapMs = max(0, (int) ($this->cfg['gapMs'] ?? 60));
-        for ($i = 0; $i < $repeat; $i++) {
-            ($this->send)($frame);
-            if ($gapMs > 0 && $i < $repeat - 1 && function_exists('IPS_Sleep')) {
-                @\IPS_Sleep($gapMs);
+
+        // ------------------------------------------------------------------
+        // BUS-SERIALISIERUNG ueber ALLE Rollos
+        // ------------------------------------------------------------------
+        // Alle Zonen teilen sich EIN RTS-Gateway und EINE Luftschnittstelle. Faehrt die
+        // Automatik mehrere Rollos gleichzeitig an (Sonnenregel trifft eine ganze Fassade,
+        // oder ein Sammelbefehl), schickten bisher alle Zonen ihre je 5 Telegramme
+        // durcheinander. Auf 433 MHz gibt es keine Kollisionsvermeidung: was sich
+        // ueberlagert, ist weg - und weil RTS nichts quittiert, faellt es nur dadurch auf,
+        // dass ein Rollo stehen bleibt, waehrend die Buchfuehrung des Moduls es als
+        // gefahren fuehrt. Genau dieses Bild ("Kachel zeigt Fahrt, Rollo steht") war der
+        // Anlass.
+        //
+        // Darum: ein globales Schloss ueber alle Instanzen, plus ein Mindestabstand zum
+        // letzten Telegramm IRGENDEINER Zone (busGapMs, Vorgabe 500 ms). Die Zeit des
+        // letzten Sendens liegt in einer Datei, weil jeder Aufruf in einem eigenen
+        // PHP-Prozess laeuft und statische Variablen das nicht ueberleben.
+        $busGap = max(0, (int) ($this->cfg['busGapMs'] ?? 500));
+        $sem    = 'HSSH_RTS_BUS';
+        $stamp  = sys_get_temp_dir() . '/hssh_rts_last';
+        $have   = function_exists('IPS_SemaphoreEnter') ? @\IPS_SemaphoreEnter($sem, 10000) : true;
+        try {
+            if ($busGap > 0) {
+                $last = (float) @file_get_contents($stamp);
+                $waitMs = (int) round(($last + $busGap / 1000 - microtime(true)) * 1000);
+                if ($waitMs > 0 && function_exists('IPS_Sleep')) {
+                    @\IPS_Sleep(min(5000, $waitMs));
+                }
+            }
+            for ($i = 0; $i < $repeat; $i++) {
+                ($this->send)($frame);
+                if ($gapMs > 0 && $i < $repeat - 1 && function_exists('IPS_Sleep')) {
+                    @\IPS_Sleep($gapMs);
+                }
+            }
+            @file_put_contents($stamp, (string) microtime(true));
+        } finally {
+            if ($have && function_exists('IPS_SemaphoreLeave')) {
+                @\IPS_SemaphoreLeave($sem);
             }
         }
         return true;
