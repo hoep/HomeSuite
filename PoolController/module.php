@@ -253,6 +253,7 @@ class PoolController extends EntityModule
                 ['op' => 'getRomCodes',         'label' => '1-Wire ROM-Codes lesen'],
                 ['op' => 'computeCirculation',  'label' => 'Umwaelzzeit berechnen (TruePoolTemp)'],
                 ['op' => 'scheduleStatus',      'label' => 'Wochenplan-Status'],
+                ['op' => 'scheduleFromDevice',  'label' => 'Wochenplan vom Geraet uebernehmen (Probelauf; apply=true schreibt)'],
                 ['op' => 'sendSchedule',        'label' => 'Wochenplan an Controller senden (schreibt)'],
                 // Konfiguration schreiben (gated)
                 ['op' => 'setDosageConfig',     'label' => 'Dosier-Sollwerte setzen (schreibt)'],
@@ -862,6 +863,115 @@ class PoolController extends EntityModule
         return $out;
     }
 
+    /**
+     * RUECKRICHTUNG: schreibt den Symcon-Wochenplan aus den TIMEC-Regeln des Geraets.
+     *
+     * Gedacht fuer den Fall, dass jemand am Controller selbst (oder mit der Original-Oberflaeche)
+     * Zeiten geaendert hat und Symcon nachziehen soll. Standard ist ein PROBELAUF - geschrieben
+     * wird nur mit apply=true, weil hier ein bestehender Wochenplan ueberschrieben wird.
+     *
+     * Bewusste Einschraenkung: die GRUPPENSTRUKTUR des Ereignisses bleibt, wie sie ist. Symcon
+     * legt Gruppen an, nicht wir; Gruppen anzulegen oder zu loeschen waere der riskante Teil und
+     * ist hier nicht noetig, solange jede Gruppe fuer ihre Tage ein einheitliches Bild bekommt.
+     * Passt das Geraetebild nicht zur Gruppierung (eine Gruppe deckt Tage mit UNTERSCHIEDLICHEN
+     * Zeiten ab), wird NICHTS geschrieben und der Konflikt gemeldet - halb geschriebene
+     * Wochenplaene sind schlimmer als gar keine.
+     */
+    private function mgmtScheduleFromDevice(array $args): array
+    {
+        $apply = (bool) ($args['apply'] ?? false);
+        $eid   = $this->scheduleEventId();
+        if ($eid === 0) {
+            return ['ok' => false, 'error' => 'no_schedule_event'];
+        }
+        $client = $this->client();
+        if ($client === null) {
+            return ['ok' => false, 'error' => 'not_configured'];
+        }
+        $cur = $client->getRules('TIMEC');
+        if (empty($cur['ok'])) {
+            return ['ok' => false, 'error' => 'read_failed'];
+        }
+        $relay  = (int) $this->cfgVal('pumpRelayIndex', 0);
+        $perDay = TimecSchedule::groupsToPerDay(TimecSchedule::rulesToGroups($cur['rules'], $relay));
+
+        $e = @\IPS_GetEvent($eid);
+        if (!is_array($e) || (int) ($e['EventType'] ?? -1) !== 2) {
+            return ['ok' => false, 'error' => 'not_a_weekly_schedule'];
+        }
+        // Aktions-IDs des Ereignisses statt fester 0/1 - ein Plan kann eigene Aktionen haben.
+        $acts = array_map(static fn($a) => (int) $a['ID'], $e['ScheduleActions'] ?? []);
+        if (!in_array(0, $acts, true) || !in_array(1, $acts, true)) {
+            return ['ok' => false, 'error' => 'unexpected_actions', 'actions' => $acts];
+        }
+
+        $plan = $conflicts = [];
+        $seen = 0;
+        foreach ($e['ScheduleGroups'] ?? [] as $g) {
+            $gid  = (int) $g['ID'];
+            $days = (int) $g['Days'];
+            $seen |= $days;
+            $sig  = null;
+            $lbl  = [];
+            for ($d = 0; $d < 7; $d++) {
+                if (!($days & (1 << $d))) {
+                    continue;
+                }
+                $lbl[] = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'][$d];
+                $s = json_encode($perDay[$d]);
+                if ($sig === null) {
+                    $sig = $s;
+                } elseif ($sig !== $s) {
+                    $conflicts[] = sprintf('Gruppe %d (%s): das Geraet faehrt diese Tage unterschiedlich - der Wochenplan kann das in einer Gruppe nicht abbilden.',
+                        $gid, implode('+', $lbl));
+                    $sig = false;
+                    break;
+                }
+            }
+            if ($sig === false || $sig === null) {
+                continue;
+            }
+            $first = 0;
+            for ($d = 0; $d < 7; $d++) { if ($days & (1 << $d)) { $first = $d; break; } }
+            $plan[] = ['group' => $gid, 'days' => implode('+', $lbl),
+                       'points' => TimecSchedule::windowsToPoints($perDay[$first]),
+                       'had' => count($g['Points'] ?? [])];
+        }
+        if ($conflicts) {
+            return ['ok' => false, 'error' => 'group_structure', 'conflicts' => $conflicts];
+        }
+        // Tage, fuer die es gar keine Gruppe gibt, faehrt das Geraet zwar - der Wochenplan
+        // koennte sie aber nicht zeigen. Das ist meldenswert, kein Abbruchgrund.
+        $missing = [];
+        for ($d = 0; $d < 7; $d++) {
+            if (!($seen & (1 << $d)) && $perDay[$d]) {
+                $missing[] = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'][$d];
+            }
+        }
+
+        if ($apply) {
+            foreach ($plan as $p) {
+                $n = count($p['points']);
+                foreach ($p['points'] as $i => $pt) {
+                    @\IPS_SetEventScheduleGroupPoint($eid, $p['group'], $i, $pt['h'], $pt['m'], 0, $pt['a']);
+                }
+                // Ueberzaehlige Punkte werden mit ungueltiger Zeit (Stunde -1) geloescht.
+                for ($i = $n; $i < $p['had']; $i++) {
+                    @\IPS_SetEventScheduleGroupPoint($eid, $p['group'], $i, -1, 0, 0, 0);
+                }
+            }
+            // Der Plan stammt jetzt vom Geraet - Stand festhalten, sonst schreibt der naechste
+            // Abgleich ihn sofort wieder dorthin zurueck.
+            $rt = $this->readRt();
+            $rt['schedHash'] = md5(json_encode($this->groupsFromEvent($eid)));
+            $this->writeRt($rt);
+            $this->LogMessage('Pool-Wochenplan aus den Geraeteregeln uebernommen (' . count($plan) . ' Gruppen).', KL_NOTIFY);
+        }
+
+        return ['ok' => true, 'apply' => $apply, 'eventId' => $eid, 'relay' => $relay,
+                'groups' => $plan, 'missingDays' => $missing];
+    }
+
     /** Baut die 15-Werte-TIMEC-Regel aus {days,windows}. */
     private function buildFilterRule(array $st): array
     {
@@ -1416,6 +1526,8 @@ class PoolController extends EntityModule
                     'warn'        => $warn,
                     'pending' => (md5(json_encode($groups)) !== ($rt['schedHash'] ?? '')),
                     'armed' => (bool) $this->cfgVal('armed', false)];
+            case 'scheduleFromDevice':
+                return $this->mgmtScheduleFromDevice($args);
             case 'sendSchedule':
                 $eid = $this->scheduleEventId();
                 if ($eid === 0) {

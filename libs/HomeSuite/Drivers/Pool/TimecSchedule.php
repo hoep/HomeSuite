@@ -185,6 +185,59 @@ class TimecSchedule
         return $rules;
     }
 
+    /**
+     * Fenster -> Schaltpunkte eines Symcon-Wochenplans: [['min','h','m','a'], ...].
+     *
+     * Symcon beschreibt den Tag nicht mit Fenstern, sondern mit UMSCHALTPUNKTEN, und verlangt
+     * einen Punkt um 00:00 - sonst waere der Tagesanfang undefiniert. Ein Fenster wird also zu
+     * "Ein" an seinem Beginn und "Aus" an seinem Ende; beginnt der Tag nicht mit einem Fenster,
+     * kommt ein "Aus" um 00:00 davor.
+     *
+     * Ein Fenster bis 23:59 (1439) erzeugt bewusst KEINEN Aus-Punkt: der Tag ist ohnehin zu Ende,
+     * und ein Punkt um 23:59 waere nur eine Minute lang gueltig.
+     */
+    public static function windowsToPoints(array $windows, int $actOn = 1, int $actOff = 0): array
+    {
+        $w   = self::normalizeWindows($windows);
+        $pts = [];
+        if (!$w || $w[0][0] > 0) {
+            $pts[] = 0;                       // Tagesanfang: aus
+        }
+        foreach ($w as $x) {
+            $pts[] = $x[0];
+            if ($x[1] < 1439) {
+                $pts[] = $x[1];
+            }
+        }
+        $out = [];
+        foreach ($pts as $i => $min) {
+            // Punkte wechseln sich ab; der erste ist "Aus", wenn der Tag nicht mit einem
+            // Fenster beginnt, sonst "Ein".
+            $ein = (!$w || $w[0][0] > 0) ? ($i % 2 === 1) : ($i % 2 === 0);
+            $out[] = ['min' => $min, 'h' => intdiv($min, 60), 'm' => $min % 60,
+                      'a'   => $ein ? $actOn : $actOff];
+        }
+        return $out;
+    }
+
+    /** Tagesgruppen -> Fenster je Wochentag (Index 0=Mo .. 6=So), fuer die Rueckrichtung. */
+    public static function groupsToPerDay(array $groups): array
+    {
+        $perDay = array_fill(0, 7, []);
+        foreach ($groups as $g) {
+            $days = (int) ($g['days'] ?? 0);
+            for ($d = 0; $d < 7; $d++) {
+                if ($days & (1 << $d)) {
+                    $perDay[$d] = array_merge($perDay[$d], $g['windows'] ?? []);
+                }
+            }
+        }
+        for ($d = 0; $d < 7; $d++) {
+            $perDay[$d] = self::normalizeWindows($perDay[$d]);
+        }
+        return $perDay;
+    }
+
     /** Tagesgruppen mit identischem Fensterbild zu einer Gruppe verschmelzen (ODER der Tage). */
     public static function mergeIdenticalDays(array $groups): array
     {
