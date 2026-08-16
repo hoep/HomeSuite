@@ -192,7 +192,8 @@ class PoolController extends EntityModule
 
         // --- Automatik / System / Fehler / Verbindung ---
         $controls[] = $R('AutoCircOptimal', 'Optimale Filterzeit (Min)', 1);
-        $controls[] = $R('ProgFilterMin', 'Programmierte Filterzeit (Min)', 1);
+        $controls[] = $R('ProgFilterMin', 'Programmierte Filterzeit Woche (Min)', 1);
+        $controls[] = $R('ProgFilterToday', 'Programmierte Filterzeit heute (Min)', 1);
         $controls[] = $R('FilterRuntimeToday', 'Filterzeit heute (Min)', 1);
         $controls[] = $R('CpuTemp', 'CPU-Temperatur', 2, '~Temperature');
         $controls[] = $R('OperatingHours', 'Betriebsstunden', 2);
@@ -320,7 +321,7 @@ class PoolController extends EntityModule
     {
         static $rules = [
             ['Relais',             ['Relay']],
-            ['Regeln Filter',      ['FilterSchedule', 'ProgFilterMin', 'AutoCircOptimal', 'CircAuto', 'FilterRuntime']],
+            ['Regeln Filter',      ['FilterSchedule', 'ProgFilterMin', 'ProgFilterToday', 'AutoCircOptimal', 'CircAuto', 'FilterRuntime']],
             ['Regeln Solar-Temp',  ['TempRule']],
             ['Regeln Analog',      ['AdccR']],
             ['Regeln Digital-IO',  ['SwcR']],
@@ -587,17 +588,37 @@ class PoolController extends EntityModule
             @$this->SetValue('OperatingHours', round($cur + ($now - $lastTick) / 3600.0, 2));
         }
 
-        // Programmierte Filterzeit = Summe der Fenster der Filter-Regel (aus Wochenplan-Event).
+        // Programmierte Filterzeit: getrennt fuer die WOCHE und fuer HEUTE.
+        //
+        // Frueher gab es nur einen Wert, der ALLE Gruppen aufaddierte. Ein Plan mit einer
+        // Gruppe je Wochentag (7 x 630 Min) ergab damit 4410 Min - die Wochensumme, aber
+        // beschriftet und gelesen als Tageswert und damit unvergleichbar mit "Filterzeit
+        // heute" direkt daneben. Jetzt steht beides nebeneinander: die Woche als Budget,
+        // der heutige Tag als Vergleichsgroesse zur tatsaechlichen Laufzeit.
+        //
+        // Days ist eine Bitmaske: Mo=1, Di=2, Mi=4, Do=8, Fr=16, Sa=32, So=64;
+        // date('N') liefert 1 (Montag) bis 7 (Sonntag).
         $eidP = $this->scheduleEventId();
         if ($eidP > 0) {
-            $groupsP = $this->groupsFromEvent($eidP);
-            $sumP = 0;
+            $groupsP  = $this->groupsFromEvent($eidP);
+            $heuteBit = 1 << ((int) date('N') - 1);
+            $sumWoche = 0;
+            $sumHeute = 0;
             foreach ($groupsP as $gP) {
+                $dauer = 0;
                 foreach ($gP['windows'] as $wP) {
-                    $sumP += max(0, (int) $wP[1] - (int) $wP[0]);
+                    $dauer += max(0, (int) $wP[1] - (int) $wP[0]);
+                }
+                $tage = (int) ($gP['days'] ?? 0);
+                // Eine Gruppe gilt fuer JEDEN gesetzten Tag - fuer die Wochensumme zaehlt
+                // ihre Dauer also so oft, wie Tage gesetzt sind (Mo-Fr = fuenfmal).
+                $sumWoche += $dauer * substr_count(decbin($tage & 0x7F), '1');
+                if (($tage & $heuteBit) !== 0) {
+                    $sumHeute += $dauer;
                 }
             }
-            @$this->SetValue('ProgFilterMin', $sumP);
+            @$this->SetValue('ProgFilterMin', $sumWoche);
+            @$this->SetValue('ProgFilterToday', $sumHeute);
         }
 
         // Dosier-Sollwerte (pH/Redox) gedrosselt aus der Konfig lesen (alle 300 s).
