@@ -787,8 +787,21 @@ class PoolController extends EntityModule
      * einen Satz {days(sym), windows:[[start,end]..max4]}. KEINE Zusammenfassung mehr —
      * jede Wochentag-Gruppe wird zu einer eigenen TIMEC-Regel (S2).
      */
+    /** @var array Hinweise aus der letzten Wochenplan-Uebersetzung (Fenster-/Regel-Grenzen). */
+    private $planWarn = [];
+
+    /** Tagesmaske als Kuerzel, fuer lesbare Meldungen. */
+    private static function daysLabel(int $sym): string
+    {
+        $n = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'];
+        $o = [];
+        for ($i = 0; $i < 7; $i++) { if ($sym & (1 << $i)) { $o[] = $n[$i]; } }
+        return $o ? implode('+', $o) : '(ohne Tag)';
+    }
+
     private function groupsFromEvent(int $eid): array
     {
+        $this->planWarn = [];
         $e = @\IPS_GetEvent($eid);
         $groups = is_array($e) ? ($e['ScheduleGroups'] ?? []) : [];
         $out = [];
@@ -825,11 +838,32 @@ class PoolController extends EntityModule
                 $local[] = [$open, 1439];
             }
             if ($hasEin && $local) {
+                // Der Controller haelt je TIMEC-Regel genau 4 Fenster. Mehr wurde frueher
+                // STILL abgeschnitten: das Dashboard zeigte den Plan, der Controller fuhr
+                // ihn nie. Jetzt wird die Kuerzung vermerkt und weiter unten gemeldet.
+                if (count($local) > 4) {
+                    $this->planWarn[] = sprintf('Tagesgruppe %s: %d Fenster programmiert, der Controller kann 4 - die uebrigen %d werden nicht gefahren.',
+                        self::daysLabel((int) ($g['Days'] ?? 0)), count($local), count($local) - 4);
+                }
                 $out[] = ['days' => (int) ($g['Days'] ?? 0), 'windows' => array_slice($local, 0, 4)];
             }
         }
         // Deterministische Reihenfolge => stabiler schedHash unabhaengig von Gruppen-Sortierung.
         usort($out, static fn($a, $b) => ($a['days'] <=> $b['days']));
+
+        // Zweite Grenze: JEDE Tagesgruppe belegt eine eigene TIMEC-Regel, und davon gibt es
+        // nur so viele wie eingestellt (Eigenschaft "Anzahl Regeln"). Ein Plan mit einer
+        // Gruppe je Wochentag braucht sieben; bei vier fielen drei Wochentage lautlos weg.
+        $frei = count($this->filterRuleIndices());
+        if (count($out) > $frei) {
+            $weg = array_slice($out, $frei);
+            $this->planWarn[] = sprintf('Wochenplan hat %d Tagesgruppen, es stehen aber nur %d TIMEC-Regeln bereit - nicht gefahren werden: %s. Abhilfe: "Anzahl Regeln" erhoehen oder gleiche Tage zu einer Gruppe zusammenfassen.',
+                count($out), $frei, implode(', ', array_map(fn($g) => self::daysLabel((int) $g['days']), $weg)));
+        }
+        if ($this->planWarn) {
+            $this->LogMessage('Pool-Wochenplan: ' . implode(' | ', $this->planWarn), KL_WARNING);
+            @$this->SetValue('ErrorText', implode("\n", $this->planWarn));
+        }
         return $out;
     }
 
