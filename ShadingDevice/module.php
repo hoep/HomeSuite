@@ -127,6 +127,14 @@ class ShadingDevice extends EntityModule
                     'actionable' => false,
                 ],
                 [
+                    // Warum greift die Automatik gerade nicht? Der Grund entsteht ohnehin in
+                    // reconcile() - bisher verschwand er dort im Nichts, und im Dashboard war
+                    // nur zu sehen, DASS nichts passiert. Leer = kein Hindernis.
+                    'ident' => 'BlockReason', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:block', 'label' => 'Automatik blockiert durch',
+                    'varType' => 3, 'actionable' => false,
+                ],
+                [
                     'ident' => 'Mode', 'type' => ControlContract::T_SELECT,
                     'role' => 'shading:mode', 'label' => 'Modus',
                     'varType' => 1, 'actionable' => true,
@@ -1923,6 +1931,17 @@ class ShadingDevice extends EntityModule
      * (M7-Trockenlauf). manualHold (externer/manueller Eingriff) unterdrueckt nur
      * Komfort-Regeln; Safety (Wind/Regen) ueberfaehrt ihn hart (ScheduleEngine).
      */
+    /**
+     * Sperrgrund festhalten. Leerer Text heisst: nichts haelt die Automatik auf.
+     * Wird bei JEDEM Abgleich gesetzt, damit ein weggefallener Grund auch wieder
+     * verschwindet - ein stehengebliebener Hinweis waere schlimmer als keiner.
+     */
+    private function setBlock(string $text): void
+    {
+        $cur = (string) @$this->GetControlValue('BlockReason');
+        if ($cur !== $text) { @$this->setReflect('BlockReason', $text); }
+    }
+
     private function reconcile(IShutter $drv): void
     {
         $d = $this->computeDecision($drv, true);
@@ -1930,7 +1949,7 @@ class ShadingDevice extends EntityModule
         // Kalibrierung laeuft -> die Automatik fasst das Rollo NICHT an. Ausnahme: STURM
         // steht ueber der Kalibrierung (Sachschadenschutz) und bricht sie hart ab.
         if ($this->calLocked()) {
-            if (empty($d['storm'])) { return; }
+            if (empty($d['storm'])) { $this->setBlock('Kalibrierung läuft'); return; }
             $this->calUnlock('Sturm bricht Kalibrierung ab');
         }
         // LAUFENDE FAHRT NIEMALS ZERHACKEN: driveTo() beendet als erstes jede laufende
@@ -1941,14 +1960,19 @@ class ShadingDevice extends EntityModule
         // Waehrend einer Fahrt wird deshalb nichts nachgeregelt - nur Sturm darf abbrechen.
         $rtMove = $this->readRt();
         if (!empty($rtMove['moving']) && empty($d['storm'])) {
+            $this->setBlock('');   // faehrt gerade - kein Hindernis, nur beschaeftigt
             return;
         }
         // Globaler Automatik-Schalter (Hub) aus -> keine Komfort-Automatik; Sturm/Safety bleibt.
         if (!$this->automationEnabled() && empty($d['storm'])) {
+            $this->setBlock('Automatik am Hub aus');
             return;
         }
         $rt = $this->readRt();
         if ($target === null) {
+            // Kein Ziel heisst meist: von Hand uebersteuert. Das ist der haeufigste Grund,
+            // warum die Automatik "nichts tut", und genau der, den man sehen will.
+            $this->setBlock($this->isManuallyHeld('Position') ? 'Von Hand übersteuert' : '');
             $this->writeRt($rt); // Debounce-State ggf. schon in computeDecision persistiert
             return; // nichts erzwingen (keine aktive Regel / Hold ohne Safety)
         }
@@ -1957,12 +1981,14 @@ class ShadingDevice extends EntityModule
         $drift  = ($cur === IShutter::POS_UNKNOWN) || abs($cur - $target) > self::POS_TOLERANCE;
 
         if (!$drift) {
+            $this->setBlock('');           // steht schon richtig - kein Hindernis
             $rt['lastTarget'] = $target;
             $this->writeRt($rt);
             return;
         }
         // Tuer-Guard: Zufahren gegen offene Tuer blocken (Auffahren/Sturm bleibt erlaubt).
         if ($d['blockedByDoor']) {
+            $this->setBlock('Tür offen');
             $this->SendDebug('HSSH.guard', 'Tuer offen -> Zufahren auf ' . $target . '% blockiert', 0);
             if ($armed) { $this->logDecision((int) $cur, (int) $target, 'Tür blockiert', true, 'auto'); } // nur echte (scharfe) Ereignisse loggen
             $rt['blockedTs'] = time();
@@ -1970,6 +1996,7 @@ class ShadingDevice extends EntityModule
             return;
         }
         if ($armed) {
+            $this->setBlock('');           // es wird gefahren - Entwarnung
             // Self-Write VOR dem Schreiben markieren: auch bei SYNCHRONER VM_UPDATE-
             // Zustellung darf der eigene moveTo nicht als externer Eingriff (-> Hold)
             // missdeutet werden.
@@ -1980,6 +2007,7 @@ class ShadingDevice extends EntityModule
             $this->driveTo($drv, (int) $target);
             $this->logDecision((int) $cur, (int) $target, $this->reasonOf($d), true, 'auto');
         } else {
+            $this->setBlock('Schatten-Modus (nicht scharf)');
             // Schatten-Modus: nur protokollieren, kein Geraeteschreiben. Fuer den
             // Trockenlauf wird der geplante Fahrbefehl inkl. Telegramm-Vorschau geloggt.
             $this->SendDebug('HSSH.shadow', 'Ziel ' . $target . '% (ist ' . $cur . '%, '
