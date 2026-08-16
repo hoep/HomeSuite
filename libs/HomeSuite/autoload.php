@@ -68,6 +68,7 @@ $__hs_files = [
 
     // --- Pool-Controller (ProCon.IP) Client (selbst-enthalten, kein HAL-Interface noetig) ---
     'Drivers/Pool/PoolClient.php',     // HTTP-Client GetState.csv/GetDos.csv (P0/P1 Lesepfad)
+    'Drivers/Pool/TimecSchedule.php',  // TIMEC-Regeln <-> Wochenplan, beide Richtungen (reine Rechenlogik)
 
     // --- Audio-Treiber (generisch variablen-/skriptgebunden + native Vendor-Codecs) ---
     'Drivers/Audio/GenericBoundAudioRenderer.php',

@@ -28,6 +28,7 @@ use Hoep\HomeSuite\ActionContext;
 use Hoep\HomeSuite\Control;
 use Hoep\HomeSuite\ControlContract;
 use Hoep\HomeSuite\Drivers\Pool\PoolClient;
+use Hoep\HomeSuite\Drivers\Pool\TimecSchedule;
 use Hoep\HomeSuite\EntityModule;
 
 class PoolController extends EntityModule
@@ -768,18 +769,19 @@ class PoolController extends EntityModule
         return range($base, $base + $cnt - 1);
     }
 
-    /** Symcon-Tagesmaske (Bit0=Mo..Bit6=So) -> Controller-Maske (Bit0=So,Bit1=Mo..Bit6=Sa). */
+    /**
+     * Symcon-Tagesmaske -> Controller-Maske. Beide zaehlen GLEICH (Bit0=Mo..Bit6=So).
+     *
+     * Hier stand frueher eine Verschiebung um ein Bit ("Controller Bit0=So"), uebernommen aus
+     * PROTOCOLS.md. Die Original-Oberflaeche des Geraets belegt das Gegenteil: timectrl.htm
+     * beschriftet die Kaestchenreihe mit "Wochentage (Mo-So)" und legt Kaestchen k auf Bit k.
+     * Jeder geschriebene Plan war dadurch um einen Wochentag verschoben - unsichtbar, solange
+     * alle sieben Tage gleich programmiert sind (127). Die Umrechnung liegt jetzt an EINER
+     * Stelle, in TimecSchedule.
+     */
     private static function symconToCtrlDays(int $sym): int
     {
-        $r = 0;
-        if ($sym & 1)  { $r |= 2; }   // Mo
-        if ($sym & 2)  { $r |= 4; }   // Di
-        if ($sym & 4)  { $r |= 8; }   // Mi
-        if ($sym & 8)  { $r |= 16; }  // Do
-        if ($sym & 16) { $r |= 32; }  // Fr
-        if ($sym & 32) { $r |= 64; }  // Sa
-        if ($sym & 64) { $r |= 1; }   // So
-        return $r;
+        return TimecSchedule::symconToCtrlDays($sym);
     }
 
     /**
@@ -838,28 +840,21 @@ class PoolController extends EntityModule
                 $local[] = [$open, 1439];
             }
             if ($hasEin && $local) {
-                // Der Controller haelt je TIMEC-Regel genau 4 Fenster. Mehr wurde frueher
-                // STILL abgeschnitten: das Dashboard zeigte den Plan, der Controller fuhr
-                // ihn nie. Jetzt wird die Kuerzung vermerkt und weiter unten gemeldet.
-                if (count($local) > 4) {
-                    $this->planWarn[] = sprintf('Tagesgruppe %s: %d Fenster programmiert, der Controller kann 4 - die uebrigen %d werden nicht gefahren.',
-                        self::daysLabel((int) ($g['Days'] ?? 0)), count($local), count($local) - 4);
-                }
-                $out[] = ['days' => (int) ($g['Days'] ?? 0), 'windows' => array_slice($local, 0, 4)];
+                // Frueher wurde hier bei mehr als vier Fenstern abgeschnitten (je Regel passen
+                // nur vier). Das uebernimmt jetzt TimecSchedule, und zwar ohne Verlust: mehr
+                // Fenster bekommen eine zweite Regel mit derselben Tagesmaske.
+                $out[] = ['days' => (int) ($g['Days'] ?? 0), 'windows' => $local];
             }
         }
-        // Deterministische Reihenfolge => stabiler schedHash unabhaengig von Gruppen-Sortierung.
-        usort($out, static fn($a, $b) => ($a['days'] <=> $b['days']));
+        // Tage mit gleichem Fensterbild gehoeren in EINE Regel (die Regel traegt die Tagesmaske
+        // selbst). Symcon legt im Wochenplan-Editor pro Tag eine eigene Gruppe an; wer Mo-So
+        // gleich programmiert, hat sieben identische Gruppen. mergeIdenticalDays macht daraus
+        // eine — und sortiert zugleich deterministisch, damit der schedHash stabil bleibt.
+        $out = TimecSchedule::mergeIdenticalDays($out);
 
-        // Zweite Grenze: JEDE Tagesgruppe belegt eine eigene TIMEC-Regel, und davon gibt es
-        // nur so viele wie eingestellt (Eigenschaft "Anzahl Regeln"). Ein Plan mit einer
-        // Gruppe je Wochentag braucht sieben; bei vier fielen drei Wochentage lautlos weg.
-        $frei = count($this->filterRuleIndices());
-        if (count($out) > $frei) {
-            $weg = array_slice($out, $frei);
-            $this->planWarn[] = sprintf('Wochenplan hat %d Tagesgruppen, es stehen aber nur %d TIMEC-Regeln bereit - nicht gefahren werden: %s. Abhilfe: "Anzahl Regeln" erhoehen oder gleiche Tage zu einer Gruppe zusammenfassen.',
-                count($out), $frei, implode(', ', array_map(fn($g) => self::daysLabel((int) $g['days']), $weg)));
-        }
+        // Eine Warnung ueber zu wenige Regeln gibt es hier nicht mehr: wie viele Regeln der Plan
+        // wirklich braucht, weiss erst der Transformer beim Schreiben (nach dem Verschmelzen und
+        // gegen den Ist-Stand des Geraets). Er meldet es von dort nach $planWarn.
         if ($this->planWarn) {
             $this->LogMessage('Pool-Wochenplan: ' . implode(' | ', $this->planWarn), KL_WARNING);
             @$this->SetValue('ErrorText', implode("\n", $this->planWarn));
@@ -899,21 +894,20 @@ class PoolController extends EntityModule
         if ($client === null) {
             return ['ok' => false, 'error' => 'not_configured'];
         }
-        $slots = $this->filterRuleIndices();
-        return $this->writeGuarded('TIMEC', function () use ($client, $groups, $slots) {
+        $relay = (int) $this->cfgVal('pumpRelayIndex', 0);
+        return $this->writeGuarded('TIMEC', function () use ($client, $groups, $relay) {
             $cur = $client->getRules('TIMEC');
             if (empty($cur['ok'])) {
                 return ['ok' => false, 'error' => 'read_before_write_failed'];
             }
-            $rules = $cur['rules']; // 0..15 (RMW-Basis, Fremd-Regeln bleiben erhalten)
-            foreach ($slots as $k => $idx) {
-                $rules[$idx] = ($k < count($groups))
-                    ? $this->buildFilterRule($groups[$k])
-                    : array_fill(0, 15, 0); // Budget-Slot freigeben (ENA=0)
-            }
-            if (count($groups) > count($slots)) {
-                $this->SendDebug('HSPC.schedule',
-                    'Wochentag-Gruppen (' . count($groups) . ') > Regel-Budget (' . count($slots) . '); Rest verworfen', 0);
+            // Der Transformer entscheidet, WELCHE Regeln uns gehoeren (die auf unser Relais)
+            // und belegt sonst nur freie Plaetze. Ein festes Index-Budget gab es frueher, es
+            // haette hier eine fremde aktive Regel ueberschrieben.
+            $warn  = [];
+            $rules = TimecSchedule::groupsToRules($groups, $relay, $cur['rules'], $warn);
+            foreach ($warn as $m) {
+                $this->planWarn[] = $m;
+                $this->SendDebug('HSPC.schedule', $m, 0);
             }
             return $client->setRules('TIMEC', $rules); // setRules haengt TIMEC=1 selbst an
         });
@@ -1395,12 +1389,31 @@ class PoolController extends EntityModule
                     return ['ok' => false, 'error' => 'no_schedule_event'];
                 }
                 $groups = $this->groupsFromEvent($eid);
-                $rt = $this->readRt();
-                return ['ok' => true, 'eventId' => $eid,
-                    'ruleIndices' => $this->filterRuleIndices(),
-                    'groups' => array_map(fn($g) => [
-                        'days' => $g['days'], 'windows' => $g['windows'], 'rule' => $this->buildFilterRule($g),
-                    ], $groups),
+                $rt     = $this->readRt();
+                $relay  = (int) $this->cfgVal('pumpRelayIndex', 0);
+                // Beide Richtungen zeigen: was der Plan sagt, was das Geraet faehrt, und was
+                // geschrieben wuerde. Reines Lesen, deshalb ohne Schreib-Gate.
+                $warn = $ours = [];
+                $target = $device = null;
+                $cl = $this->client();
+                if ($cl !== null) {
+                    $cur = $cl->getRules('TIMEC');
+                    if (!empty($cur['ok'])) {
+                        $device = TimecSchedule::rulesToGroups($cur['rules'], $relay);
+                        $target = TimecSchedule::groupsToRules($groups, $relay, $cur['rules'], $warn);
+                        foreach ($cur['rules'] as $i => $r) {
+                            if ((int) ($r[0] ?? 0) === 1 && (int) ($r[1] ?? -1) === $relay) {
+                                $ours[] = $i;
+                            }
+                        }
+                    }
+                }
+                return ['ok' => true, 'eventId' => $eid, 'relay' => $relay,
+                    'groups'      => $groups,   // Plan (Symcon), bereits verschmolzen
+                    'device'      => $device,   // Geraet -> Plan (Rueckrichtung)
+                    'deviceRules' => $ours,     // Regel-Indizes, die uns gehoeren
+                    'target'      => $target,   // was geschrieben wuerde
+                    'warn'        => $warn,
                     'pending' => (md5(json_encode($groups)) !== ($rt['schedHash'] ?? '')),
                     'armed' => (bool) $this->cfgVal('armed', false)];
             case 'sendSchedule':
