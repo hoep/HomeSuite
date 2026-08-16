@@ -23,6 +23,11 @@ class RainRadar extends IPSModule
         $this->RegisterPropertyInteger('LocY', 316);
         $this->RegisterPropertyInteger('LocationID', 0); // Symcon-Location-Control (0 = automatisch), wenn Lat/Lon = 0
         // Quelle / Karte
+        // Das Modul brennt die Standortmarke (Fadenkreuz + Kreis) in die PNG. Das LVB-Widget
+        // zeichnet daneben eine eigene, die als Vektor bei jeder Kachelgroesse scharf bleibt und
+        // per Konstruktion genau auf der Kachelmitte sitzt - zwei Marken an derselben Stelle.
+        // Voreinstellung daher AUS; wer die Bilder ausserhalb des Widgets nutzt, schaltet sie ein.
+        $this->RegisterPropertyBoolean('DrawMarkers', false);
         $this->RegisterPropertyString('BaseMap', '/usr/share/symcon/tile/kremsmuenster/austria.png');
         $this->RegisterPropertyString('RadarUrl', 'https://portale.geosphere.at/hpAT/index.php?pu=default&op=getNoCacheImg&a=INCAL_VW1398&p=HP_RR_AT&i=');
         $this->RegisterPropertyString('OutputDir', '/usr/share/symcon/tile/rainradar');
@@ -87,7 +92,7 @@ class RainRadar extends IPSModule
             . "  'radarBaseUrl'   => IPS_GetProperty(\$IID, 'RadarUrl'),\n"
             . "  'hours'          => IPS_GetProperty(\$IID, 'Hours'),\n"
             . "  'coordinates'    => [\$coord],\n"
-            . "  'drawMarkers'    => true, 'markerColor' => [255,0,0], 'markerSize' => 10,\n"
+            . "  'drawMarkers'    => (bool) IPS_GetProperty(\$IID, 'DrawMarkers'), 'markerColor' => [255,0,0], 'markerSize' => 10,\n"
             . "  'showDateTime'   => true, 'dateFormat' => 'd.m.y-H:i',\n"
             . "  'createAnimation'=> true, 'animationDelay' => IPS_GetProperty(\$IID, 'AnimDelay'),\n"
             . "  'cropEnabled'    => false, 'legendEnabled' => false, 'showForecastText' => false,\n"
@@ -132,6 +137,8 @@ class RainRadar extends IPSModule
                 ['type' => 'ValidationTextBox', 'name' => 'OutputDir', 'caption' => 'Ausgabe-Ordner'],
                 ['type' => 'RowLayout', 'items' => [
                     ['type' => 'NumberSpinner', 'name' => 'Hours', 'caption' => 'Stunden'],
+                    ['type' => 'CheckBox', 'name' => 'DrawMarkers', 'caption' => 'Standortmarke ins Bild zeichnen (Fadenkreuz)'],
+                    ['type' => 'Label', 'caption' => 'Aus lassen, solange die Karte im LiveViewBuilder gezeigt wird: das Widget zeichnet dort eine eigene, bei jeder Kachelgroesse scharfe Marke. Beides zusammen ergibt zwei Marken an derselben Stelle.'],
                     ['type' => 'NumberSpinner', 'name' => 'AnimDelay', 'caption' => 'GIF-Delay (ms)'],
                     ['type' => 'NumberSpinner', 'name' => 'Threshold', 'caption' => 'Schwelle (mm/h)', 'digits' => 2],
                     ['type' => 'NumberSpinner', 'name' => 'Interval', 'caption' => 'Takt (min)'],
