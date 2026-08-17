@@ -117,6 +117,9 @@ class HomeSuiteHub extends EntityModule
         // Beschattung — Sensoren + Sicherheit
         $this->RegisterPropertyInteger('ShadeWindId', 0);
         $this->RegisterPropertyInteger('ShadeRainId', 0);
+        // Aussentemperatur ist EINE Groesse fuers ganze Haus (ein Fuehler), deshalb hier
+        // und nicht je Rollo. Die INNEN-Fuehler bleiben an der jeweiligen Zone.
+        $this->RegisterPropertyInteger('ShadeTempOutId', 0);
         $this->RegisterPropertyInteger('ShadeBrightId', 0);
         $this->RegisterPropertyInteger('ShadeSunAzId', 0);
         $this->RegisterPropertyInteger('ShadeSunElId', 0);
@@ -295,7 +298,8 @@ class HomeSuiteHub extends EntityModule
             ['type' => 'RowLayout', 'items' => [
                 ['type' => 'SelectVariable', 'name' => 'ShadeWindId', 'caption' => 'Wind (km/h)'],
                 ['type' => 'SelectVariable', 'name' => 'ShadeRainId', 'caption' => 'Regen'],
-                ['type' => 'SelectVariable', 'name' => 'ShadeBrightId', 'caption' => 'Helligkeit'],
+                ['type' => 'SelectVariable', 'name' => 'ShadeTempOutId', 'caption' => 'Aussentemperatur (haus-weit)'],
+                ['type' => 'SelectVariable', 'name' => 'ShadeBrightId', 'caption' => 'Helligkeit / Globalstrahlung (Schwellen stehen im Sonnenprofil)'],
             ]],
             ['type' => 'RowLayout', 'items' => [
                 ['type' => 'SelectVariable', 'name' => 'ShadeSunAzId', 'caption' => 'Sonne Azimut'],
@@ -678,7 +682,8 @@ class HomeSuiteHub extends EntityModule
         $add('bl_LocationId', 'Standort', $this->ReadPropertyInteger('LocationId'));
         $add('bl_ShadeWindId', 'Wind (global)', $this->ReadPropertyInteger('ShadeWindId'));
         $add('bl_ShadeRainId', 'Regen (global)', $this->ReadPropertyInteger('ShadeRainId'));
-        $add('bl_ShadeBrightId', 'Helligkeit (global)', $this->ReadPropertyInteger('ShadeBrightId'));
+        $add('bl_ShadeTempOutId', 'Aussentemperatur (global)', $this->ReadPropertyInteger('ShadeTempOutId'));
+        $add('bl_ShadeBrightId', 'Helligkeit/Globalstrahlung (global)', $this->ReadPropertyInteger('ShadeBrightId'));
         $add('bl_ShadeSunAzId', 'Sonne Azimut', $this->ReadPropertyInteger('ShadeSunAzId'));
         $add('bl_ShadeSunElId', 'Sonne Elevation', $this->ReadPropertyInteger('ShadeSunElId'));
         $add('bl_IrrRainSensorId', 'Regensensor (global)', $this->ReadPropertyInteger('IrrRainSensorId'));
@@ -1609,8 +1614,16 @@ class HomeSuiteHub extends EntityModule
             case 'profileAssign':
                 $eid = (int) ($args['entityId'] ?? 0);
                 if ($eid <= 0) { throw new \Hoep\HomeSuite\ContractException('entityId fehlt'); }
-                if ($name === '') { $this->store()->set('assign.' . $eid . '.' . $type, ''); }
-                else { $pe->assign($eid, $type, $name); }
+                if ($name === '') {
+                    $this->store()->set('assign.' . $eid . '.' . $type, '');
+                    // Abwahl MUSS als ausdrueckliche Loeschung bei der Zone ankommen, sonst
+                    // blieben die alten Werte stehen und das Rollo folgte weiter einem Profil,
+                    // das gar nicht mehr zugewiesen ist. Nur HIER loeschen, nicht in pushZone.
+                    $clr = \Hoep\HomeSuite\ShadingProfiles::clearConfig($type);
+                    if ($clr !== [] && function_exists('HSSH_Manage')) {
+                        @\HSSH_Manage($eid, json_encode(['op' => 'configureAutomation', 'args' => $clr]));
+                    }
+                } else { $pe->assign($eid, $type, $name); }
                 $this->pushZone($eid);
                 return ['ok' => true, 'entityId' => $eid, 'type' => $type, 'name' => $name];
             case 'profileAssigned':
@@ -1628,6 +1641,12 @@ class HomeSuiteHub extends EntityModule
         $pe = $this->profileEngine(); $cfg = [];
         foreach (\Hoep\HomeSuite\ShadingProfiles::typeIds() as $t) {
             $nm = $pe->assignedName($eid, $t);
+            // NICHT zugewiesen = "dieser Push sagt nichts dazu" - und NICHT "loeschen".
+            // Die Zone kann denselben Wert auf anderem Weg haben: die Temperatur-Schwellen
+            // etwa stammen bei den meisten Rollos aus der IPSShadowing-Migration und haengen
+            // ohne Profil direkt an der Zone. Wer hier pauschal loescht, raeumt sie bei jedem
+            // beliebigen Profil-Push mit ab. Geloescht wird ausschliesslich im Moment der
+            // ausdruecklichen Abwahl - siehe case 'profileAssign'.
             if ($nm === null || $nm === '') { continue; }
             try { $f = $pe->get($t, $nm); } catch (\Throwable $e) { continue; }
             $cfg = array_merge($cfg, \Hoep\HomeSuite\ShadingProfiles::mapToConfig($t, $f));

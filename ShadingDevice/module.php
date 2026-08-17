@@ -226,7 +226,6 @@ class ShadingDevice extends EntityModule
                 ['op' => 'duplicateProfile', 'label' => 'Plan duplizieren'],
                 ['op' => 'assignProfile',    'label' => 'Plan zuweisen'],
                 ['op' => 'setActivePlan',    'label' => 'Plan setzen'],
-                ['op' => 'importLegacy',       'label' => 'Aus IPSShadowing importieren'],
                 ['op' => 'configureAutomation', 'label' => 'Sonne/Sicherheit konfigurieren'],
                 ['op' => 'setArmed',           'label' => 'Scharfschalten / Schatten-Modus'],
                 ['op' => 'migrateConfig',      'label' => 'Config auf Properties migrieren (einmalig)'],
@@ -253,8 +252,7 @@ class ShadingDevice extends EntityModule
                  'options' => [
                      ['value' => 'generic-shutter', 'label' => 'Generisch (Positions-Variable)'],
                  ]],
-                ['key' => 'positionId',  'type' => 'objid', 'label' => 'Positions-Variable (IPSShadowing)', 'required' => false],
-                ['key' => 'automaticId', 'type' => 'objid', 'label' => 'Automatik-Bool (Cutover/Rollback)', 'required' => false],
+                ['key' => 'positionId',  'type' => 'objid', 'label' => 'Positions-Variable (generisch/Homematic)', 'required' => false],
             ],
 
             'capabilities' => [
@@ -293,6 +291,8 @@ class ShadingDevice extends EntityModule
         // steuert Beschriftung/Darstellung im Frontend (Ein/Aus + Ausfahrgrad statt Auf/Zu).
         $this->RegisterPropertyString('DeviceKind', 'shutter');
         $this->RegisterPropertyInteger('PositionId', 0);
+        // ALTLAST: nur noch REGISTRIERT, nirgends benutzt - bestehende Instanzen fuehren
+        // sie in ihrer Konfiguration; ohne Registrierung meldet die Konsole einen Ladefehler.
         $this->RegisterPropertyInteger('AutomaticId', 0);
         $this->RegisterPropertyInteger('SocketId', 0);
         $this->RegisterPropertyInteger('Channel', 0);
@@ -311,6 +311,16 @@ class ShadingDevice extends EntityModule
         $this->RegisterPropertyFloat('Lat', 0.0);
         $this->RegisterPropertyFloat('Lon', 0.0);
         $this->RegisterPropertyBoolean('Armed', false);   // Schatten-Modus bis Cutover
+        // --- Automatik-Bindungen als ECHTE Properties (frueher nur Store + Extra-Button).
+        //     Grund: Formularfelder, die keine Property sind, speichert das normale
+        //     „Uebernehmen" NICHT - der Nutzer stellte etwas ein, sah Erfolg und danach
+        //     wieder leere Felder. Jetzt traegt jedes Feld seinen echten Property-Namen. ---
+        $this->RegisterPropertyString('Doors', '[]');   // Aussperr-Schutz: [{"varId":123}, …]
+        $this->RegisterPropertyInteger('EnvSunAzId', 0); // 0 = Hub-/Standardwert benutzen
+        $this->RegisterPropertyInteger('EnvSunElId', 0);
+        $this->RegisterPropertyInteger('EnvWindId', 0);
+        $this->RegisterPropertyInteger('EnvRainId', 0);
+        $this->RegisterPropertyInteger('EnvBrightId', 0);
         $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
         $this->RegisterPropertyInteger('QueryInterval', 30); // Abfrage-Intervall in SEKUNDEN (Default = REFRESH_MS/1000)
     }
@@ -328,7 +338,6 @@ class ShadingDevice extends EntityModule
             'invert'       => $this->ReadPropertyBoolean('Invert'),
             'deviceKind'   => $this->ReadPropertyString('DeviceKind'),
             'positionId'   => $this->ReadPropertyInteger('PositionId'),
-            'automaticId'  => $this->ReadPropertyInteger('AutomaticId'),
             'socketId'     => $this->ReadPropertyInteger('SocketId'),
             'channel'      => $this->ReadPropertyInteger('Channel'),
             'repeat'       => $this->ReadPropertyInteger('Repeat'),
@@ -362,13 +371,52 @@ class ShadingDevice extends EntityModule
         // ist deshalb entfernt: massgeblich ist allein die Instanz-Property RainClose
         // (oben in $props, gewinnt ueber array_merge). Wind/Sturm bleibt bewusst haus-weit,
         // weil er die Mechanik schuetzt und nicht dem Komfort dient.
+        // Sensor-Rangfolge: EIGENE Instanz-Property > Hub (haus-weit) > Store (Altbestand) >
+        // Konstante. Frueher gewann der Hub bedingungslos - deshalb liess sich z. B. die
+        // Helligkeits-/Strahlungsquelle je Rollo einstellen, sprang aber sofort wieder auf
+        // den Hub-Wert zurueck ("wird nicht uebernommen"). 0 = nichts eigenes gesetzt.
         $env = is_array($merged['env'] ?? null) ? $merged['env'] : [];
-        foreach (['sunAzId'=>'ShadeSunAzId','sunElId'=>'ShadeSunElId','windId'=>'ShadeWindId','rainId'=>'ShadeRainId','brightId'=>'ShadeBrightId'] as $k => $hp) {
-            $g = (int) $this->hubProp($hp, 0);
-            if ($g > 0) { $env[$k] = $g; } // Hub-Sensor gewinnt
+        $sensors = [
+            'sunAzId'  => ['ShadeSunAzId',  'EnvSunAzId'],
+            'sunElId'  => ['ShadeSunElId',  'EnvSunElId'],
+            'windId'   => ['ShadeWindId',   'EnvWindId'],
+            'rainId'   => ['ShadeRainId',   'EnvRainId'],
+            'brightId' => ['ShadeBrightId', 'EnvBrightId'],
+        ];
+        foreach ($sensors as $k => [$hubProp, $ownProp]) {
+            $g = (int) $this->hubProp($hubProp, 0);
+            if ($g > 0) { $env[$k] = $g; }
+            $own = (int) $this->ReadPropertyInteger($ownProp);
+            if ($own > 0) { $env[$k] = $own; } // eigene Wahl schlaegt den Hub-Standard
         }
         $merged['env'] = $env;
+
+        // AUSSEN-Temperaturfuehler ist EINER fuers ganze Haus -> Hub-Vorgabe gewinnt, wenn
+        // gesetzt. Der INNEN-Fuehler bleibt je Rollo (jeder Raum hat einen eigenen).
+        $hto = (int) $this->hubProp('ShadeTempOutId', 0);
+        if ($hto > 0 && is_array($merged['tempGate'] ?? null)) {
+            $merged['tempGate']['outSensorId'] = $hto;
+        }
+
+        // Aussperr-Schutz: ab Schema 2 ist die Property die Wahrheit - auch LEER, sonst
+        // liesse sich der letzte Kontakt nie wieder loeschen (Store-Rueckfall).
+        if ((int) $this->ReadPropertyInteger('ConfigSchema') >= 2) {
+            $merged['doorIds'] = $this->doorsFromProperty();
+        }
         return $merged;
+    }
+
+    /** Tuerkontakt-Liste (Property „Doors") -> flache Variablen-ID-Liste. */
+    private function doorsFromProperty(): array
+    {
+        $rows = json_decode((string) $this->ReadPropertyString('Doors'), true);
+        if (!is_array($rows)) { return []; }
+        $ids = [];
+        foreach ($rows as $r) {
+            $id = (int) (is_array($r) ? ($r['varId'] ?? 0) : $r);
+            if ($id > 0 && !in_array($id, $ids, true)) { $ids[] = $id; }
+        }
+        return $ids;
     }
 
     private function armed(): bool
@@ -391,7 +439,7 @@ class ShadingDevice extends EntityModule
     /** Map flache Config-Keys -> [PropertyName, Typ]. */
     private const PROP_MAP = [
         'driver'=>['Driver','s'], 'invert'=>['Invert','b'], 'deviceKind'=>['DeviceKind','s'], 'positionId'=>['PositionId','i'],
-        'automaticId'=>['AutomaticId','i'], 'socketId'=>['SocketId','i'], 'channel'=>['Channel','i'],
+        'socketId'=>['SocketId','i'], 'channel'=>['Channel','i'],
         'repeat'=>['Repeat','i'], 'stopRepeat'=>['StopRepeat','i'], 'gapMs'=>['GapMs','i'],
         'timeOpening'=>['TimeOpening','i'], 'timeClosing'=>['TimeClosing','i'], 'instanceId'=>['InstanceId','i'],
         'levelVarId'=>['LevelVarId','i'], 'windStormKmh'=>['WindStormKmh','f'], 'safePos'=>['SafePos','i'],
@@ -425,6 +473,34 @@ class ShadingDevice extends EntityModule
         if ($apply) {
             @\IPS_ApplyChanges($this->InstanceID);
         }
+    }
+
+    /**
+     * Einmal-Migration Schema 1 -> 2: Tuerkontakte und Sensor-Bindungen aus dem Store in
+     * echte Properties heben. Bewusst OHNE IPS_ApplyChanges (kein Rekursions-Risiko aus
+     * ApplyChanges heraus) - bis zum naechsten Uebernehmen gilt weiter der Store, danach
+     * die Property. Beide Wege liefern dieselben Werte, der Uebergang ist also unsichtbar.
+     */
+    private function migrateAutomationProps(): void
+    {
+        if ((int) $this->ReadPropertyInteger('ConfigSchema') >= 2) {
+            return;
+        }
+        $store = $this->store()->get('config', []);
+        $store = is_array($store) ? $store : [];
+
+        $doors = array_values(array_filter(array_map('intval', (array) ($store['doorIds'] ?? []))));
+        if ($doors !== []) {
+            @\IPS_SetProperty($this->InstanceID, 'Doors', json_encode(array_map(
+                static function ($id) { return ['varId' => (int) $id]; }, $doors)));
+        }
+        $env = is_array($store['env'] ?? null) ? $store['env'] : [];
+        foreach (['sunAzId'=>'EnvSunAzId','sunElId'=>'EnvSunElId','windId'=>'EnvWindId',
+                  'rainId'=>'EnvRainId','brightId'=>'EnvBrightId'] as $k => $p) {
+            $v = (int) ($env[$k] ?? 0);
+            if ($v > 0) { @\IPS_SetProperty($this->InstanceID, $p, $v); }
+        }
+        @\IPS_SetProperty($this->InstanceID, 'ConfigSchema', 2);
     }
 
     /** Einmal-Migration: flache FabricStore-config -> native Properties (per RPC-Op). */
@@ -462,7 +538,6 @@ class ShadingDevice extends EntityModule
         if ($driver === 'generic-shutter') { $add('bl_Position', 'Position', (int) $cfg['positionId']); }
         elseif ($driver === 'somfy-rts')   { $add('bl_Socket', 'Somfy-Socket', (int) $cfg['socketId']); }
         elseif ($driver === 'hm-shutter')  { $add('bl_Device', 'HM-Gerät', (int) $cfg['instanceId']); $add('bl_Level', 'Level', (int) $cfg['levelVarId']); }
-        $add('bl_Automatic', 'IPSShadowing-Automatik', (int) $cfg['automaticId']);
         $env = is_array($cfg['env'] ?? null) ? $cfg['env'] : [];
         $envLabels = ['sunAzId'=>'Sonnen-Azimut','sunElId'=>'Sonnen-Elevation','windId'=>'Wind','rainId'=>'Regen','brightId'=>'Helligkeit'];
         foreach ($envLabels as $k => $lab) { $add('bl_env_' . $k, $lab, (int) ($env[$k] ?? 0)); }
@@ -728,8 +803,6 @@ class ShadingDevice extends EntityModule
                 return $this->mgmtGetSchedule($args);
             case 'setActivePlan':
                 return $this->mgmtSetActivePlan($args);
-            case 'importLegacy':
-                return $this->mgmtImportLegacy($args, $ctx);
             case 'command':
                 return $this->mgmtCommand($args);
             case 'driverProbe':
@@ -775,18 +848,13 @@ class ShadingDevice extends EntityModule
 
         if ($driver === 'generic-shutter') {
             $positionId  = (int) ($args['positionId'] ?? 0);
-            $automaticId = (int) ($args['automaticId'] ?? 0);
             if ($positionId > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($positionId)) {
                 throw new ContractException('positionId #' . $positionId . ' ist keine Variable');
-            }
-            if ($automaticId > 0 && function_exists('IPS_VariableExists') && !\IPS_VariableExists($automaticId)) {
-                throw new ContractException('automaticId #' . $automaticId . ' ist keine Variable');
             }
             if ($positionId <= 0) {
                 throw new ContractException('generic-shutter braucht eine Positions-Variable (positionId)');
             }
             $config['positionId']  = $positionId;
-            $config['automaticId'] = $automaticId;
         } elseif ($driver === 'somfy-rts') {
             // Roh-Aktor Somfy RTS: Client-Socket-Instanz + Kanal 1..16 + Fahrzeiten
             // (kein Feedback -> Position wird zeitbasiert geschaetzt).
@@ -853,8 +921,8 @@ class ShadingDevice extends EntityModule
         //  - generic-shutter: Positions-Variable
         //  - somfy-rts: Client-Socket (NICHT die alte IPSShadowing-Position-Variable,
         //    sonst bliebe IPSShadowing faelschlich unloeschbar)
-        // automaticId immer (Cutover/Rollback-Helfer), env/doors immer (Safety/Sonne).
-        $keys = ['automaticId'];
+        // env/doors immer (Safety/Sonne).
+        $keys = [];
         if ($driver === 'generic-shutter') {
             $keys[] = 'positionId';
         }
@@ -947,7 +1015,23 @@ class ShadingDevice extends EntityModule
         }
         // Wetter-/Temp-/Tag-Profil-Felder (vom Hub gepusht):
         if (array_key_exists('rainClose', $args)) { $patch['rainClose'] = (bool) $args['rainClose']; }
-        if (array_key_exists('tempGate', $args))  { $patch['tempGate']  = is_array($args['tempGate']) ? $args['tempGate'] : null; }
+        if (array_key_exists('tempGate', $args)) {
+            // MISCHEN statt ersetzen: die Temperatur-FUEHLER (sensorId/outSensorId) gehoeren
+            // zum Rollo - jeder Raum hat seinen eigenen -, die SCHWELLEN kommen aus dem
+            // geteilten Profil. Ein Profil-Push traegt keine Sensor-IDs; wuerde er den
+            // tempGate komplett ersetzen, stuenden die Fuehler danach auf 0 und das Gate
+            // waere still wirkungslos (genau so verlor Buero seinen Innenfuehler).
+            if (!is_array($args['tempGate'])) {
+                $patch['tempGate'] = null;                       // ausdrueckliche Abwahl
+            } else {
+                // Ueberlagern: was der Aufrufer NICHT nennt, bleibt stehen. So kann das
+                // Profil nur Schwellen schicken und das Rollo-Widget nur Fuehler, ohne
+                // sich gegenseitig zu ueberschreiben.
+                $old = $this->cfgVal('tempGate', null);
+                $old = is_array($old) ? $old : [];
+                $patch['tempGate'] = array_merge($old, $args['tempGate']);
+            }
+        }
         if (array_key_exists('dayBegin', $args))  { $patch['dayBegin']  = is_array($args['dayBegin']) ? $args['dayBegin'] : null; }
         if (array_key_exists('dayEnd', $args))    { $patch['dayEnd']    = is_array($args['dayEnd']) ? $args['dayEnd'] : null; }
         if (array_key_exists('doorIds', $args)) {
@@ -968,6 +1052,11 @@ class ShadingDevice extends EntityModule
             $this->applyConfigProperties($patch, true); // ApplyChanges re-registriert Watches
             // Sonnenprofil-Edit -> Baum-Variablen (Wahrheit) nachziehen.
             if (isset($patch['geoProfile']) && is_array($patch['geoProfile'])) { $this->seedGeoVars($patch['geoProfile']); }
+            // Abwahl (geoProfile = null): die Baum-Variablen sind die Wahrheit fuer
+            // geoProfile() - sie MUESSEN mit genullt werden. Sonst bliebe das alte
+            // Sonnenfenster stehen und das Rollo verschattete weiter nach einem
+            // Profil, das gar nicht mehr zugewiesen ist.
+            if (array_key_exists('geoProfile', $patch) && $patch['geoProfile'] === null) { $this->clearGeoVars(); }
         }
         return ['ok' => true, 'config' => $patch];
     }
@@ -1077,55 +1166,6 @@ class ShadingDevice extends EntityModule
         return ['ok' => true, 'ident' => $ident, 'value' => $args['value'] ?? 0];
     }
 
-    /**
-     * Adoption EINES IPSShadowing-Geraetes (nicht-destruktiv, wie HeatingZone.ImportLegacy):
-     * bindet den Treiber an dessen Position-Variable, uebernimmt Automatic-VID und
-     * (best effort) das Sonnenprofil als 'zu verifizieren'. Kein Geraeteschreiben,
-     * armed bleibt false (Schatten). dryrun liefert nur die geplante Zuordnung.
-     * args: { deviceId } = IPSShadowing-Geraetecontainer (ident Position/Automatic/ProfileSun).
-     */
-    private function mgmtImportLegacy(array $args, array $ctx): array
-    {
-        $dev = (int) ($args['deviceId'] ?? 0);
-        if ($dev <= 0 || !@\IPS_ObjectExists($dev)) {
-            throw new ContractException('deviceId (IPSShadowing-Geraetecontainer) fehlt/ungueltig');
-        }
-        // Klartextname bevorzugt aus args (IPSShadowing-Container heisst intern
-        // 'DeviceN'; der Klartext liegt in der NAMES-Map des Migrationsskripts).
-        $name    = (string) ($args['name'] ?? '');
-        if ($name === '') { $name = (string) @\IPS_GetName($dev); }
-        $posVid  = (int) (@\IPS_GetObjectIDByIdent('Position', $dev) ?: 0);
-        $autoVid = (int) (@\IPS_GetObjectIDByIdent('Automatic', $dev) ?: 0);
-        if ($posVid <= 0) {
-            throw new ContractException('Geraet #' . $dev . ' hat keine Position-Variable');
-        }
-        // Sonnenprofil aus IPSShadowing ProfileSun (Selektor -> Profil-Kategorie).
-        $geo   = null;
-        $psSel = @\IPS_GetObjectIDByIdent('ProfileSun', $dev);
-        if ($psSel) {
-            $pid = (int) @GetValue($psSel);
-            if ($pid > 0 && @\IPS_ObjectExists($pid)) {
-                $rd  = function ($id) use ($pid) { $v = @\IPS_GetObjectIDByIdent($id, $pid); return $v ? (int) GetValue($v) : null; };
-                $bgn = $rd('AzimuthBgn'); $end = $rd('AzimuthEnd'); $el = $rd('Elevation');
-                if ($bgn !== null || $end !== null || $el !== null) {
-                    $geo = ['azimuthBgn' => (int) $bgn, 'azimuthEnd' => (int) $end, 'elevation' => (int) $el, 'closePct' => 100, 'unverified' => true];
-                }
-            }
-        }
-        $config  = ['driver' => 'generic-shutter', 'positionId' => $posVid, 'automaticId' => $autoVid, 'armed' => false];
-        $summary = ['deviceId' => $dev, 'name' => $name, 'positionId' => $posVid, 'automaticId' => $autoVid, 'geoProfile' => $geo];
-
-        if (!empty($ctx['dryrun'])) {
-            return ['ok' => true, 'dryrun' => true] + $summary;
-        }
-        $applyCfg = $config;
-        if ($geo !== null) { $applyCfg['geoProfile'] = $geo; }
-        $this->applyConfigProperties($applyCfg, true); // flach->Properties, geoProfile->Store, ApplyChanges
-        if ($name !== '') {
-            @\IPS_SetName($this->InstanceID, 'Beschattung ' . $name);
-        }
-        return ['ok' => true, 'adopted' => true, 'driverActive' => $this->driver() instanceof IShutter] + $summary;
-    }
 
     /**
      * Scharfschalten (armed=true -> reconcile faehrt wirklich) bzw. zurueck in den
@@ -1170,6 +1210,19 @@ class ShadingDevice extends EntityModule
         // per-Rollo-Override nicht bei jeder Profilzuweisung ueberschrieben wird.
         if (@$this->GetIDForIdent('SunClose') && (int) @$this->GetValue('SunClose') <= 0) {
             @$this->SetValue('SunClose', (int) ($gp['closePct'] ?? 100));
+        }
+    }
+
+    /**
+     * Sonnenprofil der Zone loeschen: Baum-Variablen auf 0. geoProfile() liefert danach
+     * null (alle drei Winkel 0 UND kein Store-Profil), computeDecision laesst die
+     * Sonnenregel damit komplett weg - das Rollo folgt nur noch Zeitplan und Sicherheit.
+     * SunClose bleibt stehen: das ist der Schliessgrad-Wunsch des Rollos, kein Profilwert.
+     */
+    private function clearGeoVars(): void
+    {
+        foreach (['SunAzBgn', 'SunAzEnd', 'SunElev'] as $i) {
+            if (@$this->GetIDForIdent($i)) { @$this->SetValue($i, 0); }
         }
     }
 
@@ -1248,6 +1301,7 @@ class ShadingDevice extends EntityModule
         parent::ApplyChanges();
         $this->driverResolved = false;
         $this->driverInstance = null;
+        $this->migrateAutomationProps(); // Store -> Properties (Tuerkontakte/Sensoren), einmalig
 
         $drv    = $this->driver();
         $active = $drv instanceof IShutter;
@@ -1342,112 +1396,127 @@ class ShadingDevice extends EntityModule
         $status   = 'Treiber: ' . ($active ? 'aktiv' : 'inaktiv')
             . ' · scharf: ' . ($armed ? 'JA (faehrt real)' : 'nein (Schatten-Modus)')
             . ' · Position: ' . ($estKnown ? ((int) ($rt['estPos'] ?? 0) . '% (geschaetzt)') : 'unbekannt (Referenzfahrt noetig)');
-        return json_encode(['elements' => [
+        $drvSel  = (string) ($cfg['driver'] ?? '');
+        $geoNow  = $this->geoProfile();
+        $geoNow  = is_array($geoNow) ? $geoNow : [];
+        $brightNow = ($envBright > 0 && @\IPS_VariableExists($envBright)) ? @GetValue($envBright) : null;
+        $brightNow = is_numeric($brightNow) ? (float) $brightNow : null;
+        $eff    = static function (int $own, int $effective) {
+            return $own > 0 ? '' : ' — aktuell #' . $effective . ' (Haus-Vorgabe)';
+        };
+        // WICHTIG: jedes Feld traegt seinen ECHTEN Property-Namen. Frueher hiessen sie
+        // cfgDriver/cfgDoors/cfgEnv… und wurden nur ueber Extra-Buttons gespeichert -
+        // das normale "Uebernehmen" verwarf sie kommentarlos, das Formular kam leer
+        // zurueck. Jetzt speichert "Uebernehmen" alles, die Extra-Buttons entfallen.
+        $el = [
             ['type' => 'Label', 'caption' => 'Beschattung — Geraete-Bindung. Sicherheits-Schwellen, Sonnen- und '
                 . 'Wetterprofile kommen aus den geteilten Profilen (LiveViewBuilder), nicht hier.'],
             ['type' => 'NumberSpinner', 'name' => 'QueryInterval', 'caption' => 'Abfrage-Intervall (s)'],
-            ['type' => 'Select', 'name' => 'cfgDriver', 'caption' => 'Treiber',
-                'value' => (string) ($cfg['driver'] ?? 'generic-shutter'), 'options' => [
-                    ['caption' => '(keiner / Schatten-Modus)', 'value' => ''],
-                    ['caption' => 'Absolutposition 0..100 (generisch / Homematic-LEVEL)', 'value' => 'generic-shutter'],
-                    ['caption' => 'Somfy RTS (Bus-Rollo: auf/ab/stop + Fahrzeiten)', 'value' => 'somfy-rts'],
-                    ['caption' => 'Homematic-Rollo/Markise (LEVEL, absolut)', 'value' => 'hm-shutter'],
-                ]],
-            ['type' => 'Label', 'caption' => '— Absolutposition (generisch / Homematic-LEVEL) —'],
-            ['type' => 'SelectVariable', 'name' => 'cfgPositionId', 'caption' => 'Positions-Variable (Ziel & Rueckmeldung)',
-                'value' => (int) ($cfg['positionId'] ?? 0)],
-            ['type' => 'SelectVariable', 'name' => 'cfgAutomaticId', 'caption' => 'IPSShadowing-Automatik-Variable (optional, fuer Cutover/Rollback)',
-                'value' => (int) ($cfg['automaticId'] ?? 0)],
-            ['type' => 'Label', 'caption' => '— Somfy RTS (Bus-Rollo ohne Positions-Rueckmeldung) —'],
-            ['type' => 'SelectInstance', 'name' => 'cfgSocketId', 'caption' => 'Client-Socket (RTS-Gateway)',
-                'value' => (int) ($cfg['socketId'] ?? 45711)],
-            ['type' => 'NumberSpinner', 'name' => 'cfgChannel', 'caption' => 'RTS-Kanal (1..16)',
-                'value' => (int) ($cfg['channel'] ?? 0), 'minimum' => 0, 'maximum' => 16],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'NumberSpinner', 'name' => 'cfgTimeClosing', 'caption' => 'Fahrzeit ZU (0->100) in s',
-                    'value' => (int) ($cfg['timeClosing'] ?? 0), 'minimum' => 0, 'maximum' => 300],
-                ['type' => 'NumberSpinner', 'name' => 'cfgTimeOpening', 'caption' => 'Fahrzeit AUF (100->0) in s',
-                    'value' => (int) ($cfg['timeOpening'] ?? 0), 'minimum' => 0, 'maximum' => 300],
-                ['type' => 'NumberSpinner', 'name' => 'cfgRepeat', 'caption' => 'Sende-Wiederholungen',
-                    'value' => (int) ($cfg['repeat'] ?? 3), 'minimum' => 1, 'maximum' => 8],
+            ['type' => 'Select', 'name' => 'Driver', 'caption' => 'Treiber', 'options' => [
+                ['caption' => '(keiner / Schatten-Modus)', 'value' => ''],
+                ['caption' => 'Absolutposition 0..100 (generisch)', 'value' => 'generic-shutter'],
+                ['caption' => 'Somfy RTS (Bus-Rollo: auf/ab/stop + Fahrzeiten)', 'value' => 'somfy-rts'],
+                ['caption' => 'Homematic-Rollo/Markise (LEVEL, absolut)', 'value' => 'hm-shutter'],
             ]],
-            ['type' => 'Label', 'caption' => '— Homematic-Rollo/Markise (LEVEL-Datenpunkt, absolut) —'],
-            ['type' => 'SelectInstance', 'name' => 'cfgHmInstance', 'caption' => 'Homematic-Instanz (LEVEL/STOP)',
-                'value' => (int) ($cfg['instanceId'] ?? 0)],
-            ['type' => 'Select', 'name' => 'cfgKind', 'caption' => 'Art des Beschattungselements',
+        ];
+        // Nur die Felder des GEWAEHLTEN Treibers zeigen. Vorher standen alle drei Bloecke
+        // untereinander - ein Somfy-Rollo bemaengelte dann eine fehlende Absolutpositions-
+        // Variable, die es bauartbedingt gar nicht haben kann.
+        if ($drvSel === 'generic-shutter') {
+            $el[] = ['type' => 'Label', 'caption' => '— Absolutposition (generisch) —'];
+            $el[] = ['type' => 'SelectVariable', 'name' => 'PositionId',
+                'caption' => 'Positions-Variable (0..100, mit Rueckmeldung)'];
+        } elseif ($drvSel === 'somfy-rts') {
+            $el[] = ['type' => 'Label', 'caption' => '— Somfy RTS (Bus-Rollo ohne Positions-Rueckmeldung) —'];
+            $el[] = ['type' => 'SelectInstance', 'name' => 'SocketId', 'caption' => 'Client-Socket (RTS-Gateway)'];
+            $el[] = ['type' => 'NumberSpinner', 'name' => 'Channel', 'caption' => 'RTS-Kanal (1..16)',
+                'minimum' => 0, 'maximum' => 16];
+            $el[] = ['type' => 'RowLayout', 'items' => [
+                ['type' => 'NumberSpinner', 'name' => 'TimeClosing', 'caption' => 'Fahrzeit ZU (0->100) in s',
+                    'minimum' => 0, 'maximum' => 300],
+                ['type' => 'NumberSpinner', 'name' => 'TimeOpening', 'caption' => 'Fahrzeit AUF (100->0) in s',
+                    'minimum' => 0, 'maximum' => 300],
+                ['type' => 'NumberSpinner', 'name' => 'Repeat', 'caption' => 'Sende-Wiederholungen',
+                    'minimum' => 1, 'maximum' => 8],
+            ]];
+            $el[] = ['type' => 'Label', 'caption' => 'Ohne Rueckmeldung wird die Position aus den Fahrzeiten '
+                . 'geschaetzt — sie ist erst nach einer Referenzfahrt bekannt. Eine Positions-Variable gibt es '
+                . 'bei RTS nicht; sie wird deshalb hier auch nicht verlangt.'];
+        } elseif ($drvSel === 'hm-shutter') {
+            $el[] = ['type' => 'Label', 'caption' => '— Homematic-Rollo/Markise (LEVEL-Datenpunkt, absolut) —'];
+            $el[] = ['type' => 'SelectInstance', 'name' => 'InstanceId', 'caption' => 'Homematic-Instanz (LEVEL/STOP)'];
+            $el[] = ['type' => 'SelectVariable', 'name' => 'LevelVarId',
+                'caption' => 'LEVEL-Variable (optional — sonst aus der Instanz)'];
+        } else {
+            $el[] = ['type' => 'Label', 'caption' => 'Kein Treiber gewaehlt: die Automatik rechnet und '
+                . 'protokolliert, faehrt aber nichts. Treiber waehlen und "Uebernehmen" — danach erscheinen '
+                . 'die passenden Felder.'];
+        }
+        if ($drvSel !== '') {
+            $el[] = ['type' => 'Select', 'name' => 'DeviceKind', 'caption' => 'Art des Beschattungselements',
                 'options' => [['caption' => 'Rollo / Jalousie', 'value' => 'shutter'],
-                              ['caption' => 'Markise', 'value' => 'awning']],
-                'value' => (string) ($cfg['deviceKind'] ?? 'shutter')],
-            ['type' => 'CheckBox', 'name' => 'cfgInvert', 'caption' => 'Richtung invertieren (auf/ab bzw. LEVEL 1=offen / 0=zu..100=offen)',
-                'value' => (bool) ($cfg['invert'] ?? false)],
-            ['type' => 'Button', 'caption' => 'Bindung uebernehmen', 'onClick' =>
-                'echo HSSH_Manage($id, json_encode(["op"=>"configureDriver","args"=>['
-                . '"driver"=>$cfgDriver,"invert"=>$cfgInvert,"deviceKind"=>$cfgKind,'
-                . '"positionId"=>$cfgPositionId,"automaticId"=>$cfgAutomaticId,'
-                . '"socketId"=>$cfgSocketId,"channel"=>$cfgChannel,"repeat"=>$cfgRepeat,'
-                . '"timeOpening"=>$cfgTimeOpening,"timeClosing"=>$cfgTimeClosing,'
-                . '"instanceId"=>$cfgHmInstance]]));'],
-            ['type' => 'Label', 'caption' => $status],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'Button', 'caption' => 'Referenzfahrt: voll AUF (setzt 0%)', 'onClick' =>
-                    'echo HSSH_Manage($id, json_encode(["op"=>"referenceRun","args"=>["dir"=>"up"]]));'],
-                ['type' => 'Button', 'caption' => 'Referenzfahrt: voll ZU (setzt 100%)', 'onClick' =>
-                    'echo HSSH_Manage($id, json_encode(["op"=>"referenceRun","args"=>["dir"=>"down"]]));'],
-                ['type' => 'Button', 'caption' => 'Bindung pruefen', 'onClick' =>
-                    'echo HSSH_Manage($id, json_encode(["op"=>"validate"]));'],
-            ]],
-            ['type' => 'Label', 'caption' => '— Aussperr-Schutz (Tuer-/Fensterkontakte) —'],
-            ['type' => 'Label', 'caption' => 'Bei OFFENEM Kontakt wird das ZUFAHREN blockiert (Auffahren + Sturm-Rueckzug bleiben erlaubt). '
-                . 'Kontakte werden markenuebergreifend erkannt (Homematic/HmIP, Z-Wave, Zigbee, Shelly …).'],
-            ['type' => 'List', 'name' => 'cfgDoors', 'caption' => 'Kontakte', 'rowCount' => 4, 'add' => true, 'delete' => true,
-                'columns' => [['caption' => 'Kontakt', 'name' => 'varId', 'width' => 'auto', 'add' => 0,
-                    'edit' => ['type' => 'Select', 'options' => $copts]]],
-                'values' => $doorVals],
-            ['type' => 'Button', 'caption' => 'Aussperr-Schutz uebernehmen', 'onClick' =>
-                'echo HSSH_Manage($id, json_encode(["op"=>"configureAutomation","args"=>["doorIds"=>'
-                . 'array_values(array_filter(array_map(function($r){return (int)$r["varId"];}, json_decode($cfgDoors,true)?:[])))]]));'],
-            ['type' => 'Label', 'caption' => '— Umgebungs-Sensoren (Sonne/Wind/Regen/Helligkeit fuer die Automatik) —'],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'SelectVariable', 'name' => 'cfgEnvSunAz', 'caption' => 'Sonnen-Azimut (Grad)',
-                    'value' => $envSunAz],
-                ['type' => 'SelectVariable', 'name' => 'cfgEnvSunEl', 'caption' => 'Sonnen-Elevation (Grad)',
-                    'value' => $envSunEl],
-            ]],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'SelectVariable', 'name' => 'cfgEnvWind', 'caption' => 'Wind (km/h)',
-                    'value' => $envWind],
-                ['type' => 'SelectVariable', 'name' => 'cfgEnvRain', 'caption' => 'Regen',
-                    'value' => $envRain],
-                ['type' => 'SelectVariable', 'name' => 'cfgEnvBright', 'caption' => 'Helligkeit',
-                    'value' => $envBright],
-            ]],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'SelectVariable', 'name' => 'SunRadId', 'caption' => 'Globalstrahlung (W/m²)'],
-                ['type' => 'NumberSpinner', 'name' => 'SunRadMin', 'caption' => 'Sonne erst ab (W/m²)', 'digits' => 0],
-                ['type' => 'NumberSpinner', 'name' => 'SunRadOff', 'caption' => 'Sonne AUS unter (W/m²)', 'digits' => 0],
-            ]],
-            ['type' => 'Label', 'caption' => 'Sonnen-Gate: liegt die gemessene Strahlung unter der Schwelle, gilt die Sonnenregel als NICHT erfuellt - unabhaengig vom Sonnenstand. 0 = aus. Richtwert 250-350 W/m². Diese beiden Felder sind echte Instanz-Eigenschaften und gelten sofort mit "Uebernehmen" (kein Button noetig).'],
-            ['type' => 'Button', 'caption' => 'Umgebungs-Sensoren uebernehmen', 'onClick' =>
-                'echo HSSH_Manage($id, json_encode(["op"=>"configureAutomation","args"=>["env"=>['
-                . '"sunAzId"=>$cfgEnvSunAz,"sunElId"=>$cfgEnvSunEl,"windId"=>$cfgEnvWind,'
-                . '"rainId"=>$cfgEnvRain,"brightId"=>$cfgEnvBright]]]));'],
-            ['type' => 'Label', 'caption' => '— Sonnenzeit-Quelle (fuer Sonnen-Anker im Zeitplan) —'],
-            ['type' => 'Select', 'name' => 'cfgSunSource', 'caption' => 'Quelle',
-                'value' => $sunSource, 'options' => [
-                    ['caption' => 'Location-Instanz (Symcon-Standort)', 'value' => 'location'],
-                    ['caption' => 'Eigene Koordinaten', 'value' => 'coords'],
-                ]],
-            ['type' => 'SelectInstance', 'name' => 'cfgLocationId', 'caption' => 'Location-Instanz',
-                'value' => $locationId],
-            ['type' => 'RowLayout', 'items' => [
-                ['type' => 'NumberSpinner', 'name' => 'cfgLat', 'caption' => 'Breite (lat)',
-                    'value' => $lat, 'digits' => 5, 'minimum' => -90, 'maximum' => 90],
-                ['type' => 'NumberSpinner', 'name' => 'cfgLon', 'caption' => 'Laenge (lon)',
-                    'value' => $lon, 'digits' => 5, 'minimum' => -180, 'maximum' => 180],
-            ]],
-            ['type' => 'Button', 'caption' => 'Sonnenzeit-Quelle uebernehmen', 'onClick' =>
-                'echo HSSH_Manage($id, json_encode(["op"=>"configureAutomation","args"=>['
-                . '"sunSource"=>$cfgSunSource,"locationId"=>$cfgLocationId,"lat"=>$cfgLat,"lon"=>$cfgLon]]));'],
+                              ['caption' => 'Markise', 'value' => 'awning']]];
+            $el[] = ['type' => 'CheckBox', 'name' => 'Invert',
+                'caption' => 'Richtung invertieren (auf/ab bzw. LEVEL 1=offen / 0=zu..100=offen)'];
+        }
+        $el[] = ['type' => 'Label', 'caption' => $status];
+        $el[] = ['type' => 'RowLayout', 'items' => [
+            ['type' => 'Button', 'caption' => 'Referenzfahrt: voll AUF (setzt 0%)', 'onClick' =>
+                'echo HSSH_Manage($id, json_encode(["op"=>"referenceRun","args"=>["dir"=>"up"]]));'],
+            ['type' => 'Button', 'caption' => 'Referenzfahrt: voll ZU (setzt 100%)', 'onClick' =>
+                'echo HSSH_Manage($id, json_encode(["op"=>"referenceRun","args"=>["dir"=>"down"]]));'],
+            ['type' => 'Button', 'caption' => 'Bindung pruefen', 'onClick' =>
+                'echo HSSH_Manage($id, json_encode(["op"=>"validate"]));'],
+        ]];
+        $el[] = ['type' => 'Label', 'caption' => '— Aussperr-Schutz (Tuer-/Fensterkontakte) —'];
+        $el[] = ['type' => 'Label', 'caption' => 'Bei OFFENEM Kontakt wird das ZUFAHREN blockiert (Auffahren + '
+            . 'Sturm-Rueckzug bleiben erlaubt). Kontakte werden markenuebergreifend erkannt (Homematic/HmIP, '
+            . 'Z-Wave, Zigbee, Shelly …). Erkannt: ' . count($contacts) . '.'];
+        $el[] = ['type' => 'List', 'name' => 'Doors', 'caption' => 'Kontakte', 'rowCount' => 4,
+            'add' => true, 'delete' => true,
+            'columns' => [['caption' => 'Kontakt', 'name' => 'varId', 'width' => 'auto', 'add' => 0,
+                'edit' => ['type' => 'Select', 'options' => $copts]]]];
+        $el[] = ['type' => 'Label', 'caption' => '— Umgebungs-Sensoren (Sonne/Wind/Regen/Helligkeit fuer die Automatik) —'];
+        $el[] = ['type' => 'Label', 'caption' => 'Leer/0 = die haus-weite Vorgabe aus dem Hub benutzen. Eine eigene '
+            . 'Auswahl gilt nur fuer dieses Rollo und schlaegt die Hub-Vorgabe.'];
+        $el[] = ['type' => 'RowLayout', 'items' => [
+            ['type' => 'SelectVariable', 'name' => 'EnvSunAzId',
+                'caption' => 'Sonnen-Azimut (Grad)' . $eff((int) $this->ReadPropertyInteger('EnvSunAzId'), $envSunAz)],
+            ['type' => 'SelectVariable', 'name' => 'EnvSunElId',
+                'caption' => 'Sonnen-Elevation (Grad)' . $eff((int) $this->ReadPropertyInteger('EnvSunElId'), $envSunEl)],
+        ]];
+        $el[] = ['type' => 'RowLayout', 'items' => [
+            ['type' => 'SelectVariable', 'name' => 'EnvWindId',
+                'caption' => 'Wind (km/h)' . $eff((int) $this->ReadPropertyInteger('EnvWindId'), $envWind)],
+            ['type' => 'SelectVariable', 'name' => 'EnvRainId',
+                'caption' => 'Regen' . $eff((int) $this->ReadPropertyInteger('EnvRainId'), $envRain)],
+            ['type' => 'SelectVariable', 'name' => 'EnvBrightId',
+                'caption' => 'Helligkeit / Globalstrahlung' . $eff((int) $this->ReadPropertyInteger('EnvBrightId'), $envBright)],
+        ]];
+        // Frueher standen hier NOCHMAL drei Strahlungsfelder (SunRadId/Min/Off). Das war eine
+        // zweite, konkurrierende Sonnen-Schranke neben der im Sonnenprofil - niemand konnte
+        // wissen, welche gilt. Es bleibt EINE: die Quelle steht oben (Helligkeit/Globalstrahlung),
+        // die Schwellen stehen im Sonnenprofil. Die alten Properties sind auf 0 (= aus) und
+        // werden nicht mehr angeboten.
+        $el[] = ['type' => 'Label', 'caption' => 'Sonnen-Schranke: die Schwellen stehen im SONNENPROFIL '
+            . '(Helligkeit min = einschalten, Sonne aus unter = Hysterese zum Zurueckfahren) und gelten gegen '
+            . 'die Variable hier oben — in DEREN Einheit. Aktuell gemessen: '
+            . ($brightNow === null ? 'kein Messwert' : sprintf('%.0f', $brightNow))
+            . ', Schwellen aus dem zugewiesenen Sonnenprofil: '
+            . (int) ($geoNow['brightnessMin'] ?? 0) . ' ein / ' . (int) ($geoNow['brightnessOff'] ?? 0) . ' aus.'];
+        $el[] = ['type' => 'Label', 'caption' => '— Sonnenzeit-Quelle (fuer Sonnen-Anker im Zeitplan) —'];
+        $el[] = ['type' => 'Select', 'name' => 'SunSource', 'caption' => 'Quelle', 'options' => [
+            ['caption' => 'Location-Instanz (Symcon-Standort)', 'value' => 'location'],
+            ['caption' => 'Eigene Koordinaten', 'value' => 'coords'],
+        ]];
+        $el[] = ['type' => 'SelectInstance', 'name' => 'LocationId', 'caption' => 'Location-Instanz'];
+        $el[] = ['type' => 'RowLayout', 'items' => [
+            ['type' => 'NumberSpinner', 'name' => 'Lat', 'caption' => 'Breite (lat)', 'digits' => 5,
+                'minimum' => -90, 'maximum' => 90],
+            ['type' => 'NumberSpinner', 'name' => 'Lon', 'caption' => 'Laenge (lon)', 'digits' => 5,
+                'minimum' => -180, 'maximum' => 180],
+        ]];
+        return json_encode(['elements' => array_merge($el, [
             ['type' => 'Label', 'caption' => '— Scharfschalten —'],
             ['type' => 'Label', 'caption' => 'Aktueller Zustand: ' . ($armed ? 'SCHARF (Automatik faehrt real)' : 'Schatten-Modus (Automatik rechnet/protokolliert nur)')],
             ['type' => 'RowLayout', 'items' => [
@@ -1460,7 +1529,7 @@ class ShadingDevice extends EntityModule
                 . 'Somfy: kein Positions-Feedback -> die Position wird aus den Fahrzeiten '
                 . 'geschaetzt. Erst nach einer Referenzfahrt (voll auf/zu) ist sie bekannt. Real gefahren wird nur bei '
                 . '"scharf"; bis dahin werden Fahrten nur protokolliert (Schatten-Modus).'],
-        ]]);
+        ])]);
     }
 
     /** Timer-Callback (prefix HSSH_Refresh): Reflect + Reconcile. Public per SDK. */
@@ -1896,7 +1965,7 @@ class ShadingDevice extends EntityModule
             return ['ok' => false, 'text' => 'inaktiv (kein Treiber)', 'issues' => ['kein Treiber']];
         }
         $issues = [];
-        foreach (['positionId', 'socketId', 'automaticId'] as $k) {
+        foreach (['positionId', 'socketId'] as $k) {
             $id = (int) ($cfg[$k] ?? 0);
             if ($id > 0 && function_exists('IPS_ObjectExists') && !@\IPS_ObjectExists($id)) {
                 $issues[] = $k . ' #' . $id . ' fehlt';

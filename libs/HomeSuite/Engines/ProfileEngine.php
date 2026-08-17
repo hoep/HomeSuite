@@ -244,6 +244,17 @@ final class ProfileEngine
             $val  = $fields[$key];
             $ftyp = (string) ($spec['type'] ?? '');
 
+            // LEER IST EIN GUELTIGER WERT. Ein leeres Zahlenfeld schickt der Editor als null,
+            // und mehrere Schemata bauen genau darauf ("leer = Schwelle aus", Temperatur-Gate).
+            // Vorher fiel das in die Numerik-Pruefung: eine einzige leere Temperatur-Schwelle
+            // liess das GANZE Profil nicht mehr speichern - ohne sichtbaren Grund, das Feld
+            // kam beim naechsten Oeffnen einfach wieder leer zurueck.
+            if ($val === null) {
+                if (!empty($spec['required'])) {
+                    throw new \InvalidArgumentException('Pflichtfeld leer: ' . $key);
+                }
+                continue;
+            }
             if (($ftyp === 'int' || $ftyp === 'float') && !is_numeric($val)) {
                 throw new \InvalidArgumentException('Feld ' . $key . ' muss numerisch sein');
             }

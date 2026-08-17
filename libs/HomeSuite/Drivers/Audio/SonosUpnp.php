@@ -332,7 +332,11 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
             AudioState::REPEAT_OFF,
             false,
             true,
-            $this->host() !== '',
+            // ERREICHBARKEIT statt "ist konfiguriert": vorher stand hier host()!=='' - damit
+            // meldete JEDER konfigurierte Player "online", auch ein stromlos abgeschalteter.
+            // Fuer die Ein/Aus-Anzeige ist aber genau das die einzige ehrliche Quelle: hat der
+            // Player auf die Abfrage geantwortet? Ein ausgeschalteter Sonos antwortet nicht.
+            $ti !== '',
             $this->sourceType($this->tag($pi, 'TrackURI'))
         );
     }
@@ -444,6 +448,75 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
             }
         }
         return $out;
+    }
+
+    /**
+     * WARTESCHLANGE des Players lesen (Sonos-Container 'Q:0').
+     *
+     * browseList() liefert nur Titel und Stream-Adresse - fuer die Anzeige braucht es
+     * Interpret, Album, Dauer und Coverbild, deshalb hier eine eigene DIDL-Auswertung.
+     * Zusaetzlich wird die laufende Spur ermittelt (AVTransport CurrentTrack, 1-basiert),
+     * damit die Anzeige "laeuft gerade" von "als Naechstes" trennen kann.
+     *
+     * Bewusst KEIN Zwischenspeicher: die Warteschlange aendert sich beim Abspielen staendig,
+     * und ein veralteter Stand waere schlimmer als eine Abfrage mehr.
+     *
+     * @return array{items:array<int,array<string,mixed>>,current:int,total:int}
+     */
+    public function queueList(int $offset = 0, int $limit = 60): array
+    {
+        $svc  = 'urn:schemas-upnp-org:service:ContentDirectory:1';
+        $resp = $this->soap($svc, 'Browse',
+            '<ObjectID>Q:0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag>'
+            . '<Filter>*</Filter><StartingIndex>' . max(0, $offset) . '</StartingIndex>'
+            . '<RequestedCount>' . max(1, $limit) . '</RequestedCount><SortCriteria></SortCriteria>',
+            '/MediaServer/ContentDirectory/Control');
+        $didl  = $this->unescapeXml($this->tag($resp, 'Result'));
+        $total = (int) $this->tag($resp, 'TotalMatches');
+        $items = [];
+        if (preg_match_all('~<item[^>]*id="([^"]*)"[^>]*>(.*?)</item>~s', $didl, $mm, PREG_SET_ORDER)) {
+            foreach ($mm as $i => $it) {
+                $x   = $it[2];
+                $res = '';
+                // res traegt die Dauer als Attribut: <res duration="0:04:12" ...>
+                $dur = '';
+                if (preg_match('~<res\b([^>]*)>(.*?)</res>~s', $x, $rm)) {
+                    $res = $this->unescapeXml($rm[2]);
+                    if (preg_match('~duration="([^"]+)"~', $rm[1], $dm)) { $dur = $dm[1]; }
+                }
+                $items[] = [
+                    'idx'      => $offset + $i,             // 0-basiert, wie die Anzeige zaehlt
+                    'id'       => $it[1],
+                    'title'    => $this->unescapeXml($this->tag($x, 'dc:title')),
+                    'artist'   => $this->unescapeXml($this->tag($x, 'dc:creator')),
+                    'album'    => $this->unescapeXml($this->tag($x, 'upnp:album')),
+                    'cover'    => $this->unescapeXml($this->tag($x, 'upnp:albumArtURI')),
+                    'duration' => $this->trimDur($dur),
+                    'uri'      => $res,
+                ];
+            }
+        }
+        // Laufende Spur: 1-basiert im AVTransport, hier auf 0-basiert gebracht.
+        $pos = $this->soap(self::AVT, 'GetPositionInfo', '<InstanceID>0</InstanceID>');
+        $cur = max(0, ((int) $this->tag($pos, 'Track')) - 1);
+        return ['items' => $items, 'current' => $cur, 'total' => $total ?: count($items)];
+    }
+
+    /** "0:04:12" -> "4:12" (fuehrende Nullstunde weg, Minuten ohne fuehrende Null). */
+    private function trimDur(string $d): string
+    {
+        $p = explode(':', trim($d));
+        if (count($p) !== 3) { return trim($d); }
+        $h = (int) $p[0]; $m = (int) $p[1]; $s = (int) $p[2];
+        return $h > 0 ? sprintf('%d:%02d:%02d', $h, $m, $s) : sprintf('%d:%02d', $m, $s);
+    }
+
+    /** Spur der Warteschlange direkt anspringen (1-basiert im AVTransport). */
+    public function playQueueIndex(int $idx): void
+    {
+        $this->soap(self::AVT, 'Seek',
+            '<InstanceID>0</InstanceID><Unit>TRACK_NR</Unit><Target>' . (max(0, $idx) + 1) . '</Target>');
+        $this->play();
     }
 
     /**

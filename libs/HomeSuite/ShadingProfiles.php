@@ -54,23 +54,21 @@ final class ShadingProfiles
                 'rainClose'  => ['type' => 'bool', 'label' => 'Bei Regen schützen'],
                 'safePos'    => ['type' => 'int',  'min' => 0, 'max' => 100, 'unit' => '%', 'label' => 'Sichere Position (%)'],
             ]],
-            ['id' => 'dayBegin', 'title' => 'Tagesbeginn', 'editor' => 'fields', 'schema' => [
-                'mode'   => ['type' => 'enum',  'label' => 'Zeitpunkt', 'options' => self::DAY_MODES],
-                'time'   => ['type' => 'time',  'label' => 'Uhrzeit (bei fest)'],
-                'offset' => ['type' => 'int',   'min' => -180, 'max' => 180, 'label' => 'Offset (min)'],
-                'pos'    => ['type' => 'int',   'min' => 0, 'max' => 100, 'label' => 'Position tags (%)'],
-            ]],
-            ['id' => 'dayEnd', 'title' => 'Tagesende', 'editor' => 'fields', 'schema' => [
-                'mode'   => ['type' => 'enum',  'label' => 'Zeitpunkt', 'options' => self::DAY_MODES],
-                'time'   => ['type' => 'time',  'label' => 'Uhrzeit (bei fest)'],
-                'offset' => ['type' => 'int',   'min' => -180, 'max' => 180, 'label' => 'Offset (min)'],
-                'pos'    => ['type' => 'int',   'min' => 0, 'max' => 100, 'label' => 'Position nachts (%)'],
-            ]],
+            // 'dayBegin' / 'dayEnd' sind hier BEWUSST NICHT MEHR AUFGEFUEHRT.
+            // Tagesbeginn und Tagesende macht der Positions-Wochenplan der Zone, und zwar
+            // vollstaendig - inklusive Sonnen-Anker (siehe SunTimes/scheduleVariants).
+            // Ein zweiter Weg zum selben Ziel war nur eine Quelle fuer Widersprueche;
+            // zugewiesen war er bei keinem einzigen Rollo. Die Auswertung in
+            // ShadingDevice.computeDecision bleibt bestehen (sie ruht, solange nichts
+            // zugewiesen ist) - so laesst sich der Typ jederzeit wieder aufnehmen, ohne
+            // an der Kernlogik zu schneiden. Felder dazu: self::DAY_MODES.
+            // Das Profil traegt nur die SCHWELLEN. Die Innen-/Aussen-Temperatur-VARIABLEN
+            // gehoeren zum einzelnen Rollo (jeder Raum hat seinen eigenen Fuehler) und
+            // stehen deshalb in der Zone, nicht hier - sonst ueberschriebe ein geteiltes
+            // Profil bei jeder Zuweisung die raumeigenen Sensoren mit 0.
             ['id' => 'temp', 'title' => 'Temperatur-Gate', 'editor' => 'fields', 'schema' => [
-                'aboveC'      => ['type' => 'float', 'min' => -20, 'max' => 50, 'label' => 'Beschatten ab innen (°C, leer=aus)'],
-                'sensorId'    => ['type' => 'objid', 'label' => 'Innen-Temperatur-Variable'],
-                'outAboveC'   => ['type' => 'float', 'min' => -20, 'max' => 50, 'label' => 'und ab außen (°C, leer=aus)'],
-                'outSensorId' => ['type' => 'objid', 'label' => 'Außen-Temperatur-Variable'],
+                'aboveC'      => ['type' => 'float', 'min' => -20, 'max' => 50, 'unit' => '°C', 'label' => 'Beschatten ab innen (°C, leer=aus)'],
+                'outAboveC'   => ['type' => 'float', 'min' => -20, 'max' => 50, 'unit' => '°C', 'label' => 'und ab außen (°C, leer=aus)'],
                 'requireSun'  => ['type' => 'bool',  'label' => 'Nur bei Sonne'],
             ]],
         ];
@@ -80,6 +78,29 @@ final class ShadingProfiles
     public static function typeIds(): array
     {
         return array_map(static fn($t) => $t['id'], self::types());
+    }
+
+    /**
+     * Gegenstueck zu mapToConfig: das Config-Fragment fuer einen ABGEWAEHLTEN Profiltyp.
+     *
+     * Abwahl muss als ausdrueckliche Loeschung bei der Zone ankommen. Wer nur "nichts
+     * sendet", laesst die alten Werte in der Zone stehen - das Rollo verschattet dann
+     * weiter nach einem Profil, das in der Oberflaeche laengst abgewaehlt ist.
+     *
+     * AUSNAHME 'weather': Sturmschwelle, Sicherheitsposition und Regen sind SICHERHEIT,
+     * kein Komfort. Faellt das Wetterprofil weg, gelten wieder die Instanz-Eigenschaften
+     * der Zone - der Sturmschutz wird NICHT stillschweigend abgeschaltet.
+     * @return array<string,mixed>
+     */
+    public static function clearConfig(string $type): array
+    {
+        switch ($type) {
+            case 'sun':      return ['geoProfile' => null];
+            case 'temp':     return ['tempGate' => null];
+            case 'dayBegin': return ['dayBegin' => null];
+            case 'dayEnd':   return ['dayEnd' => null];
+        }
+        return [];
     }
 
     /**
@@ -109,12 +130,12 @@ final class ShadingProfiles
             case 'temp':
                 // Innen- UND Außen-Schwelle (wie IPSShadowing ProfileTemp). Leeres Feld = Schwelle aus
                 // (null). ShadingDevice.reconcile blockt, wenn eine gesetzte Schwelle unterschritten wird.
+                // OHNE sensorId/outSensorId: die Fuehler stehen am Rollo. ShadingDevice mischt das
+                // Fragment in den vorhandenen tempGate, die Sensoren der Zone bleiben also stehen.
                 $has = static fn($k) => isset($f[$k]) && $f[$k] !== '' && $f[$k] !== null;
                 $tg = [
                     'aboveC'      => $has('aboveC') ? (float) $f['aboveC'] : null,
-                    'sensorId'    => (int) ($f['sensorId'] ?? 0),
                     'outAboveC'   => $has('outAboveC') ? (float) $f['outAboveC'] : null,
-                    'outSensorId' => (int) ($f['outSensorId'] ?? 0),
                     'requireSun'  => (bool) ($f['requireSun'] ?? true),
                 ];
                 return ['tempGate' => $tg];

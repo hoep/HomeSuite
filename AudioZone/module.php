@@ -162,6 +162,8 @@ class AudioZone extends EntityModule
                 ['op' => 'ungroup',         'label' => 'Gruppe trennen'],
                 ['op' => 'setGroupVolume',  'label' => 'Gruppen-Lautstaerke'],
                 ['op' => 'seek',            'label' => 'Springen (Position %)'],
+                ['op' => 'queue',           'label' => 'Warteschlange lesen'],
+                ['op' => 'playQueueIndex',  'label' => 'Spur der Warteschlange anspringen'],
                 ['op' => 'playSource',      'label' => 'Quelle abspielen'],
                 ['op' => 'updateProfile',   'label' => 'Wochenplan bearbeiten'],
                 ['op' => 'getSchedule',     'label' => 'Wochenplan lesen'],
@@ -339,12 +341,21 @@ class AudioZone extends EntityModule
             return null;
         }
         try {
-            $this->driverInstance = DriverFactory::create($driverId, [
+            // VERBINDUNGSDATEN mitgeben: die nativen Treiber (sonos-upnp, heos) sprechen das
+            // Geraet direkt an und brauchen Adresse/Kennung. Sie fehlten hier - der Treiber
+            // liess sich zwar waehlen und meldete seine Faehigkeiten, stand aber ohne Adresse
+            // da und lieferte einen leeren Zustand (online=false, Lautstaerke 0).
+            $dcfg = [
                 'bind'    => $bind,
                 'reflect' => (array) ($cfg['reflect'] ?? []),
                 'group'   => (array) ($cfg['group'] ?? []),
                 'caps'    => (array) ($cfg['caps'] ?? []),
-            ]);
+            ];
+            foreach (['host', 'rincon', 'uid'] as $k) {
+                if (($cfg[$k] ?? '') !== '') { $dcfg[$k] = (string) $cfg[$k]; }
+            }
+            if ((int) ($cfg['port'] ?? 0) > 0) { $dcfg['port'] = (int) $cfg['port']; }
+            $this->driverInstance = DriverFactory::create($driverId, $dcfg);
         } catch (\Throwable $e) {
             $this->SendDebug('HSAU.driver', 'Treiberaufbau fehlgeschlagen: ' . $e->getMessage(), 0);
             $this->driverInstance = null;
@@ -372,6 +383,17 @@ class AudioZone extends EntityModule
         $this->setReflect('Duration', $this->secToTime($st->durationSec));
         $this->setReflect('PlayState', $st->playState);
         $this->setReflect('Online', $st->online);
+        // EIN/AUS spiegeln. Fehlte bisher ganz - deshalb stand die Zone dauerhaft auf "aus",
+        // obwohl Musik lief, und der Schalter im Frontend sprang nach dem Druck zurueck.
+        // Quelle je nach Betriebsart: eine gebundene Variable (Altbestand) oder - bei Geraeten
+        // ohne echten Netzschalter wie Sonos - schlicht "spielt gerade".
+        $pw = (array) ($this->cfg()['power'] ?? []);
+        if ((string) ($pw['mode'] ?? 'playstop') === 'var' && (int) ($pw['varId'] ?? 0) > 0) {
+            $pv = @\GetValue((int) $pw['varId']);
+            $this->setReflect('Power', (bool) ($pw['invert'] ?? false) ? !$pv : (bool) $pv);
+        } else {
+            $this->setReflect('Power', (bool) $st->playState);
+        }
         // Reflect der schaltbaren Ist-Werte (nur wenn nicht manuell gehalten -> kein Flackern).
         if (!$this->isManuallyHeld('Volume')) {
             $this->setReflect('Volume', $st->volume);
@@ -604,6 +626,10 @@ class AudioZone extends EntityModule
                 return $this->mgmtSetGroupVolume($args);
             case 'seek':
                 return $this->mgmtSeek($args);
+            case 'queue':
+                return $this->mgmtQueue($args);
+            case 'playQueueIndex':
+                return $this->mgmtPlayQueueIndex($args);
             case 'playSource':
                 return $this->mgmtPlaySource($args);
             case 'updateProfile':
@@ -653,6 +679,18 @@ class AudioZone extends EntityModule
             if (isset($args[$k]) && is_array($args[$k])) {
                 $config[$k] = $args[$k];
             }
+        }
+        // VERBINDUNGSDATEN der nativen Treiber (sonos-upnp: Player-Adresse + RINCON-Kennung,
+        // heos: Host). Ohne sie war der native Treiber zwar waehlbar, aber adresslos - er
+        // meldete Faehigkeiten und lieferte trotzdem keinen Zustand. Skalare Werte, deshalb
+        // in der Schleife oben nicht erfasst.
+        foreach (['host', 'rincon', 'uid'] as $k) {
+            if (isset($args[$k]) && is_scalar($args[$k]) && (string) $args[$k] !== '') {
+                $config[$k] = (string) $args[$k];
+            }
+        }
+        if (isset($args['port'])) {
+            $config['port'] = max(1, (int) $args['port']);
         }
         if (!empty($ctx['dryrun'])) {
             return ['ok' => true, 'dryrun' => true, 'config' => $config];
@@ -790,6 +828,45 @@ class AudioZone extends EntityModule
         $pct = max(0, min(100, (int) ($args['percent'] ?? 0)));
         $this->RequestAction('Position', $pct);
         return ['ok' => true, 'percent' => $pct, 'armed' => (bool) $this->cfgVal('armed', false)];
+    }
+
+    /**
+     * WARTESCHLANGE lesen. Nicht jeder Treiber hat eine: Radio-Streams und die HEOS-Bruecke
+     * kennen keine Queue. Statt einen Fehler zu werfen, wird das ehrlich gemeldet
+     * (supported=false) - die Kachel zeigt dann die Senderliste statt einer leeren Liste.
+     */
+    private function mgmtQueue(array $args): array
+    {
+        $drv = $this->driver();
+        if (!is_object($drv) || !method_exists($drv, 'queueList')) {
+            return ['ok' => true, 'supported' => false, 'items' => [], 'current' => 0, 'total' => 0,
+                    'note' => 'Dieser Treiber fuehrt keine Warteschlange'];
+        }
+        $off = max(0, (int) ($args['offset'] ?? 0));
+        $lim = max(1, min(200, (int) ($args['limit'] ?? 60)));
+        try {
+            $q = $drv->queueList($off, $lim);
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'supported' => true, 'error' => $e->getMessage(), 'items' => []];
+        }
+        return ['ok' => true, 'supported' => true,
+                'items' => $q['items'] ?? [], 'current' => (int) ($q['current'] ?? 0),
+                'total' => (int) ($q['total'] ?? 0)];
+    }
+
+    /** Spur der Warteschlange anspringen. Faehrt real - deshalb am Scharf-Gate vorbei geprueft. */
+    private function mgmtPlayQueueIndex(array $args): array
+    {
+        $drv = $this->driver();
+        if (!is_object($drv) || !method_exists($drv, 'playQueueIndex')) {
+            return ['ok' => false, 'error' => 'Treiber kennt keine Warteschlange'];
+        }
+        if (!$this->armed()) {
+            return ['ok' => false, 'armed' => false, 'note' => 'Schatten-Modus: nicht gesendet'];
+        }
+        $idx = max(0, (int) ($args['index'] ?? 0));
+        $drv->playQueueIndex($idx);
+        return ['ok' => true, 'index' => $idx];
     }
 
     private function mgmtPlaySource(array $args): array
