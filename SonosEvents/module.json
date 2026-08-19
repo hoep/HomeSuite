@@ -1,0 +1,19 @@
+{
+    "id": "{5C1A7D28-9E44-4B31-8F62-2A7D0C6B4E93}",
+    "name": "HomeSuiteSonosEvents",
+    "type": 2,
+    "vendor": "",
+    "aliases": [
+        "HomeSuite Sonos-Ereignisse",
+        "Sonos Events",
+        "Sonos Eventing"
+    ],
+    "parentRequirements": [
+        "{C8792760-65CF-4C53-B5C7-A30FCC84FEFE}"
+    ],
+    "childRequirements": [],
+    "implemented": [
+        "{7A1272A4-CBDB-46EF-BFC6-DCF4A53D2FC7}"
+    ],
+    "prefix": "HSSE"
+}

@@ -1228,8 +1228,14 @@ class ShadingDevice extends EntityModule
                 // Schliessgrad pro Rollo aus SunClose (Wahrheit); 0/fehlend -> Store bzw. 100.
                 $cp = @$this->GetIDForIdent('SunClose') ? (int) @$this->GetValue('SunClose') : 0;
                 if ($cp <= 0) { $cp = (int) ($st['closePct'] ?? 100); }
+                // brightnessOff MUSS mit: computeDecision setzt damit die Hysterese
+                // (laufende Beschattung haelt bis zur niedrigeren AUS-Schwelle). Fehlte der
+                // Wert hier, war er dort immer 0 -> die Hysterese griff nie, und die
+                // Beschattung fiel schon an der EIN-Schwelle wieder heraus (19.08.2026:
+                // Strahlung 18:08 unter 300, Aufblenden 18:13 bei 281 W/m2 statt bei 180).
                 return ['azimuthBgn' => $bgn, 'azimuthEnd' => $end, 'elevation' => $el,
-                        'closePct' => $cp, 'brightnessMin' => (int) ($st['brightnessMin'] ?? 0)];
+                        'closePct' => $cp, 'brightnessMin' => (int) ($st['brightnessMin'] ?? 0),
+                        'brightnessOff' => (int) ($st['brightnessOff'] ?? 0)];
             }
         }
         $st = $this->cfgVal('geoProfile', null);

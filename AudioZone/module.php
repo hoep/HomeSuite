@@ -177,6 +177,8 @@ class AudioZone extends EntityModule
                 ['op' => 'seek',            'label' => 'Springen (Position %)'],
                 ['op' => 'queue',           'label' => 'Warteschlange lesen'],
                 ['op' => 'playQueueIndex',  'label' => 'Spur der Warteschlange anspringen'],
+                ['op' => 'queueRemove',     'label' => 'Titel aus der Warteschlange entfernen'],
+                ['op' => 'queueClear',      'label' => 'Warteschlange leeren'],
                 ['op' => 'playSource',      'label' => 'Quelle abspielen'],
                 ['op' => 'updateProfile',   'label' => 'Wochenplan bearbeiten'],
                 ['op' => 'getSchedule',     'label' => 'Wochenplan lesen'],
@@ -400,6 +402,78 @@ class AudioZone extends EntityModule
     // ==================================================================
     // Refresh: Ist-Zustand spiegeln
     // ==================================================================
+
+    /**
+     * Zustand aus einem UPnP-Ereignis uebernehmen (vom Modul HomeSuite Sonos-Ereignisse).
+     *
+     * Der Player meldet von sich aus, was sich geaendert hat - wir schreiben nur diese
+     * Felder. Was das Ereignis NICHT enthaelt, bleibt stehen; ein NOTIFY ueber die
+     * Lautstaerke sagt nichts ueber den Titel, und ein leergeschriebener Titel waere
+     * schlechter als ein Sekunden alter.
+     *
+     * Titel und Interpret stecken im DIDL des Ereignisses; ist keines dabei, wird nur
+     * der Transportzustand gesetzt und der naechste regulaere Abruf holt den Rest.
+     */
+    public function ApplyEvent(string $json): void
+    {
+        $ev = json_decode($json, true);
+        if (!is_array($ev) || $ev === []) {
+            return;
+        }
+        if (isset($ev['transport'])) {
+            $t = strtoupper((string) $ev['transport']);
+            $spielt = ($t === 'PLAYING' || $t === 'TRANSITIONING');
+            // Namen aus dem Manifest: PlayState (bool), nicht "Playing". Power folgt der
+            // Wiedergabe nur, wenn keine eigene Netz-Variable gebunden ist - sonst wuerde
+            // ein Ereignis die echte Steckdose ueberschreiben.
+            $this->setReflect('PlayState', $spielt);
+            // Power genau wie im Abruf ableiten: eine gebundene Netz-Variable hat Vorrang,
+            // sonst gilt "spielt gerade". Zwei Varianten derselben Regel liefen sonst
+            // auseinander, sobald eine davon geaendert wird.
+            $pw = (array) ($this->cfg()['power'] ?? []);
+            if ((string) ($pw['mode'] ?? 'playstop') === 'var' && (int) ($pw['varId'] ?? 0) > 0) {
+                $pv = @\GetValue((int) $pw['varId']);
+                $this->setReflect('Power', (bool) ($pw['invert'] ?? false) ? !$pv : (bool) $pv);
+            } else {
+                $this->setReflect('Power', $spielt);
+            }
+            // Ein Ereignis beweist, dass der Player antwortet - die Ruhepause aufheben.
+            $rt = $this->readRt();
+            if (!empty($rt['offlineSince'])) {
+                $rt['offlineSince'] = 0;
+                $this->writeRt($rt);
+            }
+            $this->setReflect('Online', true);
+        }
+        if (isset($ev['volume']) && $ev['volume'] !== '') {
+            $this->setReflect('Volume', (int) $ev['volume']);
+        }
+        if (isset($ev['mute']) && $ev['mute'] !== '') {
+            $this->setReflect('Mute', ((int) $ev['mute']) === 1);
+        }
+        $meta = (string) ($ev['meta'] ?? '');
+        if ($meta !== '') {
+            $tag = static function (string $x, string $t) {
+                return preg_match('~<' . $t . '\b[^>]*>(.*?)</' . $t . '>~s', $x, $m)
+                    ? trim(html_entity_decode($m[1], ENT_QUOTES | ENT_XML1 | ENT_HTML5)) : '';
+            };
+            $titel = $tag($meta, 'dc:title');
+            if ($titel !== '') {
+                $this->setReflect('Title', $titel);
+                $this->setReflect('Artist', $tag($meta, 'dc:creator'));
+                $this->setReflect('Album', $tag($meta, 'upnp:album'));
+                $cov = $tag($meta, 'upnp:albumArtURI');
+                if ($cov !== '') {
+                    $this->setReflect('CoverUri', $cov);
+                }
+            }
+        }
+        // Der Radiotitel steckt nicht im DIDL, sondern im laufenden Strom - der Zwischen-
+        // speicher der Now-Anzeige muss daher weg, sonst zeigt sie den alten Song.
+        $rt = $this->readRt();
+        unset($rt['radioCache']);
+        $this->writeRt($rt);
+    }
 
     public function Refresh(): void
     {
@@ -688,6 +762,10 @@ class AudioZone extends EntityModule
                 return $this->mgmtQueue($args);
             case 'playQueueIndex':
                 return $this->mgmtPlayQueueIndex($args);
+            case 'queueRemove':
+                return $this->mgmtQueueRemove($args);
+            case 'queueClear':
+                return $this->mgmtQueueClear();
             case 'playSource':
                 return $this->mgmtPlaySource($args);
             case 'updateProfile':
@@ -921,6 +999,42 @@ class AudioZone extends EntityModule
         return ['ok' => true, 'supported' => true,
                 'items' => $q['items'] ?? [], 'current' => (int) ($q['current'] ?? 0),
                 'total' => (int) ($q['total'] ?? 0)];
+    }
+
+    /**
+     * Einen Titel aus der Warteschlange entfernen. Wirkt am Zuspieler, faellt also
+     * unter das Scharf-Gate. Der Index ist 0-basiert wie in mgmtQueue/queueList.
+     */
+    private function mgmtQueueRemove(array $args): array
+    {
+        $drv = $this->queueDriver();
+        if (!$drv instanceof IAudioQueue) {
+            return ['ok' => false, 'error' => 'Treiber fuehrt keine Warteschlange'];
+        }
+        if (!$this->armed()) {
+            return ['ok' => false, 'armed' => false, 'note' => 'Schatten-Modus: nicht gesendet'];
+        }
+        $idx = (int) ($args['index'] ?? -1);
+        if ($idx < 0) {
+            return ['ok' => false, 'error' => 'index fehlt'];
+        }
+        $ok = $drv->removeFromQueue($idx);
+        return $ok ? ['ok' => true, 'index' => $idx]
+                   : ['ok' => false, 'index' => $idx, 'error' => 'Zuspieler hat nicht bestaetigt'];
+    }
+
+    /** Ganze Warteschlange leeren. Wirkt am Zuspieler -> Scharf-Gate. */
+    private function mgmtQueueClear(): array
+    {
+        $drv = $this->queueDriver();
+        if (!$drv instanceof IAudioQueue) {
+            return ['ok' => false, 'error' => 'Treiber fuehrt keine Warteschlange'];
+        }
+        if (!$this->armed()) {
+            return ['ok' => false, 'armed' => false, 'note' => 'Schatten-Modus: nicht gesendet'];
+        }
+        $drv->clearQueue();
+        return ['ok' => true];
     }
 
     /** Spur der Warteschlange anspringen. Faehrt real - deshalb am Scharf-Gate vorbei geprueft. */

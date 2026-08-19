@@ -220,6 +220,24 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable, IAudioQueu
         return preg_match('~<NewQueueLength>(\d+)</NewQueueLength>~', $resp, $m) ? (int) $m[1] : 0;
     }
 
+    /**
+     * Einen Titel aus der Warteschlange werfen. Sonos zaehlt ab 1, unsere Listen ab 0.
+     * UpdateID 0 heisst „ohne Versionspruefung" - eine echte ID muesste sonst aus einem
+     * vorherigen Browse stammen und waere zwischen Anzeige und Klick laengst veraltet.
+     * Die Antwort traegt die neue UpdateID; fehlt sie, hat der Player nicht angenommen.
+     */
+    public function removeFromQueue(int $index): bool
+    {
+        if ($index < 0) {
+            return false;
+        }
+        $resp = $this->soap(self::AVT, 'RemoveTrackRangeFromQueue',
+            '<InstanceID>0</InstanceID><UpdateID>0</UpdateID>'
+            . '<StartingIndex>' . ($index + 1) . '</StartingIndex>'
+            . '<NumberOfTracks>1</NumberOfTracks>');
+        return $resp !== '' && stripos($resp, 'NewUpdateID') !== false;
+    }
+
     public function startQueue(int $index = 0): void
     {
         $uid = (string) ($this->cfg['rincon'] ?? '');

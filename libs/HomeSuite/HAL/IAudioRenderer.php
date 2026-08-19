@@ -98,6 +98,12 @@ interface IAudioQueue extends IAudioRenderer
 
     /** Auf die Warteschlange umschalten und ab $index abspielen. */
     public function startQueue(int $index = 0): void;
+
+    /**
+     * Einen Titel aus der Warteschlange entfernen (0-basiert, wie queueList zaehlt).
+     * true = der Zuspieler hat die Aenderung bestaetigt.
+     */
+    public function removeFromQueue(int $index): bool;
 }
 
 interface IAudioRendererExtended extends IAudioRenderer
