@@ -527,7 +527,9 @@ class HomeSuiteHub extends EntityModule
                 'label' => $sa[1], 'destructive' => ($sa[0] === 'lightSceneDelete'), 'fields' => []]);
         }
         foreach ([['lightAutoGet', 'Automatik-Regeln lesen'], ['lightAutoSet', 'Automatik-Regeln speichern'],
-                  ['lightAutoTick', 'Automatik jetzt auswerten (Test)']] as $la) {
+                  ['lightAutoTick', 'Automatik jetzt auswerten (Test)'],
+                  ['lightAutoBandGet', 'Zeitsteuerung (Baender) lesen'],
+                  ['lightAutoBandSet', 'Zeitsteuerung (Baender) speichern']] as $la) {
             $m->addManagementAction(['op' => $la[0], 'verb' => $la[0], 'target' => 'hub',
                 'label' => $la[1], 'destructive' => false, 'fields' => []]);
         }
@@ -1368,22 +1370,154 @@ class HomeSuiteHub extends EntityModule
                     ? ['sunrise' => (int) date('G', (int) $si['sunrise']) * 60 + (int) date('i', (int) $si['sunrise']),
                        'sunset'  => (int) date('G', (int) $si['sunset']) * 60 + (int) date('i', (int) $si['sunset'])]
                     : ['sunrise' => 360, 'sunset' => 1200];
+                // Aus Baendern abgeleitete Regeln gehoeren NICHT in den Regel-Editor: dort waeren
+                // sie nur verwirrend (Loeschen haette keinen Bestand, weil sie beim naechsten
+                // Speichern neu entstehen). Sie werden im Baender-Widget bearbeitet.
+                $cfg = $this->lightAutoCfg();
+                $cfg['rules'] = array_values(array_filter($cfg['rules'], static fn($r) => ($r['src'] ?? '') !== 'band'));
                 return ['ok' => true, 'sun' => $sun,
                     'automationEnabled' => $this->automationEnabled(),
                     'automationVar'     => (int) (@\IPS_GetObjectIDByIdent('AutomationEnabled', $this->InstanceID) ?: 0),
-                ] + $this->lightAutoCfg();
+                ] + $cfg;
             case 'lightAutoSet':
                 $enabled = (bool) ($args['enabled'] ?? false);
                 $rules = is_array($args['rules'] ?? null) ? array_values($args['rules']) : [];
+                // Aus Baendern abgeleitete Regeln gehoeren dem Baender-Editor: sie stehen in
+                // KEINEM Regel-Editor und duerfen von dessen Speichern nicht geloescht werden.
+                $rules = array_values(array_filter($rules, static fn($r) => ($r['src'] ?? '') !== 'band'));
+                $rules = array_merge($rules, $this->bandRules());
                 $this->store()->set('lightAuto', ['enabled' => $enabled, 'rules' => $rules]);
                 $this->lightAutoWire();
                 return ['ok' => true, 'enabled' => $enabled, 'count' => count($rules)];
             case 'lightAutoTick':
                 $this->lightAutoTick();
                 return ['ok' => true, 'ticked' => true];
+            case 'lightAutoBandGet':
+                $co = $this->sunCoords();
+                $si = @date_sun_info(time(), (float) ($co['lat'] ?? 48.2082), (float) ($co['lon'] ?? 16.3738));
+                return ['ok' => true, 'bands' => $this->bandCfg(),
+                    'enabled' => $this->lightAutoCfg()['enabled'],
+                    'automationEnabled' => $this->automationEnabled(),
+                    'scenes' => $this->scenes()->list(),
+                    'sun' => is_array($si)
+                        ? ['sunrise' => (int) date('G', (int) $si['sunrise']) * 60 + (int) date('i', (int) $si['sunrise']),
+                           'sunset'  => (int) date('G', (int) $si['sunset']) * 60 + (int) date('i', (int) $si['sunset'])]
+                        : ['sunrise' => 360, 'sunset' => 1200]];
+            case 'lightAutoBandSet':
+                return $this->bandSet($args);
             default:
                 return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
         }
+    }
+
+    // ==================================================================
+    // Licht-Zeitsteuerung als BAENDER
+    //
+    // Bearbeitet wird ein Tag als Folge von Abschnitten ("ab 06:30 gilt Morgen"), gehandelt
+    // wird weiterhin nur an den KANTEN: aus jedem Abschnittsbeginn entsteht eine gewoehnliche
+    // Schaltpunkt-Regel (type=schedule, src=band). Damit bleibt die gepruefte Auswertung
+    // unveraendert - und vor allem bleibt das Verhalten unaufdringlich: es gibt keinen
+    // durchgesetzten Sollzustand, der eine von Hand eingeschaltete Lampe wieder ausmacht.
+    // ==================================================================
+
+    /** @return array{days:array<int,array>} Baender je Wochentag (0=So..6=Sa, wie date('w')). */
+    private function bandCfg(): array
+    {
+        $b = $this->store()->get('lightBands', []);
+        $days = is_array($b['days'] ?? null) ? $b['days'] : [];
+        $out = [];
+        for ($d = 0; $d <= 6; $d++) {
+            $segs = is_array($days[$d] ?? null) ? $days[$d] : (is_array($days[(string) $d] ?? null) ? $days[(string) $d] : []);
+            $out[$d] = array_values(array_filter(array_map([$this, 'bandSeg'], $segs)));
+            usort($out[$d], fn($a, $b2) => $this->bandSegMin($a) <=> $this->bandSegMin($b2));
+        }
+        return ['days' => $out];
+    }
+
+    /** Einen Abschnitt normalisieren; ohne Szene ist er wertlos -> null. */
+    private function bandSeg($s): ?array
+    {
+        if (!is_array($s)) {
+            return null;
+        }
+        $scene = (string) ($s['sceneId'] ?? '');
+        if ($scene === '') {
+            return null;
+        }
+        $tr = is_array($s['trigger'] ?? null) ? $s['trigger'] : [];
+        $kind = ($tr['kind'] ?? 'time') === 'sun' ? 'sun' : 'time';
+        return ['sceneId' => $scene,
+            'trigger' => $kind === 'sun'
+                ? ['kind' => 'sun',
+                   'event' => (($tr['event'] ?? 'sunset') === 'sunrise') ? 'sunrise' : 'sunset',
+                   'offsetMin' => max(-240, min(240, (int) ($tr['offsetMin'] ?? 0)))]
+                : ['kind' => 'time', 'time' => $this->bandTime((string) ($tr['time'] ?? '00:00'))]];
+    }
+
+    private function bandTime(string $t): string
+    {
+        if (!preg_match('/^(\d{1,2}):(\d{2})$/', trim($t), $m)) {
+            return '00:00';
+        }
+        return sprintf('%02d:%02d', max(0, min(23, (int) $m[1])), max(0, min(59, (int) $m[2])));
+    }
+
+    /** Sortierschluessel in Minuten; Sonnenabschnitte mit den heutigen Sonnenzeiten. */
+    private function bandSegMin(array $s): int
+    {
+        $tr = $s['trigger'] ?? [];
+        if (($tr['kind'] ?? 'time') === 'sun') {
+            $co = $this->sunCoords();
+            $si = @date_sun_info(time(), (float) ($co['lat'] ?? 48.2082), (float) ($co['lon'] ?? 16.3738));
+            $base = ($tr['event'] ?? 'sunset') === 'sunrise'
+                ? (is_array($si) ? (int) date('G', (int) $si['sunrise']) * 60 + (int) date('i', (int) $si['sunrise']) : 360)
+                : (is_array($si) ? (int) date('G', (int) $si['sunset']) * 60 + (int) date('i', (int) $si['sunset']) : 1200);
+            return $base + (int) ($tr['offsetMin'] ?? 0);
+        }
+        $p = explode(':', (string) ($tr['time'] ?? '00:00'));
+        return (int) ($p[0] ?? 0) * 60 + (int) ($p[1] ?? 0);
+    }
+
+    /** Baender -> Schaltpunkt-Regeln (eine je Abschnittsbeginn und Wochentag). */
+    private function bandRules(): array
+    {
+        $rules = [];
+        foreach ($this->bandCfg()['days'] as $d => $segs) {
+            foreach ($segs as $i => $s) {
+                $rules[] = [
+                    'id'      => 'band-' . $d . '-' . $i,
+                    'src'     => 'band',
+                    'type'    => 'schedule',
+                    'name'    => 'Band ' . ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'][$d],
+                    'enabled' => true,
+                    'days'    => [(int) $d],
+                    'trigger' => $s['trigger'],
+                    'sceneId' => $s['sceneId'],
+                ];
+            }
+        }
+        return $rules;
+    }
+
+    /** Baender speichern und die abgeleiteten Regeln neu erzeugen. */
+    private function bandSet(array $args): array
+    {
+        $days = is_array($args['days'] ?? null) ? $args['days'] : [];
+        $rein = [];
+        for ($d = 0; $d <= 6; $d++) {
+            $segs = is_array($days[$d] ?? null) ? $days[$d] : (is_array($days[(string) $d] ?? null) ? $days[(string) $d] : []);
+            $rein[$d] = array_values(array_filter(array_map([$this, 'bandSeg'], $segs)));
+        }
+        $this->store()->set('lightBands', ['days' => $rein]);
+
+        $cfg   = $this->lightAutoCfg();
+        $rules = array_values(array_filter($cfg['rules'], static fn($r) => ($r['src'] ?? '') !== 'band'));
+        $rules = array_merge($rules, $this->bandRules());
+        $enabled = array_key_exists('enabled', $args) ? (bool) $args['enabled'] : $cfg['enabled'];
+        $this->store()->set('lightAuto', ['enabled' => $enabled, 'rules' => $rules]);
+        $this->lightAutoWire();
+        return ['ok' => true, 'enabled' => $enabled,
+            'segments' => array_sum(array_map('count', $rein)), 'rules' => count($rules)];
     }
 
     /** Quellen-Konfig (Medien-Provider) aus dem Store, inkl. Defaults je bekanntem Provider. */
