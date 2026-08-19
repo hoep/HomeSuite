@@ -35,6 +35,7 @@ use Hoep\HomeSuite\EntityModule;
 use Hoep\HomeSuite\HAL\AudioSourceRef;
 use Hoep\HomeSuite\HAL\AudioState;
 use Hoep\HomeSuite\HAL\DriverFactory;
+use Hoep\HomeSuite\HAL\IAudioQueue;
 use Hoep\HomeSuite\HAL\IAudioRenderer;
 use Hoep\HomeSuite\HAL\IAudioStateReadable;
 use Hoep\HomeSuite\HAL\IDriver;
@@ -52,6 +53,18 @@ class AudioZone extends EntityModule
     private const TR_PREV = 5;
 
     private const TIMER_REFRESH = 'Refresh';
+    // Ein-Schuss-Nachlesen kurz nach einem Befehl. Ohne ihn zeigt die Kachel bis zu einen
+    // vollen Abfragetakt lang den alten Zustand - man drueckt Pause und sieht fuenf Sekunden
+    // lang weiter "spielt". Der Push kann daran nichts aendern: er ist sofort, aber die
+    // Variable aendert sich erst beim naechsten Abruf.
+    private const TIMER_KICK    = 'Kick';
+    // Wie lange eine nicht erreichbare Zone in Ruhe gelassen wird, bevor wieder angeklopft wird.
+    private const OFFLINE_RETRY_S = 60;
+    private const KICK_MS       = 900;   // dem Geraet Zeit lassen, den Befehl umzusetzen
+    private const TIMER_ENQ     = 'Enqueue';
+    private const ENQ_MS        = 3000;  // Takt; laenger als ein Block braucht (12 x ~165 ms)
+    private const ENQ_FIRST     = 3;     // sofort, damit binnen ~1 s Ton kommt
+    private const ENQ_BLOCK     = 12;    // je Timer-Lauf (~2 s bei 164 ms/Titel)
     private const TIMER_SLEEP = 'Sleep';       // Ein-Schuss: Sleep-Timer -> stop
     private const TIMER_RAMP = 'Ramp';         // sanftes Wecken: Volume schrittweise
     private const REFRESH_MS = 5000;
@@ -175,6 +188,8 @@ class AudioZone extends EntityModule
                 ['op' => 'playDirect',      'label' => 'Radio: HQ-Direktstream spielen'],
                 ['op' => 'radioStations',   'label' => 'Radio: Senderliste'],
                 ['op' => 'playContent',     'label' => 'Bibliotheks-Inhalt abspielen (ContentRef)'],
+                ['op' => 'playContainer',   'label' => 'Ganze Sammlung abspielen/anhaengen (Album, Playlist, Hoerbuch)'],
+                ['op' => 'cancelEnqueue',   'label' => 'Laufendes Einreihen abbrechen'],
             ],
 
             'capabilities' => [
@@ -202,6 +217,8 @@ class AudioZone extends EntityModule
         $this->RegisterTimer(self::TIMER_REFRESH, 0, 'HSAU_Refresh($_IPS[\'TARGET\']);');
         $this->RegisterTimer(self::TIMER_SLEEP, 0, 'HSAU_RunSleep($_IPS[\'TARGET\']);');
         $this->RegisterTimer(self::TIMER_RAMP, 0, 'HSAU_RunRamp($_IPS[\'TARGET\']);');
+        $this->RegisterTimer(self::TIMER_KICK, 0, 'HSAU_Refresh($_IPS[\'TARGET\']);');
+        $this->RegisterTimer(self::TIMER_ENQ, 0, 'HSAU_RunEnqueue($_IPS[\'TARGET\']);');
     }
 
     public function ApplyChanges()
@@ -267,6 +284,23 @@ class AudioZone extends EntityModule
             default:
                 $this->SendDebug('HSAU.apply', $c->ident, 0);
                 break;
+        }
+        // Ein Befehl an die Zone hebt die Offline-Sperre sofort auf: wer einschaltet, will
+        // nicht bis zu einer Minute auf die naechste Erreichbarkeitspruefung warten.
+        $rt = $this->readRt();
+        if (!empty($rt['offlineSince'])) { $rt['offlineSince'] = 0; $this->writeRt($rt); }
+
+        // Nach dem Befehl kurz nachlesen, damit die Kachel nicht bis zum naechsten Abfragetakt
+        // den alten Zustand zeigt. Beim ersten Versuch machte das alles LANGSAMER, weil sieben
+        // stromlose Zonen je Abruf sieben bis acht Sekunden in die Zeitueberschreitung liefen -
+        // ein zusaetzlicher Abruf legte auf eine blockierte Kette noch einen drauf. Seit tote
+        // Zonen zurueckgestellt werden (OFFLINE_RETRY_S) kostet ein Abruf rund 100 ms, und der
+        // Anstoss tut das, wofuer er gedacht war.
+        //
+        // Nicht bei Position: dort laeuft der Wert ohnehin weiter, und ein Nachlesen mitten im
+        // Suchlauf liest daneben.
+        if ($c->ident !== 'Position') {
+            $this->SetTimerInterval(self::TIMER_KICK, self::KICK_MS);
         }
     }
 
@@ -369,11 +403,35 @@ class AudioZone extends EntityModule
 
     public function Refresh(): void
     {
+        $this->SetTimerInterval(self::TIMER_KICK, 0);   // Ein-Schuss: nach dem Lauf wieder aus
         $drv = $this->driver();
         if (!$drv instanceof IAudioStateReadable) {
             return; // Push-Treiber spiegeln ueber parseEvent (spaeter, Bridge)
         }
+
+        // NICHT ERREICHBARE ZONE NUR SELTEN ANKLOPFEN.
+        //
+        // Ein Abruf besteht aus mehreren SOAP-Aufrufen mit je zwei Sekunden Zeitgrenze. Ist das
+        // Geraet aus oder vom Netz, laeuft jeder einzelne in die Grenze - gemessen sieben bis
+        // acht Sekunden fuer EINEN Abruf. Bei sieben abgeschalteten Zonen im Fuenf-Sekunden-Takt
+        // ist die Kette dauerhaft blockiert, und auch die erreichbaren Zonen reagieren traege.
+        //
+        // Darum: wer beim letzten Mal nicht geantwortet hat, wird erst nach OFFLINE_RETRY_S
+        // wieder gefragt. Ein Befehl an die Zone hebt die Sperre sofort auf (siehe applyControl),
+        // damit ein Einschalten nicht bis zu einer Minute wartet.
+        // Der Merker liegt im vorhandenen Laufzeitspeicher, nicht in einem neuen Attribut:
+        // ein nachtraeglich eingefuehrtes Attribut fehlt bestehenden Instanzen, bis sie neu
+        // angelegt werden - und jeder Lesezugriff darauf scheitert.
+        $rt = $this->readRt();
+        $letzte = (int) ($rt['offlineSince'] ?? 0);
+        if ($letzte > 0 && (time() - $letzte) < self::OFFLINE_RETRY_S) {
+            return;
+        }
+
         $st = $drv->readState();
+        $rt = $this->readRt();
+        $rt['offlineSince'] = $st->online ? 0 : time();
+        $this->writeRt($rt);
         $this->setReflect('Title', $st->title);
         $this->setReflect('Artist', $st->artist);
         $this->setReflect('Album', $st->album);
@@ -651,13 +709,24 @@ class AudioZone extends EntityModule
             case 'playDirect':
                 return $this->mgmtPlayDirect($args);
             case 'radioStations':
+                // Logo und Herkunft mitgeben: die Oberflaeche soll eigene Sender kenntlich
+                // machen koennen und braucht das Bild, ohne es selbst zu wissen.
                 $list = [];
-                foreach (RadioNow::STATIONS as $k => $s) {
-                    $list[] = ['key' => $k, 'title' => $s['title']];
+                foreach (RadioNow::all() as $k => $s) {
+                    $list[] = [
+                        'key'   => $k,
+                        'title' => (string) ($s['title'] ?? $k),
+                        'logo'  => (string) ($s['logo'] ?? ''),
+                        'eigen' => !empty($s['eigen']),
+                    ];
                 }
                 return ['ok' => true, 'stations' => $list];
             case 'playContent':
                 return $this->mgmtPlayContent($args);
+            case 'playContainer':
+                return $this->mgmtPlayContainer($args);
+            case 'cancelEnqueue':
+                return $this->mgmtCancelEnqueue();
             default:
                 return parent::mgmt($op, $args, $ctx);
         }
@@ -1008,6 +1077,203 @@ class AudioZone extends EntityModule
         return ['ok' => true] + $data;
     }
 
+    /**
+     * Treiber fuer Warteschlangen-Betrieb besorgen.
+     *
+     * Drei Stufen, in dieser Reihenfolge:
+     *  1. der GEBUNDENE Treiber, wenn er Warteschlangen beherrscht (IAudioQueue),
+     *  2. sonst ein sonos-upnp aus IP und RINCON des Raums - das ist die Kruecke, die
+     *     frueher hart in mgmtPlayContent stand und den konfigurierten Treiber umging,
+     *  3. sonst null: dann antwortet der Aufrufer ehrlich mit "nicht unterstuetzt",
+     *     statt so zu tun, als waere etwas passiert.
+     */
+    private function queueDriver(): ?IAudioQueue
+    {
+        $drv = $this->driver();
+        if ($drv instanceof IAudioQueue) {
+            return $drv;
+        }
+        [$ip, $rin] = $this->resolveSpeaker();
+        if ($ip === '') {
+            return null;
+        }
+        $d = DriverFactory::create('sonos-upnp', ['host' => $ip, 'rincon' => $rin, 'timeout' => 3000]);
+        return ($d instanceof IAudioQueue) ? $d : null;
+    }
+
+    /** Laufendes Einreihen abbrechen: Restliste verwerfen, Timer aus. */
+    private function mgmtCancelEnqueue(): array
+    {
+        $rt   = $this->readRt();
+        $rest = count((array) (($rt['enq'] ?? [])['refs'] ?? []));
+        unset($rt['enq'], $rt['enqBusy']);
+        $this->writeRt($rt);
+        $this->SetTimerInterval(self::TIMER_ENQ, 0);
+        return ['ok' => true, 'verworfen' => $rest];
+    }
+
+    /**
+     * Naechster Block der laufenden Einreihung.
+     *
+     * Wird vom Timer gerufen und haengt ENQ_BLOCK Titel an, bis nichts mehr uebrig ist.
+     * Zwei Sicherungen: ohne Treiber oder ohne Restliste schaltet der Timer sich ab, und
+     * eine Einreihung, die aelter als zehn Minuten ist, gilt als verwaist und wird
+     * verworfen - sonst wuerde ein Neustart mitten im Lauf sie ewig weiterschleppen.
+     */
+    public function RunEnqueue(): void
+    {
+        // Der Timer laeuft DURCH und wird erst abgeschaltet, wenn nichts mehr aussteht.
+        // Zwei Versuche zuvor sind gescheitert: bei 250 ms Takt liefen mehrere Durchgaenge
+        // gleichzeitig und reihten doppelt ein (240 statt 200 Titel); das Abschalten am
+        // Anfang mit Wiederanschalten am Ende desselben Laufs kam beim Kernel nicht an -
+        // der Timer blieb aus und 177 Titel lagen liegen. Jetzt haelt allein die Sperre
+        // die Durchgaenge auseinander, und der Takt ist laenger als ein Block braucht.
+        // KEINE IPS-Sperre mehr: eine solche blieb nach einem abgebrochenen Lauf haengen und
+        // liess sich weder freigeben noch neu belegen - danach kehrte jeder Durchgang sofort
+        // zurueck und 177 Titel blieben liegen. Der Merker im Laufzeitspeicher heilt sich
+        // selbst: nach 30 s gilt ein Lauf als tot und der naechste uebernimmt.
+        $rt   = $this->readRt();
+        $seit = (int) ($rt['enqBusy'] ?? 0);
+        if ($seit > 0 && (time() - $seit) < 30) {
+            return;
+        }
+        $rt['enqBusy'] = time();
+        $this->writeRt($rt);
+        try {
+            // In eigenem Thread: bis zum Ende durchziehen. Die Obergrenze ist der Deckel
+            // aus playContainer, mehr als ein paar Dutzend Bloecke kann es nie geben.
+            for ($i = 0; $i < 60; $i++) {
+                if (!$this->enqueueStep()) {
+                    break;
+                }
+            }
+        } finally {
+            $rt = $this->readRt();
+            unset($rt['enqBusy']);
+            $this->writeRt($rt);
+        }
+    }
+
+    private function enqueueStep(): bool
+    {
+        $rt   = $this->readRt();
+        $enq  = (array) ($rt['enq'] ?? []);
+        $refs = (array) ($enq['refs'] ?? []);
+        if ($refs === [] || (time() - (int) ($enq['ts'] ?? 0)) > 600) {
+            unset($rt['enq']);
+            $this->writeRt($rt);
+            return false;
+        }
+        $drv = $this->queueDriver();
+        if ($drv === null) {
+            unset($rt['enq']);
+            $this->writeRt($rt);
+            return false;
+        }
+        $block = array_splice($refs, 0, self::ENQ_BLOCK);
+        foreach ($block as $r) {
+            $c = ContentRef::fromArray((array) $r);
+            if ($c->uri !== '') {
+                $drv->addToQueue($c->toSourceRef());
+            }
+        }
+        if ($refs === []) {
+            unset($rt['enq']);
+            $this->writeRt($rt);
+            $this->SetTimerInterval(self::TIMER_KICK, self::KICK_MS);
+            return false;
+        }
+        $rt['enq'] = ['refs' => $refs, 'ts' => (int) ($enq['ts'] ?? time())];
+        $this->writeRt($rt);
+        return true;
+    }
+
+    /**
+     * Eine ganze Sammlung abspielen oder an die Warteschlange anhaengen.
+     *
+     * Erwartet die bereits aufgeloeste Titelliste (der Hub kennt die Provider, dieses Modul
+     * den Player - die Trennung bleibt). $args:
+     *   tracks[]  ContentRef-Datensaetze in Abspielreihenfolge
+     *   mode      'replace' (Vorgabe) oder 'append'
+     *   dryRun    true = nur melden, was passieren wuerde; nichts senden
+     *   title     Anzeigename der Sammlung (nur fuer die Rueckmeldung)
+     */
+    private function mgmtPlayContainer(array $args): array
+    {
+        $roh   = (array) ($args['tracks'] ?? []);
+        $mode  = ((string) ($args['mode'] ?? 'replace') === 'append') ? 'append' : 'replace';
+        $trock = (bool) ($args['dryRun'] ?? false);
+        $titel = (string) ($args['title'] ?? '');
+
+        $refs = [];
+        foreach ($roh as $r) {
+            $c = ContentRef::fromArray((array) $r);
+            if ($c->uri !== '') {
+                $refs[] = $c;
+            }
+        }
+        if ($refs === []) {
+            return ['ok' => false, 'error' => 'keine abspielbaren Titel'];
+        }
+
+        $drv = $this->queueDriver();
+        if ($drv === null) {
+            return ['ok' => false, 'error' => 'unsupported',
+                    'note' => 'Dieser Player kann keine Warteschlange'];
+        }
+
+        // Gruppenmitglied: die eigene Warteschlange waere stumm, es spielt der Koordinator.
+        // In dieser Stufe wird das gesperrt und gesagt - Umleiten kommt spaeter.
+        $rolle = '';
+        try {
+            $g = $drv->readGroup();
+            $rolle = (string) ($g['role'] ?? '');
+        } catch (\Throwable $e) {
+            $rolle = '';
+        }
+        if ($rolle === 'member') {
+            return ['ok' => false, 'error' => 'group_member',
+                    'note' => 'Dieser Raum ist Mitglied einer Gruppe - bitte im Koordinator abspielen'];
+        }
+
+        if ($trock) {
+            return ['ok' => true, 'dryRun' => true, 'count' => count($refs), 'mode' => $mode,
+                    'title' => $titel, 'note' => 'Trockenlauf: WUERDE ' . count($refs) . ' Titel einreihen'];
+        }
+        if (!(bool) $this->cfgVal('armed', false)) {
+            return ['ok' => true, 'armed' => false, 'count' => count($refs), 'mode' => $mode,
+                    'title' => $titel, 'note' => 'Schatten: WUERDE ' . count($refs) . ' Titel einreihen'];
+        }
+
+        // Haeppchenweise: die ersten Titel sofort, damit binnen etwa einer Sekunde Ton
+        // kommt (gemessen 164 ms je Titel - 200 Titel am Stueck waeren 33 s Stille), der
+        // Rest laeuft ueber den Zonen-Timer nach. Der Aufruf kehrt sofort zurueck.
+        $sofort = array_slice($refs, 0, self::ENQ_FIRST);
+        $rest   = array_slice($refs, self::ENQ_FIRST);
+        $srcs   = array_map(static fn($c) => $c->toSourceRef(), $sofort);
+        $n      = $drv->playSourceList($srcs, $mode);
+
+        $rt = $this->readRt();
+        unset($rt['radioCache']);
+        if ($rest !== []) {
+            // Ab hier wird IMMER angehaengt - das Leeren ist im ersten Block passiert.
+            $rt['enq'] = ['refs' => array_map(static fn($c) => $c->toArray(), $rest), 'ts' => time()];
+        } else {
+            unset($rt['enq']);
+        }
+        $this->writeRt($rt);
+        // Der Rest laeuft in einem EIGENEN Thread weiter. Ein dafuer registrierter Timer
+        // wurde von diesem Kernel nicht in den Ablaufplan uebernommen (Faelligkeit wanderte
+        // in die Vergangenheit, LastRun blieb leer) - IPS_RunScriptText startet dagegen
+        // sofort einen Thread und kehrt zurueck, ganz ohne Zeitplanung.
+        if ($rest !== [] && function_exists('IPS_RunScriptText')) {
+            @\IPS_RunScriptText('<?php HSAU_RunEnqueue(' . $this->InstanceID . ');');
+        }
+        $this->SetTimerInterval(self::TIMER_KICK, self::KICK_MS);
+        return ['ok' => true, 'count' => $n, 'wanted' => count($refs), 'mode' => $mode,
+                'title' => $titel, 'queued' => count($rest)];
+    }
+
     /** Aufgeloesten Bibliotheks-Inhalt (ContentRef) auf diesem Renderer abspielen. */
     private function mgmtPlayContent(array $args): array
     {
@@ -1018,11 +1284,10 @@ class AudioZone extends EntityModule
         if (!(bool) $this->cfgVal('armed', false)) {
             return ['ok' => true, 'armed' => false, 'note' => 'Schatten: WUERDE abspielen', 'title' => $ref->title];
         }
-        [$ip, $rin] = $this->resolveSpeaker();
-        if ($ip === '') {
+        $drv = $this->queueDriver();
+        if ($drv === null) {
             return ['ok' => false, 'error' => 'Speaker nicht aufloesbar'];
         }
-        $drv = DriverFactory::create('sonos-upnp', ['host' => $ip, 'rincon' => $rin, 'timeout' => 3000]);
         $drv->playSource($ref->toSourceRef());
         $rt = $this->readRt(); unset($rt['radioCache']); $this->writeRt($rt);
         return ['ok' => true, 'title' => $ref->title, 'provider' => $ref->provider, 'kind' => $ref->kind];
@@ -1043,7 +1308,7 @@ class AudioZone extends EntityModule
         if ($ip === '') {
             return ['ok' => false, 'error' => 'Speaker nicht aufloesbar'];
         }
-        $title = (string) (RadioNow::STATIONS[$key]['title'] ?? 'Radio');
+        $title = (string) (RadioNow::all()[$key]['title'] ?? 'Radio');
         $drv = DriverFactory::create('sonos-upnp', ['host' => $ip, 'rincon' => $rin, 'timeout' => 3000]);
         $drv->playSource(new AudioSourceRef(AudioSourceRef::KIND_STATION, $key, $title, $url));
         // Cache invalidieren, damit der neue Titel sofort gezogen wird.

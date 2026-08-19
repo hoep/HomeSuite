@@ -85,6 +85,7 @@ class ShadingDevice extends EntityModule
     private const RAIN_ID        = 19991;    // Regen
     private const BRIGHT_ID      = 53778;    // Helligkeit
     private const WIND_STORM_KMH = 45.0;     // Sturm-Schwelle (km/h)
+    private const BUS_GAP_MS     = 4000;     // Mindestabstand zweier Funktelegramme (haus-weit, Hub-Vorgabe)
 
     /**
      * Vertrag 2 — das Manifest dieser Entitaet. Aus ihm legt die Basis die
@@ -365,6 +366,10 @@ class ShadingDevice extends EntityModule
         if ($hw > 0) { $merged['windStormKmh'] = $hw; }
         $hs = (int) $this->hubProp('ShadeSafePos', 0);
         if ($hs > 0) { $merged['safePos'] = $hs; }
+        // Bus-Abstand: AUSSCHLIESSLICH haus-weit. Er beschreibt die gemeinsame Luftschnittstelle,
+        // nicht das einzelne Rollo - je Rollo einstellbar waere er sinnlos, weil das langsamste
+        // Geraet ohnehin den Takt aller anderen bestimmt.
+        $merged['busGapMs'] = max(0, (int) $this->hubProp('ShadeBusGapMs', self::BUS_GAP_MS));
         // REGEN IST OPT-IN JE GERAET (Vorgabe): hier hat frueher der Hub-Schalter
         // ShadeRainClose bedingungslos gewonnen -> Regen haette ALLE 17 Rollos gefahren,
         // obwohl in IPSShadowing nur die Markise ein Wetterprofil hatte. Der Hub-Override
@@ -666,31 +671,44 @@ class ShadingDevice extends EntityModule
         }
         $drv = $this->driver();
         if (!$drv instanceof IShutter) {
-            return; // kein (Shutter-)Treiber gebunden -> Schatten-Modus
+            // Kein Treiber gebunden: es faehrt nichts. Dann darf auch der Sollwert nicht
+            // stehenbleiben - die Basisklasse hat ihn vor diesem Aufruf schon geschrieben.
+            $this->mirrorBack($c->ident);
+            return;
         }
-        // Ist-Lage fuer den Tuer-Guard: readPosition() liefert bei rueckmeldungslosen
-        // Treibern (Somfy) IMMER -1, damit lief der Guard im Handbetrieb ins Leere.
-        // estPos() nimmt die geschaetzte/gespiegelte Lage und macht ihn wirksam.
+        // TUER-GUARD: gilt auch fuer den ausdruecklichen Befehl.
+        //
+        // Ein konfigurierter Tuerkontakt ist eine Zusage an die Mechanik - ein Rollo faehrt nicht
+        // in eine offene Terrassentuer, egal ob Zeitplan, Kachel oder Skript den Befehl gibt.
+        // Auffahren und der Sturm-Rueckzug bleiben immer erlaubt, geblockt wird nur das Zufahren.
+        //
+        // Was frueher falsch war, ist NICHT der Guard, sondern sein Nachlauf: die Basisklasse
+        // schreibt den Sollwert, bevor applyControl ueberhaupt entscheiden kann. Brach der Guard
+        // danach ab, meldete die Buchfuehrung "zu", waehrend das Rollo offen stand - so stand
+        // Esszimmer Mitte am 17.08.2026 auf Position 100 bei Ist 0, und die Automatik hielt sich
+        // fuer fertig. Deshalb: blocken UND den Sollwert auf die belegte Lage zuruecknehmen.
         $curForGuard = $drv->readPosition();
         if ($curForGuard === IShutter::POS_UNKNOWN) { $curForGuard = $this->estPos(); }
         switch ($c->ident) {
             case 'Position':
                 $p = (int) max(self::POS_MIN, min(self::POS_MAX, (int) round((float) $value)));
                 if ($this->closeBlockedByDoor($curForGuard, $p)) {
-                    $this->SendDebug('HSSH.guard', 'Tuer offen -> manuelles Zufahren auf ' . $p . '% blockiert', 0);
+                    $this->setBlock('Tür offen');
+                    $this->SendDebug('HSSH.guard', 'Tuer offen -> Zufahren auf ' . $p . '% blockiert (Befehl)', 0);
+                    $this->mirrorBack('Position');   // Sollwert zurueck: es ist nichts gefahren
                     break;
                 }
                 $this->driveTo($drv, $p); // ueber den Executor: zeitbasiert bei Somfy, mit Ramp + Positions-Rueckmeldung
                 break;
             case 'Movement':
                 // Auf/Zu ueber den Executor (Endanschlag, selbstkalibrierend + Rueckmeldung); Stopp beendet die laufende Fahrt.
-                // Zufahren unterliegt demselben Tuer-Guard wie der Positionsbefehl (vorher lief
-                // Movement komplett daran vorbei -> Rollo konnte in die offene Tuer fahren).
                 $mv = (int) $value;
                 if ($mv === 1)      { $this->driveTo($drv, self::POS_MIN); }   // auf
                 elseif ($mv === 2)  {
                     if ($this->closeBlockedByDoor($curForGuard, self::POS_MAX)) {
-                        $this->SendDebug('HSSH.guard', 'Tuer offen -> manuelles Zufahren (Taste Zu) blockiert', 0);
+                        $this->setBlock('Tür offen');
+                        $this->SendDebug('HSSH.guard', 'Tuer offen -> Zufahren (Taste Zu) blockiert', 0);
+                        $this->mirrorBack('Position');
                         break;
                     }
                     $this->driveTo($drv, self::POS_MAX);
@@ -743,9 +761,27 @@ class ShadingDevice extends EntityModule
                 if ($socketId <= 0 || $channel < 1 || $channel > 16) {
                     return null; // unvollstaendig konfiguriert -> Schatten-Modus
                 }
-                $send = static function ($frame) use ($socketId): void {
-                    if (function_exists('CSCK_SendText')) {
-                        @\CSCK_SendText($socketId, (string) $frame);
+                // Der Callback MELDET jetzt, statt zu schweigen.
+                //
+                // Vorher stand hier ein @ vor dem Aufruf und die Rueckgabe wurde verworfen. Ein
+                // Telegramm, das den Socket nie erreicht, war damit nicht von einem gesendeten zu
+                // unterscheiden - und das Modul buchte die Fahrt trotzdem als erledigt. Genau
+                // diese Blindheit macht die Fehlersuche vom 17./18.08.2026 unmoeglich.
+                $send = static function ($frame) use ($socketId): array {
+                    if (!function_exists('CSCK_SendText')) {
+                        return ['ok' => false, 'status' => 0, 'err' => 'CSCK_SendText nicht vorhanden'];
+                    }
+                    $status = 0;
+                    try {
+                        $status = (int) (@\IPS_GetInstance($socketId)['InstanceStatus'] ?? 0);
+                    } catch (\Throwable $e) {
+                        // Instanz weg oder kein Socket - der Status bleibt 0 und faellt unten auf
+                    }
+                    try {
+                        $r = \CSCK_SendText($socketId, (string) $frame);
+                        return ['ok' => ($r !== false), 'status' => $status, 'err' => ''];
+                    } catch (\Throwable $e) {
+                        return ['ok' => false, 'status' => $status, 'err' => $e->getMessage()];
                     }
                 };
                 $this->driverInstance = DriverFactory::create('somfy-rts', [
@@ -753,6 +789,7 @@ class ShadingDevice extends EntityModule
                     'repeat'     => (int) ($cfg['repeat'] ?? 3),
                     'stopRepeat' => (int) ($cfg['stopRepeat'] ?? 4),
                     'gapMs'      => (int) ($cfg['gapMs'] ?? 50),
+                    'busGapMs'   => (int) ($cfg['busGapMs'] ?? self::BUS_GAP_MS),
                     'invert'     => (bool) ($cfg['invert'] ?? false),
                 ], $send);
             } elseif ($driverId === 'hm-shutter') {
@@ -1296,6 +1333,17 @@ class ShadingDevice extends EntityModule
         return max(2, $this->ReadPropertyInteger('QueryInterval')) * 1000;
     }
 
+    /**
+     * Fester Startversatz dieser Instanz innerhalb eines Abfragezyklus (0 .. Intervall).
+     * Aus der Instanz-ID abgeleitet, damit derselbe Rollo immer denselben Platz bekommt und
+     * ein Sweep ueber alle Instanzen sie trotzdem gleichmaessig verteilt.
+     */
+    private function phaseOffsetMs(): int
+    {
+        $slots = 16;                                   // so viele Rollos teilen sich den Funkbus
+        return (int) (($this->InstanceID % $slots) * ($this->refreshMs() / $slots));
+    }
+
     public function ApplyChanges()
     {
         parent::ApplyChanges();
@@ -1305,7 +1353,19 @@ class ShadingDevice extends EntityModule
 
         $drv    = $this->driver();
         $active = $drv instanceof IShutter;
-        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? $this->refreshMs() : 0);
+        // PHASENVERSATZ, NICHT GLEICHTAKT.
+        //
+        // SetTimerInterval zaehlt ab JETZT. Laeuft ApplyChanges ueber mehrere Instanzen -
+        // ein Konfigurationslauf, ein Modul-Reload, eine Migration -, starten danach alle
+        // Rollo-Timer in derselben Sekunde, und beim ersten Tick faehrt die ganze Fassade
+        // gleichzeitig los. Am 17.08.2026 gingen so 15 Fahrbefehle in 12 Sekunden ueber
+        // EINEN Funksender; gefahren ist genau eines. Dieselbe Menge lief morgens ueber die
+        // Minute verteilt fehlerfrei - der Unterschied war allein der Gleichtakt.
+        //
+        // Der erste Tick bekommt deshalb einen festen, aus der Instanz-ID abgeleiteten
+        // Aufschlag; Refresh() setzt danach das normale Intervall. Der Versatz ist stabil
+        // (gleiche Instanz -> gleicher Platz im Reigen) und braucht keinen Zufall.
+        $this->SetTimerInterval(self::TIMER_REFRESH, $active ? ($this->refreshMs() + $this->phaseOffsetMs()) : 0);
         $this->registerWatches($drv);
         $this->syncReferences();
         $this->updateHealth();
@@ -1539,6 +1599,9 @@ class ShadingDevice extends EntityModule
         if (!$drv instanceof IShutter) {
             return;
         }
+        // Nach dem ersten (versetzten) Tick auf das normale Intervall zurueck; der einmal
+        // gewonnene Phasenversatz bleibt dabei erhalten, weil ab hier alles gleich lang wartet.
+        $this->SetTimerInterval(self::TIMER_REFRESH, $this->refreshMs());
         // Waehrend der Kalibrierung nicht spiegeln: die Ist-Lage ist per Definition
         // unbekannt (roher Motorlauf ohne Bookkeeping) - reconcile() entscheidet
         // selbst, ob Sturm den Lock bricht.
@@ -2073,6 +2136,7 @@ class ShadingDevice extends EntityModule
         if (!$drift) {
             $this->setBlock('');           // steht schon richtig - kein Hindernis
             $rt['lastTarget'] = $target;
+            unset($rt['blockedTs'], $rt['blockedTarget']); // Blockade vorbei -> naechste wird wieder gemeldet
             $this->writeRt($rt);
             return;
         }
@@ -2080,8 +2144,18 @@ class ShadingDevice extends EntityModule
         if ($d['blockedByDoor']) {
             $this->setBlock('Tür offen');
             $this->SendDebug('HSSH.guard', 'Tuer offen -> Zufahren auf ' . $target . '% blockiert', 0);
-            if ($armed) { $this->logDecision((int) $cur, (int) $target, 'Tür blockiert', true, 'auto'); } // nur echte (scharfe) Ereignisse loggen
-            $rt['blockedTs'] = time();
+            // EINMAL protokollieren, nicht bei jedem Tick. Die Automatik versucht es im
+            // Abfragetakt weiter (richtig - sobald die Tuer zugeht, soll sie fahren), aber ein
+            // Eintrag je Minute ist keine Information mehr: am 17.08.2026 stammten 21 der 60
+            // sichtbaren Logzeilen von einer einzigen offenen Terrassentuer und haben alles
+            // andere aus dem Fenster gedraengt. Neu geloggt wird erst wieder, wenn sich das
+            // Ziel aendert oder die Blockade zwischendurch weg war.
+            $schonGemeldet = !empty($rt['blockedTs']) && (int) ($rt['blockedTarget'] ?? -1) === (int) $target;
+            if ($armed && !$schonGemeldet) {
+                $this->logDecision((int) $cur, (int) $target, 'Tür blockiert', true, 'auto');
+            }
+            $rt['blockedTs']     = time();
+            $rt['blockedTarget'] = (int) $target;
             $this->writeRt($rt);
             return;
         }
@@ -2092,6 +2166,7 @@ class ShadingDevice extends EntityModule
             // missdeutet werden.
             $rt['selfWriteTs']  = time();
             $rt['selfWriteVal'] = $target;
+            unset($rt['blockedTs'], $rt['blockedTarget']); // es faehrt -> naechste Blockade wieder melden
             $this->writeRt($rt);
             // Absolut-Treiber: moveTo. Travel-only (Somfy): zeitbasiert ueber driveTo.
             $this->driveTo($drv, (int) $target);
@@ -2386,6 +2461,42 @@ class ShadingDevice extends EntityModule
             return false;
         }
         return $target > $cur && $this->anyDoorOpen();
+    }
+
+    /**
+     * Setzt den Positions-Spiegel auf die zuletzt bekannte echte Lage zurueck.
+     *
+     * Symcons Basisklasse schreibt den Sollwert einer Control-Variable BEVOR applyControl()
+     * ueberhaupt entscheiden kann, ob gefahren wird. Bricht applyControl danach ab, bleibt eine
+     * Zahl stehen, die nie ein Motor gesehen hat - und der naechste Automatikabgleich haelt sich
+     * fuer fertig ("Ziel erreicht") und faehrt nie wieder. Genau dieser stille Selbstbetrug hat
+     * am 17.08.2026 die ganze Fassade eine Nacht lang offen stehen lassen.
+     *
+     * Keine Rueckmeldung heisst nicht: irgendetwas behaupten. Wenn nichts gefahren wurde, zaehlt
+     * die letzte belegte Lage.
+     *
+     * ACHTUNG, Grenze der Ehrlichkeit: bei Somfy RTS quittiert der Empfaenger nichts. Ein
+     * GESENDETES, aber verlorenes Telegramm ist von einem angekommenen nicht zu unterscheiden -
+     * dagegen hilft kein Spiegel, sondern nur der Bus-Abstand (ShadeBusGapMs).
+     */
+    private function mirrorBack(string $ident): void
+    {
+        if ($ident !== 'Position') {
+            return;
+        }
+        $real = $this->estPos();
+        if ($real === IShutter::POS_UNKNOWN) {
+            return; // nichts Belegtes da - dann lieber gar nichts behaupten
+        }
+        $vid = @$this->GetIDForIdent('Position');
+        if ($vid && (int) @GetValue($vid) !== (int) $real) {
+            $rt = $this->readRt();                 // eigenen Schreibvorgang markieren, sonst
+            $rt['selfWriteTs']  = time();          // deutet der Watcher ihn als Handeingriff
+            $rt['selfWriteVal'] = (int) $real;
+            $this->writeRt($rt);
+            $this->SetValue('Position', (int) $real);
+            $this->SendDebug('HSSH.mirror', 'Sollwert auf belegte Lage ' . $real . '% zurueckgesetzt (nicht gefahren)', 0);
+        }
     }
 
     /** Aktive Kreuzprodukt-Variante (Plan · Season). */

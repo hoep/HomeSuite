@@ -281,14 +281,25 @@ class BatteryManager extends IPSModule
         if (preg_match('/Automower\.Battery/i', $prof)) return null;                   // Maeher = Ladeakku, kein Wechselakku
         if (stripos($mod, 'Mower') !== false || stripos($mod, 'Automower') !== false || stripos($name, 'automower') !== false) return null;
         if (stripos($mod, 'Tempest') !== false || preg_match('/^Tempest_/i', $prof)) return null; // Solar/Hub (Tempest_battery_status, Tempest_volt, ...)
+        // Wetterstationen: die Tempest laedt ueber Solar, ihre Zellspannung schwankt im
+        // Tagesgang zwischen rund 2,3 und 2,8 V - da ist nichts zu wechseln. Der Ausschluss
+        // oben griff nur ueber den Modulnamen "Tempest"; seit die Spannung im eigenen
+        // Wettermodul gefuehrt wird, heisst das Modul anders und die Regel lief ins Leere.
+        if (in_array($mod, ['WeatherStation', 'WeatherSource', 'TempestListener'], true)) return null;
 
         $hay = strtolower($name . '|' . $ident . '|' . $prof);
         $looksBattery = (bool) preg_match('/batter|batterie|lowbat|low_bat|\bakku\b|battery/i', $hay);
 
         // --- Klassen ---
         // Prozent
+        // VOLT IST KEIN PROZENT. Der Ident allein entscheidet das nicht: eine Variable namens
+        // "Battery" kann eine Ladung in Prozent ODER eine Zellspannung sein. Wer das Profil
+        // uebergeht, liest 2,5 V als 2,5 % und meldet eine volle Batterie als leer.
+        $istSpannung = (bool) preg_match('/volt|spannung/i', $prof . '|' . $ident . '|' . $name);
         if ($prof === '~Battery.100' || preg_match('/Battery\.100/i', $prof)
-            || (in_array($ident, ['BatteryVariable', 'batteryLevel', 'Battery', 'Z2M_Battery', 'batteryState', 'Battery_Status'], true) && $type !== 0)
+            || (!$istSpannung
+                && in_array($ident, ['BatteryVariable', 'batteryLevel', 'Battery', 'Z2M_Battery', 'batteryState', 'Battery_Status'], true)
+                && $type !== 0)
             || (preg_match('/Gardena\.Battery|batteryLevel/i', $prof) && $type !== 0)) {
             if ($type === 0) { return ['class' => 'bool']; }
             return ['class' => 'pct'];

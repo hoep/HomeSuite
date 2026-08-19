@@ -267,6 +267,14 @@ final class ContentRef
             'contentKind'  => $this->kind,
             'cover'        => $this->cover,
             'isContainer'  => $this->isContainer,
+            // Interpret, Album, Dateityp und Dauer wurden hier bisher weggeworfen. Solange
+            // nur EIN Titel lief, fiel das nicht auf; sobald eine ganze Sammlung in der
+            // Warteschlange steht, ist sie die Anzeige und stuende ohne diese Angaben als
+            // Liste von Dateinamen da.
+            'artist'       => $this->artist,
+            'album'        => $this->album,
+            'mime'         => $this->mime,
+            'durationSec'  => $this->durationSec,
         ]);
     }
 }

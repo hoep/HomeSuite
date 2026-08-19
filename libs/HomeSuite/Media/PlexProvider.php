@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Hoep\HomeSuite\Media;
 
 use Hoep\HomeSuite\Contracts\IMediaProvider;
+use Hoep\HomeSuite\Contracts\IMediaWritable;
 use Hoep\HomeSuite\Engines\MediaProviders;
 use Hoep\HomeSuite\HAL\ContentRef;
 
@@ -16,7 +17,7 @@ use Hoep\HomeSuite\HAL\ContentRef;
  *
  * config: url (z. B. http://10.10.10.x:32400), token (X-Plex-Token)
  */
-final class PlexProvider implements IMediaProvider
+final class PlexProvider implements IMediaProvider, IMediaWritable
 {
     private string $url;
     private string $tok;
@@ -148,6 +149,131 @@ final class PlexProvider implements IMediaProvider
         }
         $j = json_decode($r, true);
         return is_array($j) ? $j : [];
+    }
+
+    // ==================================================================
+    // Schreiben (IMediaWritable): Playlists im Plex-Server anlegen
+    // ==================================================================
+
+    /** @var string|null Maschinenkennung des Servers (fuer die server://-Verweise) */
+    private ?string $mid = null;
+
+    /**
+     * Plex referenziert Inhalte beim Anlegen ueber server://<Maschinenkennung>/... — ohne
+     * die geht es nicht, und sie steht nur in der Wurzelantwort des Servers.
+     */
+    private function machineId(): string
+    {
+        if ($this->mid !== null) {
+            return $this->mid;
+        }
+        $j = $this->get('/');
+        $this->mid = (string) ($j['MediaContainer']['machineIdentifier'] ?? '');
+        return $this->mid;
+    }
+
+    /** ratingKeys der eigenen Titel aus den Verweisen ziehen (fremde ignorieren). */
+    private function keysOf(array $refs): array
+    {
+        $keys = [];
+        foreach ($refs as $r) {
+            if (!$r instanceof ContentRef || $r->provider !== 'plex') {
+                continue;
+            }
+            if (strncmp($r->id, 'track:', 6) === 0) {
+                $k = substr($r->id, 6);
+                if ($k !== '') {
+                    $keys[] = $k;
+                }
+            }
+        }
+        return array_values(array_unique($keys));
+    }
+
+    /** Aufruf mit Methode (POST/PUT/DELETE) — get() kann nur lesen. */
+    private function send(string $method, string $path): array
+    {
+        if (!function_exists('curl_init')) {
+            return ['ok' => false, 'code' => 0];
+        }
+        $url = $this->url . $path . (strpos($path, '?') !== false ? '&' : '?')
+             . 'X-Plex-Token=' . rawurlencode($this->tok);
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 12, CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_CUSTOMREQUEST => $method, CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        ]);
+        $r = (string) curl_exec($ch);
+        $c = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        $j = json_decode($r, true);
+        return ['ok' => ($c >= 200 && $c < 300), 'code' => $c, 'json' => is_array($j) ? $j : []];
+    }
+
+    public function createPlaylist(string $name, array $refs): ?ContentRef
+    {
+        $name = trim($name);
+        $keys = $this->keysOf($refs);
+        $mid  = $this->machineId();
+        if ($name === '' || $keys === [] || $mid === '') {
+            return null;   // Plex legt keine leere Playlist an
+        }
+        $uri = 'server://' . $mid . '/com.plexapp.plugins.library/library/metadata/' . implode(',', $keys);
+        $r = $this->send('POST', '/playlists?type=audio&smart=0&title=' . rawurlencode($name)
+                                . '&uri=' . rawurlencode($uri));
+        if (empty($r['ok'])) {
+            return null;
+        }
+        $m = ($r['json']['MediaContainer']['Metadata'][0] ?? []);
+        $key = (string) ($m['key'] ?? '');
+        if ($key === '') {
+            return null;
+        }
+        return new ContentRef('plex', 'container', 'key:' . $key, '',
+            (string) ($m['title'] ?? $name), '', '', $this->thumb((string) ($m['composite'] ?? '')), '', 0, true);
+    }
+
+    public function addToPlaylist(string $playlistId, array $refs): int
+    {
+        $keys = $this->keysOf($refs);
+        $mid  = $this->machineId();
+        // Die Oberflaeche haelt Playlists als 'key:/playlists/<id>/items' - daraus die Nummer.
+        if (preg_match('~(\d+)~', $playlistId, $mm)) {
+            $playlistId = $mm[1];
+        }
+        if ($keys === [] || $mid === '' || $playlistId === '') {
+            return 0;
+        }
+        $uri = 'server://' . $mid . '/com.plexapp.plugins.library/library/metadata/' . implode(',', $keys);
+        $r = $this->send('PUT', '/playlists/' . rawurlencode($playlistId) . '/items?uri=' . rawurlencode($uri));
+        return empty($r['ok']) ? 0 : count($keys);
+    }
+
+    public function playlists(): array
+    {
+        $j = $this->get('/playlists?playlistType=audio');
+        $out = [];
+        foreach ((array) ($j['MediaContainer']['Metadata'] ?? []) as $m) {
+            if (!empty($m['smart'])) {
+                continue;   // regelbasiert - nimmt keine Handzugaben an
+            }
+            $n = (int) ($m['leafCount'] ?? 0);
+            $out[] = new ContentRef('plex', 'container', 'key:' . (string) ($m['key'] ?? ''), '',
+                (string) ($m['title'] ?? ''), $n > 0 ? ($n . ' Titel') : '', '',
+                $this->thumb((string) ($m['composite'] ?? '')), '', 0, true);
+        }
+        return $out;
+    }
+
+    public function deletePlaylist(string $playlistId): bool
+    {
+        if (preg_match('~(\d+)~', $playlistId, $mm)) {
+            $playlistId = $mm[1];
+        }
+        if ($playlistId === '') {
+            return false;
+        }
+        return !empty($this->send('DELETE', '/playlists/' . rawurlencode($playlistId))['ok']);
     }
 }
 

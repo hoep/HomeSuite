@@ -46,6 +46,7 @@ $__hs_files = [
     'Drivers/Audio/types.php',         // AudioState, AudioCapabilities, AudioSourceRef, AudioBrowseResult, ContentRef
     'Drivers/Light/types.php',         // LightState, LightCapabilities (Licht-HAL Value Objects)
     'Contracts/IMediaProvider.php',    // Quellen-Abstraktion (renderer-unabhaengig)
+    'Contracts/IMediaWritable.php',    // Zusatzvertrag: Playlists im Anbieter anlegen (optional)
 
     // --- HAL: Interfaces (kernel-frei, zustandslos) ---
     'HAL/IDriver.php',                 // Basis: bind/capabilities/discover/poll/parseEvent

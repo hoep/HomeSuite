@@ -79,6 +79,27 @@ interface IAudioRenderer extends IDriver
  * Die zugehoerigen CAP_QUEUE/CAP_TONE/CAP_SLEEPTIMER-Flags sind im v1-Core GESTRICHEN
  * und leben erst hier.
  */
+/**
+ * Warteschlange als EIGENER, schmaler Vertrag.
+ *
+ * Bewusst getrennt von IAudioRendererExtended: dort haengen Queue, Klangregelung und
+ * Einschlafzeit zusammen in einem Interface, man kann also die Warteschlange nicht
+ * anbieten, ohne den Rest mitzuschleppen. Hier soll die Frage "kann dieser Player eine
+ * Warteschlange?" ehrlich mit instanceof beantwortbar sein - davon haengt ab, ob die
+ * Oberflaeche die Tasten "Alles abspielen"/"Anhaengen" ueberhaupt zeigt.
+ */
+interface IAudioQueue extends IAudioRenderer
+{
+    /** Warteschlange leeren. */
+    public function clearQueue(): void;
+
+    /** Einen Titel einreihen; liefert die neue Laenge der Warteschlange (0 = unbekannt). */
+    public function addToQueue(AudioSourceRef $ref, bool $asNext = false): int;
+
+    /** Auf die Warteschlange umschalten und ab $index abspielen. */
+    public function startQueue(int $index = 0): void;
+}
+
 interface IAudioRendererExtended extends IAudioRenderer
 {
     public function addToQueue(AudioSourceRef $ref): void;   // CAP_QUEUE

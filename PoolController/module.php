@@ -239,6 +239,7 @@ class PoolController extends EntityModule
                 ['op' => 'poll',                'label' => 'Jetzt abfragen'],
                 ['op' => 'readRaw',             'label' => 'Rohdaten lesen (Diagnose)'],
                 ['op' => 'readErrors',          'label' => 'Fehlerlog lesen'],
+                ['op' => 'writeBudget',         'label' => 'Schreibbremse: Stand abfragen (liest)'],
                 ['op' => 'clearErrors',         'label' => 'Fehlerlog loeschen (schreibt)'],
                 ['op' => 'setRelayMode',        'label' => 'Relais Auto/Manuell (schreibt)'],
                 ['op' => 'doDosage',            'label' => 'Manuelle Dosierung (schreibt)'],
@@ -367,6 +368,9 @@ class PoolController extends EntityModule
         $this->RegisterPropertyInteger('ConnectTimeout', 5);
         $this->RegisterPropertyBoolean('UseHTTPS', false);
         $this->RegisterPropertyInteger('PollInterval', self::POLL_MS_DEF);
+        // Schreibbremse: Mindestabstand zwischen zwei Schreibvorgaengen und Stundenbudget.
+        $this->RegisterPropertyInteger('WriteGapMs', 2000);
+        $this->RegisterPropertyInteger('WritesPerHour', 60);
         // Spaltenzuordnung
         $this->RegisterPropertyInteger('PoolTempCol', 8);
         $this->RegisterPropertyInteger('OutsideCol', 9);
@@ -1403,20 +1407,171 @@ class PoolController extends EntityModule
     }
 
     /**
-     * Fuehrt eine Schreiboperation serialisiert aus (Semaphore je Sektion), damit
-     * Poll-Timer und Bedienung nicht gleichzeitig auf usrcfg.cgi schreiben.
+     * Fuehrt eine Schreiboperation serialisiert und GEBREMST aus.
+     *
+     * Der Controller ist ein kleines Geraet mit einer einzigen CGI-Schnittstelle: kommen
+     * mehrere Schreibvorgaenge dicht hintereinander, steigt er aus. Deshalb sind hier drei
+     * Dinge uebereinandergelegt:
+     *
+     *  1. Semaphore je Sektion - zwei Threads schreiben nie dieselbe usrcfg-Sektion gleichzeitig.
+     *  2. Semaphore je GERAET - auch verschiedene Sektionen gehen nacheinander zum Controller.
+     *  3. Mindestabstand + Stundenbudget - siehe bremse(). Reisst das Budget, wird NICHT
+     *     geschrieben und der Aufrufer bekommt einen klaren Fehler statt eines stillen Verlusts.
+     *
+     * Der Mindestabstand wird ausgesessen (der Aufruf wartet), das Budget nicht: Warten macht
+     * eine einzelne Bedienung nur langsamer, ein gerissenes Budget bedeutet dagegen, dass
+     * gerade etwas im Kreis schreibt - und das darf nicht auch noch verzoegert durchlaufen.
      */
-    private function writeGuarded(string $section, callable $fn): array
+    private function writeGuarded(string $section, callable $fn, string $was = ''): array
     {
-        $sem = 'HSPC_' . $this->InstanceID . '_' . $section;
+        $sem  = 'HSPC_' . $this->InstanceID . '_' . $section;
+        $dev  = 'HSPC_' . $this->InstanceID . '_dev';
         $have = !function_exists('IPS_SemaphoreEnter') || @\IPS_SemaphoreEnter($sem, 5000);
+        $hDev = !function_exists('IPS_SemaphoreEnter') || @\IPS_SemaphoreEnter($dev, 15000);
         try {
-            return (array) $fn();
+            $stau = $this->bremse($section);
+            if ($stau !== null) {
+                return $stau;
+            }
+            $res = (array) $fn();
+            $this->schreibVermerk();
+            $this->schreibSpur($section, $was, (bool) ($res['ok'] ?? false));
+            return $res;
         } finally {
+            if ($hDev && function_exists('IPS_SemaphoreLeave')) {
+                @\IPS_SemaphoreLeave($dev);
+            }
             if ($have && function_exists('IPS_SemaphoreLeave')) {
                 @\IPS_SemaphoreLeave($sem);
             }
         }
+    }
+
+    /** Auskunft ueber die Schreibbremse: was ist verbraucht, wann ist wieder frei. */
+    private function mgmtWriteBudget(): array
+    {
+        $limit = max(0, (int) $this->ReadPropertyInteger('WritesPerHour'));
+        $gap   = max(0, (int) $this->ReadPropertyInteger('WriteGapMs'));
+        $a     = $this->bremsStand();
+        $jetzt = (int) round(microtime(true) * 1000);
+        $st    = array_values(array_filter(
+            array_map('intval', (array) ($a['stamps'] ?? [])),
+            static fn($t) => ($jetzt - $t) < 3600000
+        ));
+        $last  = (int) ($a['last'] ?? 0);
+        return [
+            'ok'          => true,
+            'limit'       => $limit,
+            'gapMs'       => $gap,
+            'verbraucht'  => count($st),
+            'frei'        => $limit > 0 ? max(0, $limit - count($st)) : null,
+            'letzterVorSek' => $last > 0 ? (int) round(($jetzt - $last) / 1000) : null,
+        ];
+    }
+
+    /**
+     * Spur jedes REALEN Schreibvorgangs. Beantwortet die Frage "schreibt das Modul staendig
+     * zurueck?" mit Belegen statt Vermutungen: hier steht jeder Zugriff mit Zeit, Sektion und
+     * Anlass. Der Poll taucht hier nie auf - er liest nur.
+     */
+    private function schreibSpur(string $section, string $was, bool $ok): void
+    {
+        $zeile = sprintf(
+            "%s  %-10s %-34s %s\n",
+            date('d.m.Y H:i:s'),
+            $section,
+            $was !== '' ? $was : '-',
+            $ok ? 'ok' : 'FEHLER'
+        );
+        $datei = '/tmp/hspc_writes.log';
+        @file_put_contents($datei, $zeile, FILE_APPEND);
+        $z = @file($datei, FILE_IGNORE_NEW_LINES);
+        if (is_array($z) && count($z) > 2000) {
+            @file_put_contents($datei, implode("\n", array_slice($z, -2000)) . "\n");
+        }
+        $this->SendDebug('HSPC.write', trim($zeile), 0);
+    }
+
+    /** Ablage der Schreibhistorie. Datei statt Attribut, damit sie ueber Threads hinweg gilt. */
+    private function bremsAkte(): string
+    {
+        return '/tmp/hspc_' . $this->InstanceID . '_writes.json';
+    }
+
+    private function bremsStand(): array
+    {
+        $j = @file_get_contents($this->bremsAkte());
+        $a = $j !== false ? json_decode((string) $j, true) : null;
+        return is_array($a) ? $a : ['last' => 0, 'stamps' => []];
+    }
+
+    /**
+     * Wartet den Mindestabstand ab und prueft das Budget. Rueckgabe null = darf schreiben,
+     * sonst die fertige Fehlerantwort.
+     */
+    private function bremse(string $section): ?array
+    {
+        $gap   = max(0, (int) $this->ReadPropertyInteger('WriteGapMs'));
+        $limit = max(0, (int) $this->ReadPropertyInteger('WritesPerHour'));
+        $a     = $this->bremsStand();
+        $jetzt = (int) round(microtime(true) * 1000);
+
+        // Budget: gleitendes Fenster ueber eine Stunde. 0 = unbegrenzt (bewusst abschaltbar).
+        if ($limit > 0) {
+            $fenster = array_values(array_filter(
+                array_map('intval', (array) ($a['stamps'] ?? [])),
+                static fn($t) => ($jetzt - $t) < 3600000
+            ));
+            if (count($fenster) >= $limit) {
+                $aeltest = min($fenster);
+                $frei    = (int) ceil((3600000 - ($jetzt - $aeltest)) / 1000);
+                $this->LogMessage(sprintf(
+                    'Schreibsperre: %d Schreibvorgaenge in der letzten Stunde erreicht das Limit (%d). '
+                    . 'Naechster Versuch fruehestens in %d s. Sektion: %s',
+                    count($fenster),
+                    $limit,
+                    $frei,
+                    $section
+                ), KL_WARNING);
+                return [
+                    'ok'      => false,
+                    'error'   => 'rate_limited',
+                    'note'    => sprintf('Schreiblimit erreicht (%d/h). Wieder frei in %d s.', $limit, $frei),
+                    'retryIn' => $frei,
+                ];
+            }
+        }
+
+        // Mindestabstand: fehlende Zeit aussitzen, damit zwei Bedienungen nicht kollidieren.
+        $last = (int) ($a['last'] ?? 0);
+        if ($gap > 0 && $last > 0) {
+            $warten = $gap - ($jetzt - $last);
+            if ($warten > 0) {
+                $warten = min($warten, $gap);   // Uhrspruenge duerfen nicht zu langen Wartezeiten fuehren
+                if (function_exists('IPS_Sleep')) {
+                    \IPS_Sleep($warten);
+                } else {
+                    usleep($warten * 1000);
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Erfolgten Schreibvorgang vermerken (Zeitpunkt + Fenster fuer das Budget). */
+    private function schreibVermerk(): void
+    {
+        $a     = $this->bremsStand();
+        $jetzt = (int) round(microtime(true) * 1000);
+        $st    = array_values(array_filter(
+            array_map('intval', (array) ($a['stamps'] ?? [])),
+            static fn($t) => ($jetzt - $t) < 3600000
+        ));
+        $st[]  = $jetzt;
+        if (count($st) > 500) {
+            $st = array_slice($st, -500);
+        }
+        @file_put_contents($this->bremsAkte(), json_encode(['last' => $jetzt, 'stamps' => $st]));
     }
 
     // ==================================================================
@@ -1432,6 +1587,8 @@ class PoolController extends EntityModule
                 return $this->mgmtConfigureMapping($args, $ctx);
             case 'configureTReal':
                 return $this->mgmtConfigureTReal($args, $ctx);
+            case 'writeBudget':
+                return $this->mgmtWriteBudget();
             case 'getConfig':
                 $c = $this->cfg();
                 unset($c['pass']); // Passwort nie ausgeben
@@ -1800,7 +1957,7 @@ class PoolController extends EntityModule
         if ($cl === null) {
             return ['ok' => false, 'error' => 'not_configured'];
         }
-        $res = $this->writeGuarded($section, fn() => $fn($cl));
+        $res = $this->writeGuarded($section, fn() => $fn($cl), $what);
         return ['ok' => (bool) ($res['ok'] ?? false)] + (is_array($res) ? $res : []);
     }
 
@@ -3316,6 +3473,8 @@ class PoolController extends EntityModule
                         ['type' => 'NumberSpinner', 'name' => 'Timeout', 'caption' => 'Timeout (s)'],
                         ['type' => 'NumberSpinner', 'name' => 'ConnectTimeout', 'caption' => 'Connect-Timeout (s)'],
                         ['type' => 'NumberSpinner', 'name' => 'PollInterval', 'caption' => 'Poll-Intervall (ms)', 'minimum' => 5000],
+                        ['type' => 'NumberSpinner', 'name' => 'WriteGapMs', 'caption' => 'Mindestabstand zwischen Schreibvorgaengen (ms)', 'minimum' => 0],
+                        ['type' => 'NumberSpinner', 'name' => 'WritesPerHour', 'caption' => 'Schreibvorgaenge je Stunde (0 = unbegrenzt)', 'minimum' => 0],
                     ]],
                 ]],
 

@@ -124,6 +124,12 @@ class HomeSuiteHub extends EntityModule
         $this->RegisterPropertyInteger('ShadeSunAzId', 0);
         $this->RegisterPropertyInteger('ShadeSunElId', 0);
         $this->RegisterPropertyFloat('ShadeWindStormKmh', 50.0);
+        // Mindestabstand zwischen zwei Funktelegrammen IRGENDWELCHER Rollos. Haus-weit und
+        // nicht je Rollo, weil sich alle EINEN Sender und EINE Luftschnittstelle teilen: der
+        // Wert beschreibt den Bus, nicht das Geraet. Am 17.08.2026 gingen 15 Fahrbefehle im
+        // Abstand von 0,8 s raus und genau einer kam an - RTS quittiert nichts, also faellt
+        // so etwas nur dadurch auf, dass die Fassade offen bleibt.
+        $this->RegisterPropertyInteger('ShadeBusGapMs', 4000);
         $this->RegisterPropertyBoolean('ShadeRainClose', true);
         $this->RegisterPropertyInteger('ShadeSafePos', 0);
         // Nordausrichtung (Haus-Abweichung gegen Nord, °): dreht alle Sonnenprofile mit.
@@ -266,6 +272,37 @@ class HomeSuiteHub extends EntityModule
         }
         $items[] = ['type' => 'Button', 'caption' => 'Medienquellen speichern',
             'onClick' => 'echo HSH_Manage($id, json_encode(["op"=>"configureSources","args"=>[' . implode(',', $argParts) . ']]));'];
+
+        // --- Radiosender: eingebaute anzeigen, eigene pflegen ---------------------
+        // Die eingebauten stehen im Code und bleiben dort; eigene liegen im Hub und
+        // duerfen einen eingebauten Schluessel ueberschreiben (tote Adresse ersetzen).
+        $items[] = ['type' => 'Label', 'caption' => '— Radiosender —'];
+        $items[] = ['type' => 'Label', 'caption' => 'Alle Sender werden hier gepflegt; im Code steht keiner mehr. '
+            . 'Schluessel klein und ohne Leerzeichen. Erkennung = Textstuecke (kommagetrennt), an denen der vom '
+            . 'Player gemeldete Sendername erkannt wird; leer lassen nutzt Name und Schluessel.'];
+        $items[] = ['type' => 'List', 'name' => 'radioStations', 'caption' => 'Eigene Sender',
+            'rowCount' => 6, 'add' => true, 'delete' => true, 'sort' => ['column' => 'key', 'direction' => 'ascending'],
+            'columns' => [
+                ['caption' => 'Schluessel', 'name' => 'key', 'width' => '140px', 'add' => '',
+                    'edit' => ['type' => 'ValidationTextBox']],
+                ['caption' => 'Name', 'name' => 'title', 'width' => '220px', 'add' => '',
+                    'edit' => ['type' => 'ValidationTextBox']],
+                ['caption' => 'Stream-Adresse', 'name' => 'stream', 'width' => 'auto', 'add' => '',
+                    'edit' => ['type' => 'ValidationTextBox']],
+                ['caption' => 'Logo-Adresse', 'name' => 'logo', 'width' => '200px', 'add' => '',
+                    'edit' => ['type' => 'ValidationTextBox']],
+                ['caption' => 'Erkennung', 'name' => 'match', 'width' => '200px', 'add' => '',
+                    'edit' => ['type' => 'ValidationTextBox']],
+            ],
+            'values' => array_map(static function ($e) {
+                $e['match'] = implode(', ', (array) ($e['match'] ?? []));
+                return $e;
+            }, $this->eigeneSender())];
+        $items[] = ['type' => 'Button', 'caption' => 'Radiosender speichern',
+            'onClick' => 'echo HSH_Manage($id, json_encode(["op"=>"configureStations","args"=>["stations"=>$radioStations]]));'];
+        $items[] = ['type' => 'ValidationTextBox', 'name' => 'streamTestUrl', 'caption' => 'Stream testen (Adresse)'];
+        $items[] = ['type' => 'Button', 'caption' => 'Stream testen',
+            'onClick' => 'echo HSH_Manage($id, json_encode(["op"=>"testStation","args"=>["url"=>$streamTestUrl]]));'];
         // Spotify-OAuth: Redirect-URI anzeigen (in Spotify-App eintragen) + Login-Link erzeugen.
         $redir = $this->spotifyRedirectUri();
         $login = ($redir !== '') ? $redir : ''; // /hook/hsspotify leitet ohne code direkt zu Spotify weiter
@@ -310,6 +347,10 @@ class HomeSuiteHub extends EntityModule
                 ['type' => 'NumberSpinner', 'name' => 'ShadeSafePos', 'caption' => 'Sichere Position (%)', 'minimum' => 0, 'maximum' => 100],
                 ['type' => 'CheckBox', 'name' => 'ShadeRainClose', 'caption' => 'Bei Regen schließen'],
             ]],
+            ['type' => 'NumberSpinner', 'name' => 'ShadeBusGapMs', 'caption' => 'Abstand zwischen Funkbefehlen (ms)',
+             'minimum' => 0, 'maximum' => 30000, 'suffix' => ' ms'],
+            ['type' => 'Label', 'caption' => 'Gilt für alle Rollos gemeinsam: sie teilen sich einen Sender. '
+                . 'Zu kleine Werte lassen bei Sammelfahrten Telegramme verlorengehen, ohne dass es auffällt.'],
             ['type' => 'Label', 'caption' => 'Nordausrichtung: Haus-Abweichung gegen Nord (°). Beim Ändern werden ALLE Sonnenprofile (Hub + alle Zonen) automatisch mitgedreht.'],
             ['type' => 'NumberSpinner', 'name' => 'ShadeNorthDeg', 'caption' => 'Nordausrichtung (° gegen Nord)', 'digits' => 1, 'minimum' => -180, 'maximum' => 180],
         ]];
@@ -445,7 +486,13 @@ class HomeSuiteHub extends EntityModule
         $m->addManagementAction(['op' => 'shadeLog', 'verb' => 'shadeLog', 'target' => 'hub',
             'label' => 'Beschattungs-Log (alle Raeume) lesen', 'destructive' => false, 'fields' => []]);
         foreach ([['mediaProviders', 'Provider auflisten'], ['mediaBrowse', 'Bibliothek browsen'],
-                  ['mediaSearch', 'Bibliothek suchen'], ['mediaResolve', 'Inhalt aufloesen']] as $ma) {
+                  ['mediaSearch', 'Bibliothek suchen'], ['mediaResolve', 'Inhalt aufloesen'],
+                  ['mediaTracks', 'Sammlung in Titelliste aufloesen'],
+                  ['mediaCanWrite', 'Welche Quellen koennen Playlists?'],
+                  ['mediaPlaylistList', 'Beschreibbare Playlists lesen'], ['mediaPlaylistCreate', 'Playlist anlegen'], ['mediaPlaylistAdd', 'An Playlist anhaengen'],
+                  ['mediaPlaylistDelete', 'Playlist loeschen'],
+                  ['getStations', 'Radiosender lesen'], ['configureStations', 'Radiosender speichern'],
+                  ['testStation', 'Stream testen']] as $ma) {
             $m->addManagementAction(['op' => $ma[0], 'verb' => $ma[0], 'target' => 'hub',
                 'label' => $ma[1], 'destructive' => false, 'fields' => []]);
         }
@@ -521,6 +568,10 @@ class HomeSuiteHub extends EntityModule
     public function ApplyChanges()
     {
         parent::ApplyChanges();
+        // Die Senderdatei ist nur eine Ableitung des Stores. Geht sie verloren (Umzug,
+        // Aufraeumen, Rechteproblem), waeren ALLE Sender weg - deshalb wird sie hier bei
+        // jedem Uebernehmen und bei jedem Kernelstart aus dem Store neu geschrieben.
+        $this->senderDateiSchreiben();
         // Globalen Automatik-Schalter einmalig auf AN setzen (fail-safe Default true).
         if (!(bool) $this->store()->get('autoSeeded', false)) {
             @$this->SetValue('AutomationEnabled', true);
@@ -793,6 +844,15 @@ class HomeSuiteHub extends EntityModule
                     (string) ($args['kind'] ?? 'motion')
                 )];
 
+            case 'getStations':
+                return $this->mgmtGetStations();
+
+            case 'configureStations':
+                return $this->mgmtConfigureStations($args);
+
+            case 'testStation':
+                return $this->mgmtTestStation($args);
+
             case 'getSources':
                 return ['ok' => true, 'op' => $op, 'sources' => $this->sourcesConfig(),
                     'schema' => \Hoep\HomeSuite\Engines\MediaProviders::schema()];
@@ -820,6 +880,23 @@ class HomeSuiteHub extends EntityModule
                 return $this->mgmtMediaBrowse($args);
             case 'mediaSearch':
                 return $this->mgmtMediaBrowse($args, true);
+            case 'mediaTracks':
+                return $this->mgmtMediaTracks($args);
+
+            case 'mediaCanWrite':
+                return $this->mgmtMediaCanWrite();
+
+            case 'mediaPlaylistList':
+                return $this->mgmtMediaPlaylistList($args);
+
+            case 'mediaPlaylistCreate':
+                return $this->mgmtMediaPlaylist('create', $args);
+
+            case 'mediaPlaylistAdd':
+                return $this->mgmtMediaPlaylist('add', $args);
+
+            case 'mediaPlaylistDelete':
+                return $this->mgmtMediaPlaylist('delete', $args);
             case 'mediaResolve':
                 return $this->mgmtMediaResolve($args);
         }
@@ -1322,6 +1399,166 @@ class HomeSuiteHub extends EntityModule
         return $s;
     }
 
+    // ==================================================================
+    // Radiosender: fest eingebaute + eigene, haus-weit
+    // ==================================================================
+
+    /** Alle Sender: eingebaute und eigene, mit Herkunft. */
+    private function mgmtGetStations(): array
+    {
+        $alle = \Hoep\HomeSuite\Engines\RadioNow::all();
+        $out  = [];
+        foreach ($alle as $k => $st) {
+            $out[] = [
+                'key'    => $k,
+                'title'  => (string) ($st['title'] ?? $k),
+                'stream' => (string) ($st['stream'] ?? ''),
+                'logo'   => (string) ($st['logo'] ?? ''),
+                'match'  => implode(', ', (array) ($st['match'] ?? [])),
+                'eigen'  => !empty($st['eigen']),
+            ];
+        }
+        return ['ok' => true, 'stations' => $out, 'eigene' => $this->eigeneSender()];
+    }
+
+    /** @return array<int,array> die im Hub gepflegten eigenen Sender */
+    private function eigeneSender(): array
+    {
+        $s = $this->store()->get('radioStations', []);
+        return is_array($s) ? array_values($s) : [];
+    }
+
+    /**
+     * Eigene Sender speichern. Ein Sender mit dem Schluessel eines eingebauten
+     * UEBERSCHREIBT diesen - so laesst sich eine tote Adresse ersetzen, ohne Code zu aendern.
+     * Geschrieben wird zusaetzlich eine Datei, aus der RadioNow liest: die Klasse wird aus
+     * Zone, Hook und Wecker benutzt und soll den Hub nicht kennen muessen.
+     */
+    private function mgmtConfigureStations(array $args): array
+    {
+        $ein = (array) ($args['stations'] ?? []);
+        $rein = [];
+        foreach ($ein as $st) {
+            $k = preg_replace('~[^a-z0-9_]~', '', mb_strtolower(trim((string) ($st['key'] ?? ''))));
+            $u = trim((string) ($st['stream'] ?? ''));
+            if ($k === '' || $u === '') {
+                continue;   // ohne Schluessel oder Adresse ist ein Sender wertlos
+            }
+            // Erkennungsmuster kommaweise; sie ordnen den vom Player gemeldeten Sendernamen
+            // diesem Sender zu. Leer lassen ist erlaubt - dann werden Name und Schluessel
+            // benutzt. Beim laufenden Betrieb gewinnt die laengste Uebereinstimmung.
+            $mus = [];
+            foreach (preg_split('~\s*,\s*~', (string) ($st['match'] ?? '')) as $m) {
+                $m = mb_strtolower(trim((string) $m));
+                if ($m !== '') { $mus[] = $m; }
+            }
+            $rein[$k] = [
+                'key'    => $k,
+                'title'  => trim((string) ($st['title'] ?? $k)),
+                'stream' => $u,
+                'logo'   => trim((string) ($st['logo'] ?? '')),
+                'match'  => $mus,
+            ];
+        }
+        $liste = array_values($rein);
+        $this->store()->set('radioStations', $liste);
+
+        $ok = $this->senderDateiSchreiben();
+        return ['ok' => $ok, 'gespeichert' => count($liste),
+                'datei' => \Hoep\HomeSuite\Engines\RadioNow::CUSTOM_FILE];
+    }
+
+    /** Senderdatei aus dem Store schreiben (Ableitung, jederzeit neu erzeugbar). */
+    private function senderDateiSchreiben(): bool
+    {
+        $datei  = \Hoep\HomeSuite\Engines\RadioNow::CUSTOM_FILE;
+        $ordner = dirname($datei);
+        if (!is_dir($ordner)) {
+            @mkdir($ordner, 0775, true);
+        }
+        $ok = @file_put_contents($datei,
+            json_encode(['stations' => $this->eigeneSender()], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) !== false;
+        \Hoep\HomeSuite\Engines\RadioNow::reset();
+        return $ok;
+    }
+
+    /**
+     * Einen Stream antesten, BEVOR er als Sender abgelegt wird.
+     *
+     * Geprueft wird, was den Player wirklich betrifft: Erreichbarkeit, Inhaltstyp und ob
+     * eine Weiterleitung von http nach https fuehrt. Sonos spielt Radio zwar auch ueber
+     * https ab (anders als Dateien), aber eine Adresse, die eine Playlist statt eines
+     * Stroms liefert, oder eine, die gar nicht antwortet, faellt hier auf statt spaeter
+     * still im Wohnzimmer.
+     */
+    private function mgmtTestStation(array $args): array
+    {
+        $url = trim((string) ($args['url'] ?? ''));
+        if ($url === '' || !preg_match('~^https?://~i', $url)) {
+            return ['ok' => false, 'error' => 'keine gueltige Adresse'];
+        }
+        if (!function_exists('curl_init')) {
+            return ['ok' => false, 'error' => 'curl fehlt'];
+        }
+        // Ein Livestream endet NIE. Ein einfacher Abruf mit Zeitlimit meldet darum immer
+        // einen Fehler, obwohl alles in Ordnung ist (erster Versuch: 206 KB Audio empfangen
+        // und trotzdem "nicht erreichbar"). Deshalb wird hier mitgezaehlt und nach ein paar
+        // Kilobyte selbst abgebrochen - genau das ist der Beweis, dass Ton fliesst.
+        $genug = 24576;
+        $gelesen = 0;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS      => 3,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT        => 10,
+            CURLOPT_HTTPHEADER     => ['Icy-MetaData: 1', 'User-Agent: HomeSuite/1.0'],
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => 0,
+            CURLOPT_WRITEFUNCTION  => function ($c, $daten) use (&$gelesen, $genug) {
+                $gelesen += strlen($daten);
+                return ($gelesen >= $genug) ? 0 : strlen($daten);   // 0 bricht sauber ab
+            },
+        ]);
+        curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $typ  = strtolower(trim((string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE)));
+        $ziel = (string) curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+        $errn = curl_errno($ch);
+        $err  = curl_error($ch);
+        curl_close($ch);
+
+        // Abbruch durch die eigene Zaehlfunktion ist KEIN Fehler, sondern das Ziel.
+        $abgebrochen = ($errn === CURLE_WRITE_ERROR || $gelesen >= $genug);
+        if ($code < 200 || $code >= 400 || ($gelesen === 0 && !$abgebrochen)) {
+            return ['ok' => false, 'error' => 'nicht erreichbar', 'code' => $code,
+                    'detail' => $err !== '' ? $err : 'keine Daten'];
+        }
+
+        $hinweise = [];
+        $spielbar = true;
+        $istAudio = (strpos($typ, 'audio') !== false || strpos($typ, 'octet-stream') !== false
+            || strpos($typ, 'ogg') !== false || strpos($typ, 'aacp') !== false);
+        if (!$istAudio) {
+            $spielbar = false;
+            if (preg_match('~mpegurl|scpls|x-scpls|pls|xspf~', $typ)) {
+                $hinweise[] = 'Das ist eine Playlist-Datei (' . $typ . '), kein Strom. '
+                    . 'Bitte die darin enthaltene Stream-Adresse eintragen.';
+            } else {
+                $hinweise[] = 'Kein Audio: der Server meldet ' . ($typ !== '' ? $typ : 'keinen Inhaltstyp') . '.';
+            }
+        }
+        if (stripos($ziel, 'https://') === 0 && stripos($url, 'http://') === 0) {
+            $hinweise[] = 'Die Adresse leitet auf https um.';
+        }
+        if ($spielbar && $gelesen < 4096) {
+            $hinweise[] = 'Es kamen nur ' . $gelesen . ' Bytes - der Strom koennte sofort abreissen.';
+        }
+        return ['ok' => true, 'spielbar' => $spielbar, 'code' => $code,
+                'typ' => $typ !== '' ? $typ : '-', 'zieladresse' => $ziel,
+                'bytes' => $gelesen, 'hinweise' => $hinweise];
+    }
+
     /** Medienquellen speichern (haus-weit). Nur bekannte Provider/Felder werden uebernommen. */
     private function mgmtConfigureSources(array $args): array
     {
@@ -1520,6 +1757,91 @@ class HomeSuiteHub extends EntityModule
     }
 
     /** Einen ContentRef abspielbereit machen (uri fuellen). */
+    /**
+     * Einen Container in seine geordnete Titelliste aufloesen.
+     *
+     * Gegenstueck zu mediaResolve, das per Vertrag nur EINEN Verweis liefern kann. Der
+     * Deckel begrenzt, was eine einzelne Antwort ueberhaupt tragen darf - der Symcon-Hook
+     * kappt bei 1 MB, und eine Playlist mit tausenden Titeln liegt darueber.
+     */
+    private function mgmtMediaTracks(array $args): array
+    {
+        $pid = (string) ($args['provider'] ?? '');
+        $providers = \Hoep\HomeSuite\Engines\MediaProviders::build($this->sourcesConfig());
+        $p = $providers[$pid] ?? null;
+        if ($p === null) {
+            return ['ok' => false, 'error' => 'provider nicht aktiv: ' . $pid];
+        }
+        $ref = \Hoep\HomeSuite\HAL\ContentRef::fromArray((array) ($args['ref'] ?? []));
+        $max = (int) ($args['max'] ?? 200);
+        $r   = \Hoep\HomeSuite\Engines\MediaProviders::expand($p, $ref, $max);
+        return [
+            'ok'        => true,
+            'tracks'    => array_map(static fn($t) => $t->toArray(), $r['tracks']),
+            'total'     => $r['total'],
+            'truncated' => $r['truncated'],
+            'skipped'   => $r['skipped'],
+        ];
+    }
+
+    /** Welche aktiven Quellen koennen Playlists anlegen? (Die Oberflaeche blendet danach aus.) */
+    private function mgmtMediaCanWrite(): array
+    {
+        $out = [];
+        foreach (\Hoep\HomeSuite\Engines\MediaProviders::build($this->sourcesConfig()) as $id => $p) {
+            $out[] = ['provider' => $id, 'label' => $p->label(),
+                      'schreibbar' => ($p instanceof \Hoep\HomeSuite\Contracts\IMediaWritable)];
+        }
+        return ['ok' => true, 'quellen' => $out];
+    }
+
+    /** Die beschreibbaren Playlists einer Quelle (ohne die regelbasierten). */
+    private function mgmtMediaPlaylistList(array $args): array
+    {
+        $pid = (string) ($args['provider'] ?? '');
+        $p = \Hoep\HomeSuite\Engines\MediaProviders::build($this->sourcesConfig())[$pid] ?? null;
+        if (!($p instanceof \Hoep\HomeSuite\Contracts\IMediaWritable)) {
+            return ['ok' => true, 'playlists' => []];
+        }
+        return ['ok' => true, 'playlists' => array_map(static fn($r) => $r->toArray(), $p->playlists())];
+    }
+
+    /**
+     * Playlist anlegen, erweitern oder loeschen - IM ANBIETER.
+     *
+     * Es entsteht nichts Eigenes bei uns: die Liste kommt danach ueber den normalen
+     * browse()-Weg zurueck. Wer nicht schreiben kann, bekommt eine klare Absage statt
+     * eines Fehlschlags im Verborgenen.
+     */
+    private function mgmtMediaPlaylist(string $was, array $args): array
+    {
+        $pid = (string) ($args['provider'] ?? '');
+        $p = \Hoep\HomeSuite\Engines\MediaProviders::build($this->sourcesConfig())[$pid] ?? null;
+        if ($p === null) {
+            return ['ok' => false, 'error' => 'provider nicht aktiv: ' . $pid];
+        }
+        if (!($p instanceof \Hoep\HomeSuite\Contracts\IMediaWritable)) {
+            return ['ok' => false, 'error' => 'unsupported',
+                    'note' => $p->label() . ' kann keine Playlists anlegen'];
+        }
+        $refs = [];
+        foreach ((array) ($args['refs'] ?? []) as $r) {
+            $refs[] = \Hoep\HomeSuite\HAL\ContentRef::fromArray((array) $r);
+        }
+        if ($was === 'delete') {
+            return ['ok' => $p->deletePlaylist((string) ($args['id'] ?? ''))];
+        }
+        if ($was === 'add') {
+            $n = $p->addToPlaylist((string) ($args['id'] ?? ''), $refs);
+            return ['ok' => $n > 0, 'uebernommen' => $n, 'gewaehlt' => count($refs)];
+        }
+        $neu = $p->createPlaylist((string) ($args['name'] ?? ''), $refs);
+        return $neu === null
+            ? ['ok' => false, 'error' => 'anlegen fehlgeschlagen',
+               'note' => 'Kein passender Eintrag dieser Quelle oder der Server hat abgelehnt']
+            : ['ok' => true, 'playlist' => $neu->toArray(), 'gewaehlt' => count($refs)];
+    }
+
     private function mgmtMediaResolve(array $args): array
     {
         $pid = (string) ($args['provider'] ?? '');

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Hoep\HomeSuite\Media;
 
 use Hoep\HomeSuite\Contracts\IMediaProvider;
+use Hoep\HomeSuite\Contracts\IMediaWritable;
 use Hoep\HomeSuite\Engines\MediaProviders;
 use Hoep\HomeSuite\HAL\ContentRef;
 
@@ -17,7 +18,7 @@ use Hoep\HomeSuite\HAL\ContentRef;
  *
  * config: url (Basis inkl. evtl. Subpfad), username, password [, token]
  */
-final class AudiobookshelfProvider implements IMediaProvider
+final class AudiobookshelfProvider implements IMediaProvider, IMediaWritable
 {
     private string $url;
     private string $user;
@@ -73,6 +74,10 @@ final class AudiobookshelfProvider implements IMediaProvider
             }
             $out[] = new ContentRef('audiobookshelf', 'container', 'lib:' . $lib['id'],
                 '', (string) ($lib['name'] ?? 'Bibliothek'), '', '', '', '', 0, true);
+            // Serien sind bei Hoerbuechern das, was bei Musik die Playlist ist: die einzige
+            // gefuellte Listenart dieses Servers (Playlists und Sammlungen sind hier leer).
+            $out[] = new ContentRef('audiobookshelf', 'container', 'ser:' . $lib['id'],
+                '', (string) ($lib['name'] ?? 'Bibliothek') . ' - Serien', '', '', '', '', 0, true);
         }
         return $out;
     }
@@ -84,6 +89,13 @@ final class AudiobookshelfProvider implements IMediaProvider
         }
         if (strncmp($containerId, 'item:', 5) === 0) {
             return $this->itemTracks(substr($containerId, 5));
+        }
+        if (strncmp($containerId, 'serb:', 5) === 0) {
+            [$libId, $serId] = array_pad(explode(':', substr($containerId, 5), 2), 2, '');
+            return $this->seriesBooks($libId, $serId);
+        }
+        if (strncmp($containerId, 'ser:', 4) === 0) {
+            return $this->seriesList(substr($containerId, 4), $offset, $limit);
         }
         // Default: erste Buch-Bibliothek
         $roots = $this->roots();
@@ -106,6 +118,53 @@ final class AudiobookshelfProvider implements IMediaProvider
         return ContentRef::sortByArtistTitle($out); // Autor -> Titel
     }
 
+    /** Serien einer Bibliothek als Container. */
+    private function seriesList(string $libId, int $offset, int $limit): array
+    {
+        $j = json_decode($this->http('/api/libraries/' . rawurlencode($libId)
+            . '/series?limit=' . max(1, $limit) . '&page=' . (int) floor($offset / max(1, $limit))), true);
+        $out = [];
+        foreach ((array) ($j['results'] ?? []) as $ser) {
+            $id = (string) ($ser['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+            $n = count((array) ($ser['books'] ?? []));
+            $out[] = new ContentRef('audiobookshelf', 'container', 'serb:' . $libId . ':' . $id, '',
+                (string) ($ser['name'] ?? 'Serie'), $n > 0 ? ($n . ' Baende') : '', '', '', '', 0, true);
+        }
+        return $out;
+    }
+
+    /**
+     * Baende einer Serie, in Folgenreihenfolge.
+     *
+     * Der Server filtert ueber die base64-kodierte Serien-Kennung und liefert bereits nach
+     * Folge sortiert; die Sortierung hier ist nur die Absicherung, falls das je kippt.
+     */
+    private function seriesBooks(string $libId, string $serId): array
+    {
+        if ($libId === '' || $serId === '') {
+            return [];
+        }
+        $j = json_decode($this->http('/api/libraries/' . rawurlencode($libId)
+            . '/items?limit=200&filter=series.' . rawurlencode(base64_encode($serId))), true);
+        $roh = [];
+        foreach ((array) ($j['results'] ?? []) as $it) {
+            $md  = (array) ($it['media']['metadata'] ?? []);
+            $ser = (array) ($md['series'] ?? []);
+            $roh[] = [
+                'folge' => (float) ($ser['sequence'] ?? 0),
+                'ref'   => new ContentRef('audiobookshelf', 'container', 'item:' . $it['id'], '',
+                    (string) ($md['title'] ?? ''), (string) ($md['authorName'] ?? ''), '',
+                    $this->coverUrl((string) $it['id']), '',
+                    (int) round((float) ($it['media']['duration'] ?? 0)), true),
+            ];
+        }
+        usort($roh, static fn($a, $b) => $a['folge'] <=> $b['folge']);
+        return array_column($roh, 'ref');
+    }
+
     /** Audiospuren eines Hoerbuchs als abspielbare (URL-)Items. */
     private function itemTracks(string $itemId): array
     {
@@ -115,6 +174,13 @@ final class AudiobookshelfProvider implements IMediaProvider
         $author = (string) ($md['authorName'] ?? '');
         $cover = $this->coverUrl($itemId);
         $tracks = (array) ($j['media']['tracks'] ?? $j['media']['audioFiles'] ?? []);
+        // Reihenfolge absichern: bei einem Buch mit 393 Dateien ist eine vertauschte
+        // Reihenfolge kein Schoenheitsfehler, sondern eine unbrauchbare Wiedergabe.
+        usort($tracks, static function ($a, $b) {
+            $ia = (float) ($a['index'] ?? ($a['metadata']['index'] ?? 0));
+            $ib = (float) ($b['index'] ?? ($b['metadata']['index'] ?? 0));
+            return $ia <=> $ib;
+        });
         $tok = $this->token();
         $out = [];
         foreach ($tracks as $i => $t) {
@@ -189,6 +255,13 @@ final class AudiobookshelfProvider implements IMediaProvider
             if ($method === 'POST') {
                 $opt[CURLOPT_POST] = true;
                 $opt[CURLOPT_POSTFIELDS] = (string) $payload;
+            } elseif ($method !== 'GET') {
+                // Ohne das wuerde jedes DELETE/PATCH still zu einem GET - der Aufruf saehe
+                // erfolgreich aus und haette nichts getan.
+                $opt[CURLOPT_CUSTOMREQUEST] = $method;
+                if ($payload !== null) {
+                    $opt[CURLOPT_POSTFIELDS] = (string) $payload;
+                }
             }
             curl_setopt_array($ch, $opt);
             $r = curl_exec($ch);
@@ -199,6 +272,120 @@ final class AudiobookshelfProvider implements IMediaProvider
             'header' => implode("\r\n", $headers), 'content' => (string) $payload, 'ignore_errors' => true]]);
         $r = @file_get_contents($url, false, $ctx);
         return $r === false ? '' : (string) $r;
+    }
+
+    // ==================================================================
+    // Schreiben (IMediaWritable): Playlists im Audiobookshelf anlegen
+    // ==================================================================
+
+    /**
+     * Eine ABS-Playlist enthaelt BUECHER (libraryItems), keine einzelnen Dateien - deshalb
+     * zaehlen hier die 'item:'-Verweise. Eine einzelne Kapiteldatei laesst sich dort nicht
+     * ablegen; wer das braucht, meint eine Warteschlange, keine Playlist.
+     */
+    private function itemsOf(array $refs): array
+    {
+        $out = [];
+        foreach ($refs as $r) {
+            if (!$r instanceof ContentRef || $r->provider !== 'audiobookshelf') {
+                continue;
+            }
+            $id = '';
+            if (strncmp($r->id, 'item:', 5) === 0) {
+                $id = substr($r->id, 5);
+            } elseif (strncmp($r->id, 'file:', 5) === 0) {
+                // Datei -> zugehoeriges Buch, damit die Auswahl nicht stillschweigend leer bleibt
+                $t = explode(':', substr($r->id, 5));
+                $id = $t[0] ?? '';
+            }
+            if ($id !== '') {
+                $out[$id] = ['libraryItemId' => $id];
+            }
+        }
+        return array_values($out);
+    }
+
+    /** Bibliothek, in der die Liste angelegt wird: die des ersten Eintrags, sonst die erste. */
+    private function libIdOf(array $items): string
+    {
+        if ($items !== []) {
+            $j = json_decode((string) $this->http('/api/items/' . rawurlencode($items[0]['libraryItemId'])), true);
+            $lib = (string) ($j['libraryId'] ?? '');
+            if ($lib !== '') {
+                return $lib;
+            }
+        }
+        $roots = $this->roots();
+        foreach ($roots as $r) {
+            if (strncmp($r->id, 'lib:', 4) === 0) {
+                return substr($r->id, 4);
+            }
+        }
+        return '';
+    }
+
+    public function createPlaylist(string $name, array $refs): ?ContentRef
+    {
+        $name  = trim($name);
+        $items = $this->itemsOf($refs);
+        if ($name === '' || $items === []) {
+            return null;
+        }
+        $lib = $this->libIdOf($items);
+        if ($lib === '') {
+            return null;
+        }
+        $r = json_decode((string) $this->http('/api/playlists', 'POST',
+            ['libraryId' => $lib, 'name' => $name, 'items' => $items]), true);
+        $id = (string) ($r['id'] ?? '');
+        if ($id === '') {
+            return null;
+        }
+        return new ContentRef('audiobookshelf', 'container', 'pl:' . $id, '',
+            (string) ($r['name'] ?? $name), count($items) . ' Titel', '', '', '', 0, true);
+    }
+
+    public function addToPlaylist(string $playlistId, array $refs): int
+    {
+        if (strncmp($playlistId, 'pl:', 3) === 0) {
+            $playlistId = substr($playlistId, 3);
+        }
+        $items = $this->itemsOf($refs);
+        if ($playlistId === '' || $items === []) {
+            return 0;
+        }
+        $r = json_decode((string) $this->http('/api/playlists/' . rawurlencode($playlistId) . '/batch/add',
+            'POST', ['items' => $items]), true);
+        return isset($r['id']) ? count($items) : 0;
+    }
+
+    public function playlists(): array
+    {
+        $out = [];
+        foreach ($this->roots() as $r) {
+            if (strncmp($r->id, 'lib:', 4) !== 0) {
+                continue;
+            }
+            $j = json_decode((string) $this->http('/api/libraries/' . rawurlencode(substr($r->id, 4)) . '/playlists?limit=100'), true);
+            foreach ((array) ($j['results'] ?? []) as $pl) {
+                $n = count((array) ($pl['items'] ?? []));
+                $out[] = new ContentRef('audiobookshelf', 'container', 'pl:' . (string) ($pl['id'] ?? ''), '',
+                    (string) ($pl['name'] ?? ''), $n > 0 ? ($n . ' Titel') : '', '', '', '', 0, true);
+            }
+        }
+        return $out;
+    }
+
+    public function deletePlaylist(string $playlistId): bool
+    {
+        if (strncmp($playlistId, 'pl:', 3) === 0) {
+            $playlistId = substr($playlistId, 3);
+        }
+        if ($playlistId === '') {
+            return false;
+        }
+        $this->http('/api/playlists/' . rawurlencode($playlistId), 'DELETE');
+        return true;
     }
 }
 

@@ -22,28 +22,93 @@ namespace Hoep\HomeSuite\Engines;
 final class RadioNow
 {
     /**
-     * Kuratierte Senderliste (die 10 angelegten Stationen). Best-Quality-Direktstream
-     * (ICY-faehig) + Erkennungsmuster (Sonos-Sendername/URI -> Sender). ORF-Sender sind
-     * markiert (koennen alternativ die ORF-Audio-API nutzen).
-     * @var array<string,array{title:string,stream:string,orf:?string,match:string[]}>
+     * Senderliste - ABSICHTLICH LEER.
+     *
+     * Die Sender stehen seit 18.08.2026 vollstaendig im Hub und werden von dort in die
+     * Datei CUSTOM_FILE geschrieben; all() liest nur noch diese. Damit laesst sich ein
+     * Sender aendern, ohne Code anzufassen, und es gibt nur EINE Wahrheit statt zweier,
+     * die auseinanderlaufen koennen.
+     *
+     * Die Konstante bleibt als Erweiterungspunkt bestehen: was hier steht, wird von
+     * gleichnamigen Eintraegen aus dem Hub ueberschrieben.
+     *
+     * @var array<string,array{title:string,stream:string,logo?:string,match:string[]}>
      */
-    public const STATIONS = [
-        'oe3'      => ['title' => 'Hitradio Ö3',            'stream' => 'https://orf-live.ors-shoutcast.at/oe3-q2a', 'orf' => 'oe3', 'logo' => 'https://tubestatic.orf.at/mojo/1_3/storyserver//tube/common/images/apple-icons/oe3.png', 'match' => ['oe3', 'hitradio ö3', 's8007']],
-        'fm4'      => ['title' => 'FM4',                    'stream' => 'https://orf-live.ors-shoutcast.at/fm4-q2a', 'orf' => 'fm4', 'logo' => 'https://tubestatic.orf.at/mojo/1_3/storyserver//tube/fm4/images/touch-icon-iphone-retina.png', 'match' => ['fm4', 'fm 4']],
-        'oe1'      => ['title' => 'Österreich 1',           'stream' => 'https://orf-live.ors-shoutcast.at/oe1-q2a', 'orf' => 'oe1', 'logo' => 'https://oe1.orf.at/static/img/logo_oe1.png', 'match' => ['oe1', 'österreich 1', 'ö1']],
-        'ooe'      => ['title' => 'Radio der Region',   'stream' => 'https://orf-live.ors-shoutcast.at/ooe-q2a', 'orf' => 'ooe', 'logo' => 'https://tubestatic.orf.at/mojo/1_3/storyserver//tube/common/images/apple-icons/ooe.png', 'match' => ['oberösterreich', 'ooe', 'radio oö']],
-        'kronehit' => ['title' => 'Kronehit',               'stream' => 'http://onair-ha1.krone.at/kronehit1058.mp3', 'orf' => null, 'logo' => 'http://www.kronehit.at/static/base/img/apple-touch-icon.f5c3420c154b.png', 'match' => ['kronehit', 'krone']],
-        'antenne'  => ['title' => 'Antenne Bayern',         'stream' => 'https://stream.antenne.de/antenne/stream/mp3', 'orf' => null, 'logo' => 'http://www.antenne.de/logos/station-antenne-bayern/apple-touch-icon.png', 'match' => ['antenne bayern 103', 'antenne bayern (', 'antenne bayern pop']],
-        'antenne_chillout' => ['title' => 'Antenne Bayern Chillout', 'stream' => 'https://stream.antenne.de/chillout/stream/mp3', 'orf' => null, 'logo' => 'http://www.antenne.de/logos/station-antenne-bayern/apple-touch-icon.png', 'match' => ['chillout']],
-        'antenne_love'     => ['title' => 'Antenne Bayern Lovesongs', 'stream' => 'https://stream.antenne.de/lovesongs/stream/mp3', 'orf' => null, 'logo' => 'http://www.antenne.de/logos/station-antenne-bayern/apple-touch-icon.png', 'match' => ['lovesong']],
-        'antenne_top40'    => ['title' => 'Antenne Bayern Top 40',    'stream' => 'https://stream.antenne.de/top-40/stream/mp3', 'orf' => null, 'logo' => 'http://www.antenne.de/logos/station-antenne-bayern/apple-touch-icon.png', 'match' => ['antenne bayern top']],
-        'liferadio'        => ['title' => 'Life Radio',              'stream' => 'https://stream.liferadio.tirol/MUONLY/mp3-192/link', 'orf' => null, 'logo' => 'https://liferadio.konsole-labs.com/img/live.png', 'match' => ['life radio']],
-    ];
+    public const STATIONS = [];
+
+    /** Ablage der im Hub gepflegten eigenen Sender (vom Hub beim Speichern geschrieben). */
+    public const CUSTOM_FILE = '/var/lib/symcon/scripts/data/homesuite/radio_custom.json';
+
+    /** @var array<string,array>|null Zwischenspeicher fuer die Dauer eines Aufrufs */
+    private static ?array $alle = null;
+
+    /**
+     * Alle Sender: die fest eingebauten UND die im Hub gepflegten eigenen.
+     *
+     * Bewusst ueber eine Datei statt ueber einen Aufruf beim Hub: diese Klasse wird aus
+     * ganz verschiedenen Zusammenhaengen benutzt (Zone, Hook, Wecker), und keiner davon
+     * soll wissen muessen, wo der Hub steckt. Eigene Sender koennen eingebaute mit
+     * demselben Schluessel ueberschreiben - so laesst sich eine tote Adresse ersetzen,
+     * ohne den Code anzufassen.
+     *
+     * @return array<string,array>
+     */
+    public static function all(): array
+    {
+        if (self::$alle !== null) {
+            return self::$alle;
+        }
+        $eigen = [];
+        $roh = @file_get_contents(self::CUSTOM_FILE);
+        if ($roh !== false) {
+            $d = json_decode((string) $roh, true);
+            foreach ((array) ($d['stations'] ?? []) as $st) {
+                $k = trim((string) ($st['key'] ?? ''));
+                $u = trim((string) ($st['stream'] ?? ''));
+                if ($k === '' || $u === '') {
+                    continue;
+                }
+                // Erkennungsmuster: gepflegte gehen vor, sonst aus Name und Schluessel
+                // abgeleitet. Sie ordnen den vom Player gemeldeten Sendernamen einem Sender
+                // zu - Oe3 meldet sich bei Sonos zum Beispiel als "s8007".
+                $mus = [];
+                foreach ((array) ($st['match'] ?? []) as $m) {
+                    $m = mb_strtolower(trim((string) $m));
+                    if ($m !== '') { $mus[] = $m; }
+                }
+                if ($mus === []) {
+                    $mus = array_values(array_filter([mb_strtolower((string) ($st['title'] ?? '')), mb_strtolower($k)]));
+                }
+                $eigen[$k] = [
+                    'title'  => (string) ($st['title'] ?? $k),
+                    'stream' => $u,
+                    'logo'   => (string) ($st['logo'] ?? ''),
+                    'match'  => $mus,
+                    'eigen'  => true,
+                ];
+            }
+        }
+        self::$alle = array_merge(self::STATIONS, $eigen);
+        return self::$alle;
+    }
+
+    /** Zwischenspeicher verwerfen (nach dem Speichern im Hub). */
+    public static function reset(): void
+    {
+        self::$alle = null;
+    }
+
+    /** Ein Sender oder null. */
+    public static function station(string $key): ?array
+    {
+        $a = self::all();
+        return $a[$key] ?? null;
+    }
 
     /** Sender-Logo-URL (Fallback-Cover bei Nachrichten/Wort). */
     public static function logoOf(?string $stationKey): string
     {
-        return $stationKey ? (string) (self::STATIONS[$stationKey]['logo'] ?? '') : '';
+        return $stationKey ? (string) (self::all()[$stationKey]['logo'] ?? '') : '';
     }
 
     /** Sender-Key aus einem Sonos-Sendernamen/URI erkennen (fuer die Now-Anzeige). */
@@ -53,15 +118,20 @@ final class RadioNow
         if ($s === '') {
             return null;
         }
-        // Spezifische zuerst (Sub-Kanaele vor dem Hauptsender).
-        foreach (['antenne_top40', 'antenne_chillout', 'antenne_love', 'antenne', 'oe3', 'fm4', 'oe1', 'ooe', 'kronehit', 'liferadio'] as $key) {
-            foreach (self::STATIONS[$key]['match'] as $m) {
-                if (strpos($s, $m) !== false) {
-                    return $key;
+        // Die LAENGSTE passende Zeichenfolge gewinnt. Frueher stand hier eine fest
+        // verdrahtete Rangliste, damit "Antenne Bayern Top 40" vor "Antenne Bayern"
+        // greift - die haette jeder neu angelegte Sender wieder ausgehebelt. Die
+        // Laengenregel leistet dasselbe und pflegt sich von selbst.
+        $treffer = null; $laenge = -1;
+        foreach (self::all() as $key => $st) {
+            foreach ((array) ($st['match'] ?? []) as $m) {
+                $m = (string) $m;
+                if ($m !== '' && strpos($s, $m) !== false && mb_strlen($m) > $laenge) {
+                    $laenge = mb_strlen($m); $treffer = $key;
                 }
             }
         }
-        return null;
+        return $treffer;
     }
 
     /**
@@ -70,7 +140,7 @@ final class RadioNow
      */
     public static function now(string $stationKey, bool $withCover = true): array
     {
-        $st = self::STATIONS[$stationKey] ?? null;
+        $st = self::all()[$stationKey] ?? null;
         if ($st === null) {
             return ['ok' => false, 'error' => 'unknown station'];
         }
@@ -93,7 +163,7 @@ final class RadioNow
     /** Direkter HQ-Stream eines Senders (fuer Werbe-freie Wiedergabe statt TuneIn). */
     public static function streamUrl(string $stationKey): string
     {
-        return (string) (self::STATIONS[$stationKey]['stream'] ?? '');
+        return (string) (self::all()[$stationKey]['stream'] ?? '');
     }
 
     /**

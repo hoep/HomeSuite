@@ -20,7 +20,7 @@ namespace Hoep\HomeSuite\HAL;
  * Hinweis Polling-Kosten: readState() macht mehrere SOAP-Roundtrips. Das Modul sollte
  * das Refresh-Intervall im nativen Modus grosszuegig waehlen (Sonos hat kein Push).
  */
-final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
+final class SonosUpnp implements IAudioRenderer, IAudioStateReadable, IAudioQueue
 {
     private const AVT = 'urn:schemas-upnp-org:service:AVTransport:1';
     private const RC  = 'urn:schemas-upnp-org:service:RenderingControl:1';
@@ -178,17 +178,89 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
             return;
         }
         // url/dlna/library/container: als Track in die (geleerte) Queue -> abspielen.
+        // Verhalten unveraendert - nur ueber die drei benannten Schritte, damit dieselben
+        // Bausteine auch fuer ganze Sammlungen taugen.
+        $this->clearQueue();
+        $this->addToQueue($ref);
+        $this->startQueue(0);
+    }
+
+    // ==================================================================
+    // Warteschlange (IAudioQueue)
+    // ==================================================================
+
+    public function clearQueue(): void
+    {
         $this->soap(self::AVT, 'RemoveAllTracksFromQueue', '<InstanceID>0</InstanceID>');
-        $didl = $ref->metadata['didl'] ?? $this->trackDidl($ref->title, (string) ($ref->metadata['cover'] ?? ''));
-        $this->soap(self::AVT, 'AddURIToQueue',
+    }
+
+    /**
+     * Einen Titel einreihen. Liefert NewQueueLength aus der Antwort, sonst 0 - der
+     * Aufrufer erfaehrt damit, ob der Player die Einreihung wirklich angenommen hat.
+     */
+    public function addToQueue(AudioSourceRef $ref, bool $asNext = false): int
+    {
+        if ($ref->uri === '') {
+            return 0;
+        }
+        $didl = $ref->metadata['didl'] ?? $this->trackDidl(
+            $ref->title,
+            (string) ($ref->metadata['cover'] ?? ''),
+            (string) ($ref->metadata['artist'] ?? ''),
+            (string) ($ref->metadata['album'] ?? ''),
+            (string) ($ref->metadata['mime'] ?? ''),
+            (int) ($ref->metadata['durationSec'] ?? 0),
+            $ref->uri
+        );
+        $resp = $this->soap(self::AVT, 'AddURIToQueue',
             '<InstanceID>0</InstanceID><EnqueuedURI>' . $this->esc($ref->uri) . '</EnqueuedURI>'
             . '<EnqueuedURIMetaData>' . $this->esc($didl) . '</EnqueuedURIMetaData>'
-            . '<DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>');
+            . '<DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued>'
+            . '<EnqueueAsNext>' . ($asNext ? '1' : '0') . '</EnqueueAsNext>');
+        return preg_match('~<NewQueueLength>(\d+)</NewQueueLength>~', $resp, $m) ? (int) $m[1] : 0;
+    }
+
+    public function startQueue(int $index = 0): void
+    {
         $uid = (string) ($this->cfg['rincon'] ?? '');
         if ($uid !== '') {
             $this->setUri('x-rincon-queue:' . $uid . '#0', '');
         }
+        if ($index > 0) {
+            // Sonos zaehlt Titel ab 1, unsere Listen ab 0.
+            $this->soap(self::AVT, 'Seek',
+                '<InstanceID>0</InstanceID><Unit>TRACK_NR</Unit><Target>' . ($index + 1) . '</Target>');
+        }
         $this->play();
+    }
+
+    /**
+     * Eine ganze Sammlung abspielen oder anhaengen.
+     *
+     * $mode 'replace' leert vorher, 'append' haengt an die laufende Warteschlange an und
+     * laesst die Wiedergabe in Ruhe. Rueckgabe: wie viele Titel der Player angenommen hat -
+     * die Oberflaeche meldet diese Zahl, nicht die gewuenschte.
+     */
+    public function playSourceList(array $refs, string $mode = 'replace'): int
+    {
+        $refs = array_values(array_filter($refs, static fn($r) => $r instanceof AudioSourceRef && $r->uri !== ''));
+        if ($refs === []) {
+            return 0;
+        }
+        $anhaengen = ($mode === 'append');
+        if (!$anhaengen) {
+            $this->clearQueue();
+        }
+        $n = 0;
+        foreach ($refs as $r) {
+            if ($this->addToQueue($r) > 0 || $n === 0) {
+                $n++;
+            }
+        }
+        if (!$anhaengen) {
+            $this->startQueue(0);
+        }
+        return $n;
     }
 
     /** Spotify-URI (spotify:track|album|playlist:ID) auf Sonos abspielen (x-sonos-spotify). */
@@ -224,15 +296,30 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
         $this->play();
     }
 
-    /** Minimales DIDL fuer einen einzelnen Musik-Track (direkte URL). */
-    private function trackDidl(string $title, string $cover): string
+    /**
+     * DIDL fuer einen einzelnen Musik-Track (direkte URL).
+     *
+     * Sobald mehr als ein Titel in der Warteschlange steht, ist sie die Anzeige-Wahrheit:
+     * ohne Interpret, Album und Dauer stuenden dort vierzehnmal nur nackte Titel. Die
+     * Zusatzangaben sind daher kein Schmuck, sondern das, was die Liste lesbar macht.
+     */
+    private function trackDidl(string $title, string $cover, string $artist = '', string $album = '', string $mime = '', int $sec = 0, string $uri = ''): string
     {
         return '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
             . 'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
             . 'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="0" parentID="-1" restricted="true">'
             . '<dc:title>' . $this->esc($title !== '' ? $title : 'Titel') . '</dc:title>'
+            . ($artist !== '' ? '<dc:creator>' . $this->esc($artist) . '</dc:creator>' : '')
+            . ($artist !== '' ? '<upnp:artist>' . $this->esc($artist) . '</upnp:artist>' : '')
+            . ($album !== '' ? '<upnp:album>' . $this->esc($album) . '</upnp:album>' : '')
             . '<upnp:class>object.item.audioItem.musicTrack</upnp:class>'
             . ($cover !== '' ? '<upnp:albumArtURI>' . $this->esc($cover) . '</upnp:albumArtURI>' : '')
+            // <res> mit dem vom Anbieter GEMELDETEN Dateityp (nicht geraten) und der Adresse.
+            // Ohne dieses Element verwirft Sonos die Beschreibung und zeigt bis zum Vorladen
+            // den nackten Dateinamen; die Dauer wird als Attribut mitgegeben.
+            . ($uri !== '' ? '<res protocolInfo="http-get:*:' . $this->esc($mime !== '' ? $mime : 'audio/mpeg') . ':*"'
+                . ($sec > 0 ? sprintf(' duration="%d:%02d:%02d"', intdiv($sec, 3600), intdiv($sec % 3600, 60), $sec % 60) : '')
+                . '>' . $this->esc($uri) . '</res>' : '')
             . '</item></DIDL-Lite>';
     }
 
@@ -288,7 +375,17 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
             return;
         }
         if ($coordinatorUid === $self) {
-            // Ich bin Koordinator: Mitglieder joinen selbst (der Controller ruft sie einzeln).
+            // Ich soll Koordinator sein. Zwei Faelle, die frueher beide als "nichts tun"
+            // behandelt wurden - und deshalb liess sich eine Gruppe nie aufloesen:
+            //
+            //  a) Ich bin bereits eigenstaendig -> wirklich nichts zu tun; die Mitglieder
+            //     treten von sich aus bei (der Aufrufer spricht sie einzeln an).
+            //  b) Ich haenge noch in der Gruppe eines anderen -> "ich bin jetzt Koordinator"
+            //     heisst dann: austreten und die eigene Warteschlange uebernehmen. Genau das
+            //     meint das Trennen (mgmtUngroup ruft setGroupMembers(self, [self])).
+            if (($this->readGroup()['role'] ?? '') === 'member') {
+                $this->setUri('x-rincon-queue:' . $self . '#0', '');
+            }
             return;
         }
         if (in_array($self, $memberUids, true)) {
@@ -567,7 +664,11 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable
             return '';
         }
         $t = preg_quote($tag, '~');
-        if (preg_match('~<' . $t . '[^>]*>(.*?)</' . $t . '>~s', $xml, $m)) {
+        // (?=[\s/>]) verhindert, dass ein Name als PRAEFIX eines laengeren trifft:
+        // ohne das faengt <upnp:album ...> beim <upnp:albumArtURI> an, und weil dessen
+        // Ende-Marke nicht </upnp:album> lautet, laeuft der Ausdruck bis zur echten
+        // Ende-Marke durch und liefert die halbe Datenzeile als "Album".
+        if (preg_match('~<' . $t . '(?=[\s/>])[^>]*>(.*?)</' . $t . '\s*>~s', $xml, $m)) {
             return html_entity_decode(trim($m[1]), ENT_QUOTES | ENT_XML1);
         }
         return '';

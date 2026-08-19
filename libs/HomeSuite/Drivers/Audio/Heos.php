@@ -54,7 +54,13 @@ final class Heos implements IAudioRenderer
 
     public function capabilities(): AudioCapabilities
     {
-        return new AudioCapabilities(true, false, false, true, ['preset', 'station', 'playlist'], true, false, false);
+        // Das letzte Merkmal stand auf true, obwohl dieser Treiber keine einzige Zeile
+        // Warteschlangen-Code hat: playSource() behandelt nur preset und station, alles
+        // andere faellt still durch. Die Oberflaeche haette daraus "kann Warteschlange"
+        // gelesen und Tasten gezeigt, die nichts tun. HEOS beherrscht Warteschlangen im
+        // Protokoll durchaus (player/add_to_queue) - solange das hier nicht gebaut und an
+        // einem echten Geraet geprueft ist, wird es auch nicht behauptet.
+        return new AudioCapabilities(true, false, false, true, ['preset', 'station'], true, false, false);
     }
 
     public static function discover(int $timeoutMs = 2000): array
