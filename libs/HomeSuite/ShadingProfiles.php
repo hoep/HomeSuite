@@ -46,6 +46,17 @@ final class ShadingProfiles
                 // Helligkeit faehrt zu, jede Wolke wieder auf. 0 = keine Hysterese (wie bisher).
                 'brightnessOff' => ['type' => 'int',   'min' => 0,   'max' => 200000, 'unit' => 'W/m²',
                                     'label' => 'Sonne AUS unter (W/m²) — 0 = aus'],
+                // KLARHEITSINDEX: gemessene Strahlung geteilt durch die, die bei diesem
+                // Sonnenstand bei klarem Himmel moeglich waere. Eine feste W/m²-Schwelle
+                // bedeutet je nach Tages- und Jahreszeit etwas anderes - 300 W/m² sind im
+                // Juni um 13 Uhr eine dichte Wolkendecke und im Oktober um 9 Uhr blauer
+                // Himmel. Der Index ist davon unabhaengig: klar ~0,75, bedeckt ~0,2.
+                // Wirkt ZUSAETZLICH zu den W/m²-Schwellen (beide muessen erfuellt sein),
+                // damit bei sehr tiefer Sonne kein hoher Index ohne Energie beschattet.
+                'clearMin' => ['type' => 'int', 'min' => 0, 'max' => 100, 'unit' => '%',
+                               'label' => 'Sonne AB Klarheit (%) — 0 = aus'],
+                'clearOff' => ['type' => 'int', 'min' => 0, 'max' => 100, 'unit' => '%',
+                               'label' => 'Sonne AUS unter Klarheit (%) — 0 = aus'],
                 // closePct (Schliessgrad) ist PRO ROLLO (Baum-Var SunClose, im Besonnung-Widget
                 // einstellbar) - bewusst NICHT im geteilten Profil-Schema, sonst doppelt.
             ]],
@@ -118,6 +129,8 @@ final class ShadingProfiles
                     'elevation'     => (int) ($f['elevation'] ?? 0),
                     'brightnessMin' => (int) ($f['brightnessMin'] ?? 0),
                     'brightnessOff' => (int) ($f['brightnessOff'] ?? 0),
+                    'clearMin'      => (int) ($f['clearMin'] ?? 0),
+                    'clearOff'      => (int) ($f['clearOff'] ?? 0),
                     'closePct'      => (int) ($f['closePct'] ?? 100),
                     'profile'       => true,
                 ]];

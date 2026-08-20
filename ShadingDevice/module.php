@@ -1235,7 +1235,11 @@ class ShadingDevice extends EntityModule
                 // Strahlung 18:08 unter 300, Aufblenden 18:13 bei 281 W/m2 statt bei 180).
                 return ['azimuthBgn' => $bgn, 'azimuthEnd' => $end, 'elevation' => $el,
                         'closePct' => $cp, 'brightnessMin' => (int) ($st['brightnessMin'] ?? 0),
-                        'brightnessOff' => (int) ($st['brightnessOff'] ?? 0)];
+                        'brightnessOff' => (int) ($st['brightnessOff'] ?? 0),
+                        // Klarheits-Schwellen wie brightnessOff aus dem Store durchreichen -
+                        // sie haben keine eigene Baum-Variable, wuerden hier sonst verschwinden.
+                        'clearMin' => (int) ($st['clearMin'] ?? 0),
+                        'clearOff' => (int) ($st['clearOff'] ?? 0)];
             }
         }
         $st = $this->cfgVal('geoProfile', null);
@@ -1316,6 +1320,8 @@ class ShadingDevice extends EntityModule
             'rawSun'       => $d['rawSun'],
             'sunTarget'    => $d['sunTarget'],
             'schedTarget'  => $d['schedTarget'],
+            'clearIdx'     => $d['clearIdx'] ?? null,
+            'clearThr'     => $d['clearThr'] ?? null,
             'inputs'       => $d['inp'],
             'sunEvents'    => $this->sunEvents(time()),
             'geoProfile'   => $this->geoProfile(),
@@ -1569,7 +1575,14 @@ class ShadingDevice extends EntityModule
             . 'die Variable hier oben — in DEREN Einheit. Aktuell gemessen: '
             . ($brightNow === null ? 'kein Messwert' : sprintf('%.0f', $brightNow))
             . ', Schwellen aus dem zugewiesenen Sonnenprofil: '
-            . (int) ($geoNow['brightnessMin'] ?? 0) . ' ein / ' . (int) ($geoNow['brightnessOff'] ?? 0) . ' aus.'];
+            . (int) ($geoNow['brightnessMin'] ?? 0) . ' ein / ' . (int) ($geoNow['brightnessOff'] ?? 0) . ' aus.'
+            . ((int) ($geoNow['clearMin'] ?? 0) > 0
+                ? (' Zusaetzlich Klarheit (Anteil am Klarhimmel-Wert): '
+                   . (int) $geoNow['clearMin'] . '% ein / ' . (int) ($geoNow['clearOff'] ?? 0) . '% aus, aktuell '
+                   . (($kcNow = $this->clearIndex($brightNow, $this->envNum('sunElId', self::SUN_EL_ID))) === null
+                        ? 'nicht bestimmbar (Sonne zu tief)'
+                        : sprintf('%.0f%%', $kcNow * 100)) . '.')
+                : ' Klarheits-Schranke aus.')];
         $el[] = ['type' => 'Label', 'caption' => '— Sonnenzeit-Quelle (fuer Sonnen-Anker im Zeitplan) —'];
         $el[] = ['type' => 'Select', 'name' => 'SunSource', 'caption' => 'Quelle', 'options' => [
             ['caption' => 'Location-Instanz (Symcon-Standort)', 'value' => 'location'],
@@ -2257,6 +2270,23 @@ class ShadingDevice extends EntityModule
                 $rawSun = null;
             }
         }
+        // Klarheits-Gate: eine feste W/m²-Schwelle bedeutet je nach Sonnenstand etwas
+        // anderes - 271 W/m² sind im August um 13 Uhr eine dichte Wolkendecke (ein Drittel
+        // des Moeglichen) und im Oktober um 9 Uhr strahlender Himmel. Deshalb zusaetzlich
+        // der Anteil am Klarhimmel-Wert. Auch hier Hysterese: laeuft die Beschattung,
+        // zaehlt die niedrigere AUS-Schwelle.
+        if ($rawSun !== null && is_array($geo)) {
+            $cMin = (float) ($geo['clearMin'] ?? 0) / 100.0;
+            $cOff = (float) ($geo['clearOff'] ?? 0) / 100.0;
+            if ($cMin > 0) {
+                if (!empty($rtH['sunOn']) && $cOff > 0) { $cMin = $cOff; }
+                $kc = $this->clearIndex($inp['bright'] ?? null, $inp['el'] ?? null);
+                if ($kc !== null && $kc < $cMin) {
+                    $this->SendDebug('HSSH.sun', sprintf('Sonne verworfen: Klarheit %.0f%% < %.0f%%', $kc * 100, $cMin * 100), 0);
+                    $rawSun = null;
+                }
+            }
+        }
         $sunTarget = $this->debounceSun($rawSun, $persist);
         // Temp-Gate: Sonnen-Beschattung nur, wenn Temperatur ueber Schwelle (IPSShadowing shadowingByTemp).
         // Zwei Schwellen wie in IPSShadowing ProfileTemp: Innen (sensorId>=aboveC) UND Aussen
@@ -2306,6 +2336,14 @@ class ShadingDevice extends EntityModule
             'rawSun' => $rawSun, 'sunTarget' => $sunTarget, 'schedTarget' => $schedTarget,
             'storm' => $storm, 'safe' => $safe, 'held' => $held, 'target' => $target,
             'doorOpen' => $doorOpen, 'blockedByDoor' => $blocked,
+            // Klarheit mitgeben: sonst steht im Trockenlauf nur "Sonne ja/nein", und die
+            // knappen Faelle (37 % gegen die 35er-Schwelle) sind von aussen nicht erklaerbar.
+            'clearIdx' => (($kc = $this->clearIndex($inp['bright'] ?? null, $inp['el'] ?? null)) === null)
+                            ? null : round($kc * 100),
+            'clearThr' => (is_array($geo) && (int) ($geo['clearMin'] ?? 0) > 0)
+                            ? (!empty($rtH['sunOn']) && (int) ($geo['clearOff'] ?? 0) > 0
+                                ? (int) $geo['clearOff'] : (int) $geo['clearMin'])
+                            : null,
         ];
     }
 
@@ -2341,6 +2379,26 @@ class ShadingDevice extends EntityModule
             $this->writeRt($rt);
         }
         return $state ? $lastTarget : null;
+    }
+
+    /**
+     * Klarheitsindex: gemessene Globalstrahlung geteilt durch die, die bei diesem
+     * Sonnenstand unter klarem Himmel moeglich waere (Haurwitz-Modell). Klarer Himmel
+     * liegt bei rund 0,75-0,95, bedeckt bei 0,15-0,35. Anders als eine feste W/m²-Schwelle
+     * bedeutet der Wert um 9 Uhr dasselbe wie um 13 Uhr und im Dezember dasselbe wie im Juni.
+     *
+     * Bei sehr tiefer Sonne liefert das Modell null statt eines Werts: unter etwa 3 Grad
+     * traegt es nicht mehr, und ein durch die Division aufgeblasener Index wuerde dort
+     * Beschattung rechtfertigen, wo kaum Energie ankommt.
+     */
+    private function clearIndex(?float $ghi, ?float $elDeg): ?float
+    {
+        if ($ghi === null || $elDeg === null) { return null; }
+        $s = sin(deg2rad($elDeg));
+        if ($s <= 0.05) { return null; }                       // ~3 Grad
+        $clear = 1098.0 * $s * exp(-0.057 / $s);               // Haurwitz-Klarhimmel (W/m²)
+        if ($clear < 50.0) { return null; }
+        return max(0.0, $ghi) / $clear;
     }
 
     /** Sturm-/Regen-Lage aus den Umgebungssensoren (Regen nur wenn Wetterprofil rainClose). */
