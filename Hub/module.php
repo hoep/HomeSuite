@@ -529,7 +529,8 @@ class HomeSuiteHub extends EntityModule
         foreach ([['lightAutoGet', 'Automatik-Regeln lesen'], ['lightAutoSet', 'Automatik-Regeln speichern'],
                   ['lightAutoTick', 'Automatik jetzt auswerten (Test)'],
                   ['lightAutoBandGet', 'Zeitsteuerung (Baender) lesen'],
-                  ['lightAutoBandSet', 'Zeitsteuerung (Baender) speichern']] as $la) {
+                  ['lightAutoBandSet', 'Zeitsteuerung (Baender) speichern'],
+                  ['houseGeo', 'Hausgeometrie lesen (Nordausrichtung, Koordinaten)']] as $la) {
             $m->addManagementAction(['op' => $la[0], 'verb' => $la[0], 'target' => 'hub',
                 'label' => $la[1], 'destructive' => false, 'fields' => []]);
         }
@@ -903,6 +904,15 @@ class HomeSuiteHub extends EntityModule
                 return $this->mgmtMediaResolve($args);
         }
 
+        if ($op === 'houseGeo') {
+            // Geometrie des Hauses an EINER Stelle: Nordausrichtung und Koordinaten. Die
+            // Anzeige-Widgets sollen sie hier holen, statt sie doppelt gepflegt zu bekommen.
+            $co = $this->sunCoords();
+            return ['ok' => true,
+                'northDeg' => round((float) $this->ReadPropertyFloat('ShadeNorthDeg'), 2),
+                'lat' => (float) ($co['lat'] ?? 48.2082),
+                'lon' => (float) ($co['lon'] ?? 16.3738)];
+        }
         if (strncmp($op, 'lightAuto', 9) === 0) {
             return $this->mgmtLightAuto($op, $args, $ctx);
         }
