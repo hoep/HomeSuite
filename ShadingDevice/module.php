@@ -2404,10 +2404,27 @@ class ShadingDevice extends EntityModule
     /** Sturm-/Regen-Lage aus den Umgebungssensoren (Regen nur wenn Wetterprofil rainClose). */
     private function stormActive(array $inp): bool
     {
+        // Die Safety-Stufe faehrt auf safePos, und safePos ist die EINGEFAHRENE
+        // Lage. Bei einer Markise ist das der Sinn der Sache: Wind und Nass machen
+        // sie kaputt, also weg damit. Bei einem Rollo bedeutet dieselbe Lage OFFEN -
+        // die "Sicherung" reisst das Rollo auf, statt es zu schuetzen. Ein Rollo
+        // laeuft in seinen Fuehrungsschienen und braucht keinen Sturmschutz.
+        //
+        // Am 20.08. hat Regen ein Rollo vierzehnmal aufgefahren, bei 0 km/h Wind.
+        // Mit Wind waere dasselbe passiert, nur haus-weit.
+        //
+        // Deshalb: Sturm gilt ausschliesslich fuer Markisen.
+        if ((string) $this->cfgVal('deviceKind', 'shutter') !== 'awning') {
+            return false;
+        }
         $windMax = (float) $this->cfgVal('windStormKmh', self::WIND_STORM_KMH);
         $wind    = $inp['wind'];
-        $rainOn  = (bool) $this->cfgVal('rainClose', true);
-        return (($wind !== null) && $wind >= $windMax) || ($rainOn && $inp['rain'] === true);
+        if (($wind !== null) && $wind >= $windMax) {
+            return true;
+        }
+        // Vorgabe false: eine Instanz ohne ausdrueckliche Einstellung darf sich
+        // nicht selbst scharf schalten. Vorher stand hier true.
+        return ($inp['rain'] === true) && (bool) $this->cfgVal('rainClose', false);
     }
 
     /** Aktuelle Temperatur fuer das Temp-Gate (tg.sensorId; null = kein Sensor -> kein Gate). */
