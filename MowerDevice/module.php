@@ -31,6 +31,13 @@ use Hoep\HomeSuite\HAL\IMower;
 class MowerDevice extends EntityModule
 {
     private const TIMER_REFRESH = 'Refresh';
+
+    /** Stufen des Automatik-Waehlers (Profil HSMW.AutoMode). */
+    private const AUTO_AUTO    = 0;  // Geraet folgt seinem eigenen Wochenplan
+    private const AUTO_PAUSE   = 1;  // niemand fuehrt ihn: Autologik aus UND geparkt
+    private const AUTO_MANUELL = 2;  // nur Handbetrieb, wir schicken nichts von selbst
+    private const AUTO_LOGIK   = 3;  // Regen-Autologik fuehrt (Skripte #<ID>/#<ID>)
+
     private const DEF_POLL_S     = 20;   // Sekunden (dss ohne Limits -> schneller Poll = „Echtzeit")
     private const FULL_POLL_S    = 900;  // Voll-Poll (Statistik/Timer/Geofence/Messages/WorkAreas) alle 15 Min
 
@@ -339,7 +346,23 @@ class MowerDevice extends EntityModule
             case 'ConfirmError':  $this->gated('ConfirmError', fn(IMower $d) => $d->confirmError()); break;
             case 'CuttingHeight': $this->gated('CuttingHeight', fn(IMower $d) => $d->setCuttingHeight((int) $value)); break;
             case 'Headlight':     $this->gated('Headlight', fn(IMower $d) => $d->setHeadlight($this->headlightModeStr((int) $value))); break;
-            case 'AutoMode':      $this->SetValue('AutoMode', (int) $value); break; // lokale Automatik-Einstellung, kein Mäher-Befehl, nicht gated
+            case 'AutoMode':
+                // Die Stufe waehlt, WER den Maeher fuehrt - und "Pause" soll heissen, dass
+                // niemand ihn fuehrt: weder die Autologik noch sein eigener Wochenplan.
+                // Deshalb ist Pause nicht nur eine Notiz, sondern schickt ihn heim.
+                $alt = (int) $this->GetValue('AutoMode');
+                $neu = (int) $value;
+                $this->SetValue('AutoMode', $neu);
+                if ($neu === self::AUTO_PAUSE) {
+                    // Bis auf Weiteres parken - haelt ihn auch ueber den geraeteeigenen Plan hinaus drin.
+                    $this->gated('AutoMode=Pause -> Park', fn(IMower $d) => $d->park('furtherNotice', 0));
+                } elseif ($alt === self::AUTO_PAUSE && $neu === self::AUTO_AUTO) {
+                    // Genau die Umkehrung: das "bis auf Weiteres" aufheben und wieder dem
+                    // eigenen Plan folgen. Nur aus Pause heraus - stuende er gerade im
+                    // Maehen und wir schickten hier ein Park, wuerden wir ihn abwuergen.
+                    $this->gated('AutoMode=Auto -> Plan', fn(IMower $d) => $d->park('nextSchedule', 0));
+                }
+                break;
             default:
                 $this->SendDebug('HSMW.apply', $c->ident . '=' . (is_scalar($value) ? (string) $value : '?'), 0);
                 break;
