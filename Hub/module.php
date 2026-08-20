@@ -2602,7 +2602,7 @@ class HomeSuiteHub extends EntityModule
         if (!function_exists('IPS_GetInstanceListByModuleID')) {
             return $entities;
         }
-        foreach ($this->domainGuids() as [$guid, $domain]) {
+        foreach (array_merge($this->domainGuids(), $this->fremdeEntitaetsGuids()) as [$guid, $domain]) {
             $ids = @\IPS_GetInstanceListByModuleID($guid);
             if (!is_array($ids)) {
                 continue;
@@ -2637,6 +2637,25 @@ class HomeSuiteHub extends EntityModule
             [self::GUID_HSAU,  'audio'],
             [self::GUID_HSAUX, 'audio'],
             [self::GUID_HSIR,  'irrigation'],
+        ];
+    }
+
+    /**
+     * Geraete aus FREMDEN Libraries, die im Raumbaum erscheinen sollen.
+     *
+     * Bewusst getrennt von domainGuids(): daraus entsteht ueber domainGuidList()
+     * auch die Whitelist, die bestimmt, an welche Instanzen der Hub PREFIX_Manage
+     * schicken darf. Ein Modul im Raumbaum zu zeigen und ihm Befehle schicken zu
+     * duerfen sind zwei verschiedene Dinge - und das Zweite ist eine
+     * Sicherheitsgrenze, die wegen einer Anzeige nicht aufgeweicht wird.
+     *
+     * @return list<array{0:string,1:string}> [guid, domaene]
+     */
+    private function fremdeEntitaetsGuids(): array
+    {
+        return [
+            // EnigmaReceiver (eigene Library SymconEnigmaReceiver, Prefix ER)
+            ['{34B2530B-BFFE-4691-9937-385917E12D51}', 'media'],
         ];
     }
 
