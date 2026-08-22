@@ -1290,6 +1290,103 @@ class PoolController extends EntityModule
             });
     }
 
+
+    /**
+     * Mehrere Felder MEHRERER Regeln einer Sektion in EINEM Read-Modify-Write.
+     *
+     * Die Einzelfassung writeRuleField() liest und schreibt je Feld die ganze
+     * Sektion. Hier passiert das genau einmal, egal wie viele Felder und Regeln
+     * betroffen sind - der eigentliche Zweck der Sammelspeicherung.
+     *
+     * @param array<int,array<string,mixed>> $proRegel regelIndex => [feld => wert]
+     * @return array{ok:bool,error?:string,felder?:int,regeln?:int}
+     */
+    private function writeRuleFields(string $section, array $proRegel): array
+    {
+        $maps = [
+            'TEMPC'   => ['ena' => 0, 'rel' => 1, 'start' => 2, 'end' => 3, 'state' => 4,
+                'sens1' => 5, 'sens2' => 6, 'logic' => 7, 'diff' => 8, 'hyst' => 9],
+            'ADCC'    => ['ena' => 0, 'rel' => 1, 'state' => 2, 'drel' => 3, 'start' => 4, 'end' => 5,
+                'sens' => 6, 'logic' => 7, 'diff' => 8, 'hyst' => 9, 'cLow' => 10, 'lower' => 11,
+                'cHigh' => 12, 'upper' => 13, 'bad' => 14, 'good' => 15],
+            'SWITCHC' => ['ena' => 0, 'inp' => 1, 'rel' => 2, 'func' => 3, 'time' => 4, 'state' => 5],
+        ];
+        if (!isset($maps[$section])) {
+            return ['ok' => false, 'error' => 'bad_section'];
+        }
+        $defs = ['TEMPC' => self::TEMPC_DEFAULT, 'ADCC' => self::ADCC_DEFAULT, 'SWITCHC' => self::SWITCHC_DEFAULT];
+        $bool = ['ena' => 1, 'state' => 1, 'cLow' => 1, 'cHigh' => 1];
+        $map  = $maps[$section];
+        $zahl = 0;
+        foreach ($proRegel as $f) { $zahl += count($f); }
+
+        $r = $this->gatedWrite('rules', 'cfg:' . $section . ':sammel',
+            function ($cl) use ($section, $proRegel, $map, $bool, $defs) {
+                $cur = $cl->getRules($section);
+                if (empty($cur['ok'])) {
+                    return ['ok' => false, 'error' => 'read_before_write_failed'];
+                }
+                $rules = $cur['rules'];
+                $def   = $defs[$section];
+
+                // ENTSCHEIDEND: setRules() schickt IMMER die ganze Sektion und
+                // schreibt fuer jede Regel, die nicht mitgeliefert wird, lauter
+                // Nullen (PoolClient::setRules, array_fill bei fehlendem Index).
+                // getRules() liefert aber nur die Zeilen, die in der ini wirklich
+                // stehen. Ist der Lesevorgang unvollstaendig, wuerde ein
+                // Rueckschreiben das restliche Regelwerk LOESCHEN. Also lieber
+                // gar nicht schreiben.
+                $erwartet = ['TEMPC' => 8, 'ADCC' => 8, 'SWITCHC' => 8][$section] ?? 8;
+                for ($i = 0; $i < $erwartet; $i++) {
+                    if (!isset($rules[$i]) || !is_array($rules[$i])) {
+                        return ['ok' => false, 'error' => 'unvollstaendig_gelesen: Regel ' . $i
+                            . ' fehlt - Sektion wird NICHT geschrieben'];
+                    }
+                }
+
+                if ($section === 'TEMPC') {
+                    for ($i = 0; $i < 8; $i++) {
+                        if (array_sum(array_map('abs', $rules[$i])) === 0) {
+                            $rules[$i] = $def;
+                        }
+                    }
+                }
+                foreach ($proRegel as $ruleIndex => $felder) {
+                    $ruleIndex = (int) $ruleIndex;
+                    $rule = $rules[$ruleIndex] ?? $def;
+                    if (array_sum(array_map('abs', $rule)) === 0) {
+                        $rule = $def;
+                    }
+                    // Den Sensor ZUERST setzen: bei ADCC haengt die Umrechnung der
+                    // Schwellen an seiner Kennlinie. Andersherum wuerde mit der alten
+                    // Kennlinie gerechnet und der Schwellwert waere daneben.
+                    uksort($felder, function ($a, $b) {
+                        $p = ['sens' => 0, 'sens1' => 0, 'sens2' => 0];
+                        return ($p[$a] ?? 1) <=> ($p[$b] ?? 1);
+                    });
+                    foreach ($felder as $field => $value) {
+                        if (!isset($map[$field])) {
+                            continue;
+                        }
+                        if (isset($bool[$field])) {
+                            $conv = ((bool) $value) ? 1 : 0;
+                        } elseif ($section === 'TEMPC' && ($field === 'diff' || $field === 'hyst')) {
+                            $conv = (int) round(((float) $value) * 100);
+                        } elseif ($section === 'ADCC' && in_array($field, ['diff', 'hyst', 'lower', 'upper'], true)) {
+                            [$offs, $gain] = $this->adccSensorScale($cl, (int) $rule[6]);
+                            $conv = (int) round($gain != 0.0 ? ((float) $value - $offs) / $gain : 0.0);
+                        } else {
+                            $conv = (int) round((float) $value);
+                        }
+                        $rule[$map[$field]] = $conv;
+                    }
+                    $rules[$ruleIndex] = $rule;
+                }
+                return $cl->setRules($section, $rules);
+            });
+        return $r + ['felder' => $zahl, 'regeln' => count($proRegel)];
+    }
+
     /** Geraete-Dosierung ein/aus (type 0=Cl/Redox, 1=pH-). Liest Konfig, setzt enabled, schreibt (gated). */
     private function applyDosingEnable(int $type, bool $on): void
     {
@@ -3396,6 +3493,416 @@ class PoolController extends EntityModule
     // Control-Setter ueber SetControl; Sollwerte/Dosierung/Wartung ueber Manage.
     // Realer Effekt nur bei Armed=true (Global-Gate).
     // ==================================================================
+
+
+    /**
+     * Mehrere Konfigurationswerte in EINEM Zug an den Controller schreiben.
+     *
+     * Der Grund ist die Schreiblast. Jede einzelne Aenderung geht heute als
+     * eigener Read-Modify-Write der GANZEN Sektion an das Geraet: Regelwerk
+     * lesen, ein Feld ersetzen, Regelwerk zurueckschreiben. Wer eine Regel mit
+     * fuenf Feldern anpasst, loest damit fuenf komplette Sektionsschreibungen
+     * aus - gegen ein Stundenbudget von 60 und mit Wartezeit bei gehaltener
+     * Geraete-Semaphore.
+     *
+     * Diese Funktion sammelt die Aenderungen, gruppiert sie nach Sektion und
+     * schreibt je Sektion genau EINMAL. Dieselben fuenf Felder kosten damit
+     * einen Schreibvorgang, und selbst Aenderungen an mehreren Regeln derselben
+     * Sektion kosten zusammen nur einen.
+     *
+     * @param string $Json {"<VariablenID oder Ident>": <Wert>, ...}
+     * @return string JSON-Bericht: was geschrieben wurde, wie viele Geraetezugriffe
+     *                daraus wurden und was abgelehnt wurde.
+     */
+    public function SchreibeSammlung(string $Json, bool $Trocken = false): string
+    {
+        $ein = json_decode($Json, true);
+        if (!is_array($ein) || $ein === []) {
+            return json_encode(['ok' => false, 'fehler' => 'nichts zu schreiben'], JSON_UNESCAPED_UNICODE);
+        }
+
+        $vars = $this->cfgVars();
+        $offen = [];     // ident => Wert
+        $abgelehnt = [];
+
+        foreach ($ein as $schluessel => $wert) {
+            $ident = (string) $schluessel;
+            if (ctype_digit($ident)) {                       // Variablen-ID -> Ident
+                $vid = (int) $ident;
+                $ident = @IPS_ObjectExists($vid) ? (string) IPS_GetObject($vid)['ObjectIdent'] : '';
+            }
+            if ($ident === '' || !isset($vars[$ident])) {
+                $abgelehnt[] = (string) $schluessel . ': unbekannt';
+                continue;
+            }
+            if (!empty($vars[$ident]['ro'])) {
+                $abgelehnt[] = $ident . ': nur Anzeige';
+                continue;
+            }
+            $offen[$ident] = $wert;
+        }
+        if ($offen === []) {
+            return json_encode(['ok' => false, 'fehler' => 'keine schreibbare Variable dabei',
+                                'abgelehnt' => $abgelehnt], JSON_UNESCAPED_UNICODE);
+        }
+
+        // --- Gruppieren -------------------------------------------------------
+        $regeln = [];    // SECTION => [regelIndex => [feld => wert]]
+        $sammel = [];    // Gruppenschluessel => ['grp'=>..,'e'=>Musterelement,'felder'=>[feld=>wert]]
+        foreach ($offen as $ident => $wert) {
+            $e = $vars[$ident];
+            $grp = (string) $e['grp'];
+            if ($grp === 'tempc' || $grp === 'adcc' || $grp === 'switchc') {
+                $regeln[strtoupper($grp)][(int) $e['index']][(string) $e['field']] = $wert;
+                continue;
+            }
+            // Skalare Sektionen: je Ziel EIN Aufruf mit allen Feldern. Die
+            // zustaendigen Ops nehmen ohnehin schon Feldlisten entgegen -
+            // bisher hat sie nur niemand gebuendelt aufgerufen.
+            $k = $grp . '|' . (string) ($e['type'] ?? '') . '|' . (string) ($e['kind'] ?? '')
+               . '|' . (string) ($e['index'] ?? '') . '|' . (string) $e['op'];
+            if (!isset($sammel[$k])) {
+                $sammel[$k] = ['grp' => $grp, 'e' => $e, 'felder' => []];
+            }
+            $sammel[$k]['felder'][(string) $e['field']] = $wert;
+        }
+
+        if ($Trocken) {
+            // Zeigt, was passieren WUERDE. Kein Geraetezugriff, kein Gate beruehrt.
+            $plan = [];
+            foreach ($regeln as $section => $proRegel) {
+                $z = 0;
+                foreach ($proRegel as $f) { $z += count($f); }
+                $plan[] = ['ziel' => $section, 'regeln' => array_keys($proRegel), 'felder' => $z, 'zugriffe' => 1];
+            }
+            foreach ($sammel as $g) {
+                $plan[] = ['ziel' => $g['grp'] . ((string) ($g['e']['index'] ?? '') !== '' ? (' #' . $g['e']['index']) : ''),
+                           'felder' => count($g['felder']), 'zugriffe' => 1];
+            }
+            $anzT = count($offen);
+            $zugT = count($plan);
+            return json_encode(['ok' => true, 'trocken' => true, 'werte' => $anzT, 'zugriffe' => $zugT,
+                                'gespart' => max(0, $anzT - $zugT), 'plan' => $plan,
+                                'abgelehnt' => $abgelehnt], JSON_UNESCAPED_UNICODE);
+        }
+
+        $zugriffe = 0;
+        $fehler = [];
+
+        // --- Regelsektionen: EIN Schreibvorgang je Sektion --------------------
+        foreach ($regeln as $section => $proRegel) {
+            $r = $this->writeRuleFields($section, $proRegel);
+            $zugriffe++;
+            if (empty($r['ok'])) {
+                $fehler[] = $section . ': ' . (string) ($r['error'] ?? 'fehlgeschlagen');
+            }
+        }
+
+        // --- Skalare Sektionen ------------------------------------------------
+        foreach ($sammel as $g) {
+            $e = $g['e'];
+            $f = $g['felder'];
+            $zugriffe++;
+            switch ($g['grp']) {
+                case 'rdx':
+                case 'ph':
+                    foreach ($f as $k2 => $v2) {
+                        if (is_bool($v2)) { $f[$k2] = (int) $v2; }
+                    }
+                    $this->mgmt('setDosageFull', ['type' => (int) $e['type']] + $f, []);
+                    break;
+                case 'sensor':
+                    $this->mgmt('setSensorChannel', ['kind' => (string) $e['kind'],
+                        'index' => (int) $e['index'], 'patch' => $f], []);
+                    break;
+                case 'network':
+                    $this->mgmt('setNetworkFields', ['fields' => $f], []);
+                    break;
+                case 'other':
+                    $this->mgmt('setOther', ['other' => $f], []);
+                    break;
+                case 'email':
+                    if ((string) $e['op'] === 'setEmailServer') {
+                        $this->mgmt('setEmailServer', ['server' => $f], []);
+                    } else {
+                        $args = ['fields' => $f];
+                        if ($e['index'] !== null) { $args['index'] = (int) $e['index']; }
+                        $this->mgmt('setEmailAccount', $args, []);
+                    }
+                    break;
+                case 'contacts':
+                    $this->mgmt('setContacts', ['contacts' => [(int) $e['index'] => (string) reset($f)]], []);
+                    break;
+                case 'dtc':
+                    // Ein Aufruf je Fehlercode - die Op nimmt nur einen entgegen.
+                    $this->mgmt('setDtcField', ['code' => (int) $e['index'], 'level' => (int) reset($f)], []);
+                    break;
+                case 'cal':
+                    $cal = [];
+                    foreach ($f as $feld => $v2) {
+                        [$ch, $param] = array_pad(explode('.', $feld, 2), 2, '');
+                        $cal[$ch][$param] = (int) $v2;
+                    }
+                    $this->mgmt((string) $e['op'], ['cal' => $cal], []);
+                    break;
+                default:
+                    $zugriffe--;
+                    $fehler[] = $g['grp'] . ': unbekannte Gruppe';
+            }
+        }
+
+        $anz = count($offen);
+        $this->SendDebug('HSPC.sammel', $anz . ' Werte in ' . $zugriffe . ' Geraetezugriffen', 0);
+
+        return json_encode([
+            'ok'         => $fehler === [],
+            'werte'      => $anz,
+            'zugriffe'   => $zugriffe,
+            'gespart'    => max(0, $anz - $zugriffe),
+            'abgelehnt'  => $abgelehnt,
+            'fehler'     => $fehler,
+        ], JSON_UNESCAPED_UNICODE);
+    }
+
+
+    // ==================================================================
+    // Zeitplaene je Relais  <->  TIMEC
+    //
+    // Die Umwaelzpumpe hat ihren Wochenplan seit jeher ('FilterSchedule') und
+    // behaelt ihn - samt Umwaelzautomatik, die ihn zeitweise uebernimmt. Fuer die
+    // uebrigen Relais entstehen eigene Wochenplaene, damit eine Zeitsteuerung
+    // dort genauso aussieht wie bei der Pumpe.
+    //
+    // Warum Wochenplaene und keine Regeltabelle: eine TIMEC-Regel ist
+    //   [aktiv, Relais, Tagesmaske, 4x (aktiv, Von, Bis)]
+    // Wer sieben unterschiedliche Wochentage will, muss das von Hand auf mehrere
+    // Regeln verteilen und Tagesmasken zusammenrechnen. Genau diese Uebersetzung
+    // macht TimecSchedule bereits; der Wochenplan ist die Oberflaeche dazu.
+    //
+    // Die Belegung der 16 Regelplaetze macht TimecSchedule::groupsToRules selbst:
+    // eigene aktive Regeln zuerst (stabile Indizes), dann freie Plaetze, fremde
+    // aktive Regeln bleiben unangetastet. Ein festes Budget je Relais gibt es
+    // daher bewusst nicht.
+    // ==================================================================
+
+    /** Relaisindex -> Klartext, aus den vorhandenen Modus-Variablen (Ident Relay<n>Mode). */
+    private function relaisNamen(): array
+    {
+        $n = [];
+        for ($i = 0; $i <= 7; $i++) {
+            $vid = @$this->GetIDForIdent('Relay' . $i . 'Mode');
+            $nm  = ($vid > 0) ? trim(str_replace(' Modus', '', (string) @IPS_GetName($vid))) : '';
+            $n[$i] = $nm !== '' ? $nm : ('Relais ' . ($i + 1));
+        }
+        return $n;
+    }
+
+    /**
+     * Wochenplan-Ereignis je Relais. Relais 0 ist die Pumpe und nutzt den
+     * bestehenden Filterplan; fuer 1..7 wird bei Bedarf einer angelegt.
+     *
+     * Die neuen Plaene bleiben INAKTIV: sie dienen nur als Datenquelle fuer die
+     * Uebersetzung. Ein aktiver Wochenplan ohne Aktionsziel wuerde das Log
+     * volllaufen lassen.
+     *
+     * @return array<int,int> relaisIndex => EreignisID (0 = keins)
+     */
+    private function zeitplanEreignisse(bool $anlegen = true): array
+    {
+        $namen = $this->relaisNamen();
+        $out = [0 => $this->scheduleEventId()];
+        if (!function_exists('IPS_CreateEvent')) {
+            return $out;
+        }
+        for ($i = 1; $i <= 7; $i++) {
+            $ident = 'Schedule_R' . $i;
+            $eid = @$this->GetIDForIdent($ident);
+            $eid = (is_int($eid) && $eid > 0) ? $eid : 0;
+            if ($eid === 0 && $anlegen) {
+                $eid = (int) @IPS_CreateEvent(2);            // 2 = Wochenplan
+                if ($eid > 0) {
+                    @IPS_SetParent($eid, $this->InstanceID);
+                    @IPS_SetIdent($eid, $ident);
+                    @IPS_SetName($eid, 'Zeitplan ' . $namen[$i]);
+                    @IPS_SetEventScheduleAction($eid, 0, 'Aus', 0x9AA5AD, '');
+                    @IPS_SetEventScheduleAction($eid, 1, 'Ein', 0x00CDAB, '');
+                    @IPS_SetEventActive($eid, false);
+                }
+            }
+            $out[$i] = $eid;
+        }
+        return $out;
+    }
+
+    /**
+     * Alle Relais-Zeitplaene in EINEM Schreibvorgang an den Controller geben.
+     *
+     * Entscheidend ist das "in einem": setRules() schickt immer die komplette
+     * Sektion. Sieben Relais nacheinander zu schreiben waeren sieben volle
+     * Sektionsschreibungen gegen ein Stundenbudget von 60. Deshalb wird der
+     * Regelsatz hier durchgereicht - jedes Relais legt seine Regeln in denselben
+     * Satz - und erst am Ende einmal geschrieben.
+     *
+     * Der Plan der Pumpe (Relais 0) bleibt aussen vor: er hat seinen eigenen,
+     * erprobten Weg samt Umwaelzautomatik.
+     *
+     * @return array{ok:bool,relais:array,warnungen:array,geschrieben:bool,fehler?:string}
+     */
+    private function schreibeRelaisZeitplaene(bool $trocken = false): array
+    {
+        $cl = $this->client();
+        if ($cl === null) {
+            return ['ok' => false, 'fehler' => 'not_configured', 'relais' => [], 'warnungen' => [], 'geschrieben' => false];
+        }
+        $cur = $cl->getRules('TIMEC');
+        if (empty($cur['ok'])) {
+            return ['ok' => false, 'fehler' => 'read_before_write_failed', 'relais' => [], 'warnungen' => [], 'geschrieben' => false];
+        }
+        $rules = $cur['rules'];
+        $namen = $this->relaisNamen();
+        $eids  = $this->zeitplanEreignisse();
+        $bericht = [];
+        $warn = [];
+
+        for ($i = 1; $i <= 7; $i++) {
+            $eid = (int) ($eids[$i] ?? 0);
+            $gruppen = ($eid > 0) ? $this->groupsFromEvent($eid) : [];
+            $w = [];
+            $rules = TimecSchedule::groupsToRules($gruppen, $i, $rules, $w);
+            foreach ($w as $x) { $warn[] = $namen[$i] . ': ' . $x; }
+            $bericht[] = ['relais' => $i, 'name' => $namen[$i], 'ereignis' => $eid,
+                          'gruppen' => count($gruppen)];
+        }
+
+        $belegt = 0;
+        foreach ($rules as $r) { if ((int) ($r[0] ?? 0) === 1) { $belegt++; } }
+
+        if ($trocken) {
+            return ['ok' => true, 'trocken' => true, 'relais' => $bericht, 'warnungen' => $warn,
+                    'belegt' => $belegt, 'plaetze' => 16, 'geschrieben' => false];
+        }
+        $res = $this->gatedWrite('rules', 'zeitplaene', fn($c) => $c->setRules('TIMEC', $rules));
+        return ['ok' => (bool) ($res['ok'] ?? false), 'relais' => $bericht, 'warnungen' => $warn,
+                'belegt' => $belegt, 'plaetze' => 16,
+                'geschrieben' => empty($res['shadow']), 'schatten' => !empty($res['shadow'])];
+    }
+
+    // ---- oeffentlich ----
+
+    /** Zeitplaene je Relais anlegen (falls noch nicht da) und Ereignis-IDs melden. */
+    public function ZeitplaeneAnlegen(): string
+    {
+        $eids  = $this->zeitplanEreignisse(true);
+        $namen = $this->relaisNamen();
+        $out = [];
+        foreach ($eids as $i => $eid) {
+            $out[] = ['relais' => $i, 'name' => $namen[$i], 'ereignis' => $eid,
+                      'quelle' => $i === 0 ? 'Filterplan (bestehend)' : 'eigener Zeitplan'];
+        }
+        return json_encode(['ok' => true, 'plaene' => $out], JSON_UNESCAPED_UNICODE);
+    }
+
+    /** Was WUERDE geschrieben - ohne jeden Geraetezugriff ausser dem Lesen. */
+    public function ZeitplanProbe(): string
+    {
+        return json_encode($this->schreibeRelaisZeitplaene(true), JSON_UNESCAPED_UNICODE);
+    }
+
+    /** Alle Relais-Zeitplaene in einem Zug an den Controller schreiben (gegated). */
+    public function ZeitplaeneSenden(): string
+    {
+        return json_encode($this->schreibeRelaisZeitplaene(false), JSON_UNESCAPED_UNICODE);
+    }
+
+
+    /**
+     * Reste in den TIMEC-Regeln beseitigen.
+     *
+     * Angefasst wird nur, was ALLE drei Bedingungen erfuellt: inaktiv (ENA=0),
+     * ausserhalb des Filterblocks, und mit Inhalt (Tagesmaske oder Fenster).
+     * Eine aktive Regel wird unter keinen Umstaenden geleert - auch keine fremde.
+     *
+     * Der Nutzen ist Uebersichtlichkeit, nicht Funktion: inaktive Regeln gelten
+     * dem Verteiler ohnehin als freie Plaetze. Am Geraet selbst erschweren die
+     * Reste aber jede Fehlersuche, weil sie wie halb konfigurierte Plaene aussehen.
+     *
+     * @return string JSON mit Vorher/Nachher; $Trocken=true schreibt nichts.
+     */
+    public function ZeitplaeneAufraeumen(bool $Trocken = true): string
+    {
+        $cl = $this->client();
+        if ($cl === null) {
+            return json_encode(['ok' => false, 'fehler' => 'not_configured']);
+        }
+        $cur = $cl->getRules('TIMEC');
+        if (empty($cur['ok'])) {
+            return json_encode(['ok' => false, 'fehler' => 'read_before_write_failed']);
+        }
+        $rules = $cur['rules'];
+
+        // setRules() schickt die ganze Sektion und nullt jede fehlende Regel.
+        // Ein unvollstaendiger Lesevorgang duerfte deshalb nie zum Schreiben fuehren.
+        for ($i = 0; $i < 16; $i++) {
+            if (!isset($rules[$i]) || !is_array($rules[$i]) || count($rules[$i]) < 15) {
+                return json_encode(['ok' => false,
+                    'fehler' => 'unvollstaendig gelesen: Regel ' . $i . ' - es wird NICHTS geschrieben'],
+                    JSON_UNESCAPED_UNICODE);
+            }
+        }
+
+        $filter = $this->filterRuleIndices();
+        $leer   = array_fill(0, 15, 0);
+        $weg = [];
+        $neu = $rules;
+        for ($i = 0; $i < 16; $i++) {
+            if (in_array($i, $filter, true)) {
+                continue;                       // Filterblock gehoert dem Umwaelzplan
+            }
+            if ((int) $rules[$i][0] === 1) {
+                continue;                       // aktive Regel bleibt, immer
+            }
+            if (array_sum(array_map('abs', $rules[$i])) === 0) {
+                continue;                       // schon leer
+            }
+            $weg[] = ['regel' => $i, 'relais' => (int) $rules[$i][1], 'tage' => (int) $rules[$i][2],
+                      'inhalt' => implode(',', $rules[$i])];
+            $neu[$i] = $leer;
+        }
+
+        if ($weg === []) {
+            return json_encode(['ok' => true, 'geleert' => 0, 'hinweis' => 'nichts aufzuraeumen'],
+                JSON_UNESCAPED_UNICODE);
+        }
+        if ($Trocken) {
+            return json_encode(['ok' => true, 'trocken' => true, 'geleert' => count($weg),
+                                'regeln' => $weg], JSON_UNESCAPED_UNICODE);
+        }
+
+        $res = $this->gatedWrite('rules', 'timecAufraeumen', fn($c) => $c->setRules('TIMEC', $neu));
+        if (empty($res['ok'])) {
+            return json_encode(['ok' => false, 'fehler' => (string) ($res['error'] ?? 'schreiben fehlgeschlagen')],
+                JSON_UNESCAPED_UNICODE);
+        }
+        if (!empty($res['shadow'])) {
+            return json_encode(['ok' => true, 'schatten' => true, 'geleert' => 0,
+                                'hinweis' => 'nicht scharf - nichts geschrieben'], JSON_UNESCAPED_UNICODE);
+        }
+
+        // Ruecklesen und pruefen, dass die BEHALTENEN Regeln unveraendert sind.
+        $nach = $cl->getRules('TIMEC');
+        $abw = [];
+        if (!empty($nach['ok'])) {
+            for ($i = 0; $i < 16; $i++) {
+                $soll = $neu[$i] ?? $leer;
+                $ist  = $nach['rules'][$i] ?? null;
+                if ($ist === null || implode(',', $ist) !== implode(',', $soll)) {
+                    $abw[] = $i;
+                }
+            }
+        }
+        return json_encode(['ok' => $abw === [], 'geleert' => count($weg), 'regeln' => $weg,
+                            'abweichungen' => $abw], JSON_UNESCAPED_UNICODE);
+    }
 
     public function SetDosingRedoxAuto(bool $On): bool { return $this->setControlValue('DosingClAuto', $On); }
     public function SetDosingPHAuto(bool $On): bool    { return $this->setControlValue('DosingPHAuto', $On); }
