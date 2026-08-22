@@ -94,6 +94,13 @@ class MowerDevice extends EntityModule
         $this->RegisterPropertyInteger('PollInterval', self::DEF_POLL_S);
         $this->RegisterPropertyBoolean('Armed', false);
         $this->RegisterPropertyInteger('ConfigSchema', 1); // von Anfang an native Properties
+        // Kartendarstellung. Die Farbe kam bisher ausschliesslich aus einer Tabelle
+        // nach Taetigkeit und war damit fuer ALLE Maeher gleich - gerade unterscheiden
+        // will man sie aber. Leer = weiter wie bisher (Taetigkeitsfarbe).
+        $this->RegisterPropertyString('KartenFarbe', '');
+        $this->RegisterPropertyString('KartenMarker', '');   // leer = wie Pfadfarbe
+        $this->RegisterPropertyString('KartenZaun', '');     // leer = Hausblau
+        $this->RegisterPropertyInteger('KartenZoom', 18);    // 19 war fest verdrahtet und zu nah
         $this->RegisterAttributeInteger('LastFullPoll', 0); // Cadence: Zeitpunkt des letzten Voll-Polls
     }
 
@@ -743,6 +750,17 @@ class MowerDevice extends EntityModule
             ['type' => 'ValidationTextBox', 'name' => 'MowerId', 'caption' => 'Maeher-ID', 'value' => (string) ($cfg['mowerId'] ?? '')],
             ['type' => 'NumberSpinner', 'name' => 'PollInterval', 'caption' => 'Poll-Intervall (s)', 'minimum' => 5, 'maximum' => 3600, 'value' => (int) ($cfg['pollInterval'] ?? self::DEF_POLL_S)],
             ['type' => 'CheckBox', 'name' => 'Armed', 'caption' => 'Scharf (schreibt echte Kommandos) — sonst Schatten-Modus'],
+            ['type' => 'ExpansionPanel', 'caption' => 'Karte', 'items' => [
+                ['type' => 'Label', 'caption' => 'Farben leer lassen = wie bisher: der Pfad nimmt die Farbe der aktuellen Taetigkeit, '
+                    . 'der Zaun Hausblau. Eine eigene Farbe ist sinnvoll, wenn mehrere Maeher nebeneinander gezeigt werden.'],
+                // Bewusst Textfelder statt SelectColor: SelectColor liefert eine Zahl und
+                // kennt kein "nicht gesetzt" - genau das brauchen wir aber, damit "leer"
+                // weiter die Taetigkeitsfarbe bedeutet.
+                ['type' => 'ValidationTextBox', 'name' => 'KartenFarbe',  'caption' => 'Bewegungspfad (z. B. #00cdab)'],
+                ['type' => 'ValidationTextBox', 'name' => 'KartenMarker', 'caption' => 'Positionsnadel (leer = wie Pfad)'],
+                ['type' => 'ValidationTextBox', 'name' => 'KartenZaun',   'caption' => 'Geofence-Kreis (leer = Hausblau)'],
+                ['type' => 'NumberSpinner', 'name' => 'KartenZoom', 'caption' => 'Zoomstufe (kleiner = mehr Umgebung)', 'minimum' => 1, 'maximum' => 24],
+            ]],
             ['type' => 'Label', 'caption' => 'Status: ' . $h['text']],
             ['type' => 'Button', 'caption' => 'Jetzt lesen (Diagnose)', 'onClick' => 'echo HSMW_Manage($id, json_encode(["op"=>"readNow"]));'],
             ['type' => 'Button', 'caption' => 'Aus PHPAutomower uebernehmen (Token + Maeher-ID-Variable)', 'onClick' =>

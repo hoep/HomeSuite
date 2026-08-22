@@ -14,7 +14,15 @@
  * @param int    $height          Kartenhoehe in px
  * @return string                 Komplettes eigenstaendiges HTML-Dokument
  */
-function renderPositionMap($positions, $geofence = null, $activityColor = '#E91E63', $width = 800, $height = 600) {
+/**
+ * @param string      $activityColor Farbe fuer Pfad UND Marker (Rueckfall)
+ * @param int         $zoom          Anfangs-Zoomstufe (Leaflet). 19 war fest verdrahtet und
+ *                                   zeigt so wenig Umgebung, dass man die Bahnen nicht
+ *                                   einordnen kann; 18 ist eine Stufe weiter weg.
+ * @param string|null $markerColor   eigene Markerfarbe; null = wie $activityColor
+ * @param string|null $fenceColor    eigene Geofence-Farbe; null = Hausblau
+ */
+function renderPositionMap($positions, $geofence = null, $activityColor = '#E91E63', $width = 800, $height = 600, $zoom = 18, $markerColor = null, $fenceColor = null) {
     // --- Eingaben normalisieren: {lat,lng} ODER {latitude,longitude} akzeptieren ---
     $norm = [];
     if (is_array($positions)) {
@@ -66,6 +74,14 @@ function renderPositionMap($positions, $geofence = null, $activityColor = '#E91E
     $positionsJson = json_encode($norm);
     $geofenceJson  = $geo ? json_encode($geo) : 'null';
     $colorJson     = json_encode($activityColor);
+    // Nur zulaessige Farbangaben durchreichen - der Wert landet ungeprueft im Stil.
+    $hex = function ($c, $fallback) {
+        $c = trim((string) $c);
+        return preg_match('/^#[0-9a-fA-F]{3,8}$/', $c) ? $c : $fallback;
+    };
+    $markerJson = json_encode($hex($markerColor, $hex($activityColor, '#E91E63')));
+    $fenceJson  = json_encode($hex($fenceColor, '#3388ff'));
+    $zoomJs     = (int) max(1, min(24, (int) $zoom));
 
     $html = <<<HTML
 <!DOCTYPE html>
@@ -127,11 +143,13 @@ function renderPositionMap($positions, $geofence = null, $activityColor = '#E91E
     const positions   = {$positionsJson};
     const geofence    = {$geofenceJson};
     const pathColor   = {$colorJson};
+    const markerColor = {$markerJson};
+    const fenceColor  = {$fenceJson};
 
     // Karte initialisieren
     const map = L.map('map', {
         center: [{$centerLat}, {$centerLng}],
-        zoom: 19,
+        zoom: {$zoomJs},
         maxZoom: 24,
         attributionControl: false
     });
@@ -181,14 +199,14 @@ function renderPositionMap($positions, $geofence = null, $activityColor = '#E91E
     // Positions-Marker (aktuelle = erste Position, wie Original path[0])
     const currentPos = path[0];
     L.marker(currentPos, {
-        icon: new PinMarker({ color: pathColor })
+        icon: new PinMarker({ color: markerColor })
     }).addTo(map);
 
     // Geofence-Kreis
     if (geofence) {
         L.circle([geofence.lat, geofence.lng], {
-            color: '#3388ff',
-            fillColor: '#3388ff',
+            color: fenceColor,
+            fillColor: fenceColor,
             fillOpacity: 0.1,
             radius: geofence.radius
         }).addTo(map);
