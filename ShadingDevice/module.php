@@ -196,6 +196,98 @@ class ShadingDevice extends EntityModule
                     'role' => 'shading:online', 'label' => 'Online',
                     'varType' => 0, 'actionable' => false,
                 ],
+
+                // ---- Entscheidungsprotokoll ------------------------------------
+                // Warum faehrt das Rollo - oder warum nicht? Bisher war das nur im
+                // Trockenlauf sichtbar (mgmt-Op reconcileProbe) und damit weder im
+                // Baum noch im Hub noch in einem Diagramm. Jede Zwischengroesse, die
+                // in die Entscheidung eingeht, bekommt hier ihre eigene Variable -
+                // sonst bleibt eine knappe Entscheidung (37 % Klarheit gegen die
+                // 35er-Schwelle) von aussen unerklaerbar.
+                [
+                    'ident' => 'AutoZiel', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:autoTarget', 'label' => 'Automatik-Ziel',
+                    'varType' => 1, 'profile' => '~Intensity.100', 'unit' => '%',
+                    'actionable' => false,
+                ],
+                [
+                    'ident' => 'AutoGrund', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:autoReason', 'label' => 'Entscheidung wegen',
+                    'varType' => 3, 'actionable' => false,
+                ],
+                [
+                    'ident' => 'SonneRoh', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:sunRaw', 'label' => 'Sonnenregel roh',
+                    'varType' => 1, 'unit' => '%', 'actionable' => false,
+                ],
+                [
+                    'ident' => 'SonneZiel', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:sunTarget', 'label' => 'Sonnenregel entprellt',
+                    'varType' => 1, 'unit' => '%', 'actionable' => false,
+                ],
+                [
+                    'ident' => 'Klarheit', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:clearIdx', 'label' => 'Klarheitsindex',
+                    'varType' => 1, 'unit' => '%', 'actionable' => false,
+                ],
+                [
+                    'ident' => 'KlarheitSchwelle', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:clearThr', 'label' => 'Klarheit Schwelle',
+                    'varType' => 1, 'unit' => '%', 'actionable' => false,
+                ],
+                [
+                    'ident' => 'ZeitplanZiel', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:schedTarget', 'label' => 'Zeitplan-Ziel',
+                    'varType' => 1, 'unit' => '%', 'actionable' => false,
+                ],
+                [
+                    'ident' => 'Variante', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:variant', 'label' => 'Zeitplan-Variante',
+                    'varType' => 3, 'actionable' => false,
+                ],
+                [
+                    'ident' => 'Sturm', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:storm', 'label' => 'Sturm aktiv',
+                    'varType' => 0, 'actionable' => false,
+                ],
+                [
+                    'ident' => 'ManuellVorrang', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:held', 'label' => 'Manuell hat Vorrang',
+                    'varType' => 0, 'actionable' => false,
+                ],
+                [
+                    'ident' => 'TuerOffen', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:doorOpen', 'label' => 'Tür offen',
+                    'varType' => 0, 'actionable' => false,
+                ],
+                [
+                    'ident' => 'TuerSperrt', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:doorBlock', 'label' => 'Schließen durch Tür gesperrt',
+                    'varType' => 0, 'actionable' => false,
+                ],
+                [
+                    'ident' => 'WuerdeFahren', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:wouldMove', 'label' => 'Fahrbefehl steht an',
+                    'varType' => 0, 'actionable' => false,
+                ],
+
+                // ---- Naechster Fahrbefehl laut Zeitsteuerung -------------------
+                [
+                    'ident' => 'NaechsteFahrt', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:nextRun', 'label' => 'Nächste Fahrt',
+                    'varType' => 1, 'profile' => '~UnixTimestamp', 'actionable' => false,
+                ],
+                [
+                    'ident' => 'NaechstesZiel', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:nextTarget', 'label' => 'Nächstes Ziel',
+                    'varType' => 1, 'profile' => '~Intensity.100', 'unit' => '%',
+                    'actionable' => false,
+                ],
+                [
+                    'ident' => 'NaechsteRichtung', 'type' => ControlContract::T_REFLECT,
+                    'role' => 'shading:nextDir', 'label' => 'Nächste Richtung',
+                    'varType' => 3, 'actionable' => false,
+                ],
             ],
 
             // ---- Profil-Typ: Positions-Wochenplan (2 Achsen Plan x Wochentag) ----
@@ -2117,6 +2209,9 @@ class ShadingDevice extends EntityModule
     private function reconcile(IShutter $drv): void
     {
         $d = $this->computeDecision($drv, true);
+        // Protokoll zuerst: es soll auch dann stimmen, wenn gleich darunter ein
+        // Abbruchpfad greift (Kalibrierung, laufende Fahrt, Automatik aus).
+        $this->dokumentiere($d, is_numeric($d['cur'] ?? null) ? (int) $d['cur'] : null);
         $target = $d['target'];
         // Kalibrierung laeuft -> die Automatik fasst das Rollo NICHT an. Ausnahme: STURM
         // steht ueber der Kalibrierung (Sachschadenschutz) und bricht sie hart ab.
@@ -2202,6 +2297,109 @@ class ShadingDevice extends EntityModule
             $rt['shadowTarget'] = $target;
             $rt['shadowTs']     = time();
             $this->writeRt($rt);
+        }
+    }
+
+
+    /**
+     * Naechster Fahrbefehl laut Zeitsteuerung.
+     *
+     * Nicht die naechste Slot-GRENZE (die gibt es schon als secondsToNextBoundary),
+     * sondern die naechste Grenze, an der sich der Zielwert wirklich AENDERT -
+     * nur dort entsteht ein Fahrbefehl. Zwei gleiche Slots hintereinander sind
+     * kein Ereignis.
+     *
+     * Sonnen-verankerte Grenzen ("eine Stunde nach Sonnenaufgang") werden je Tag
+     * aufgeloest, deshalb wird tageweise vorgegangen und nicht mit einer festen
+     * Minutenliste gerechnet.
+     *
+     * @return array{ts:int,ziel:?int,richtung:string}  ts=0 -> keine Aenderung in Sicht
+     */
+    private function naechsteFahrt(): array
+    {
+        $leer = ['ts' => 0, 'ziel' => null, 'richtung' => ''];
+        $variant = $this->activeVariant();
+        $now = time();
+        $vorher = $this->scheduleValueAt($now, $variant);
+        $vorher = is_numeric($vorher) ? (int) round((float) $vorher) : null;
+
+        for ($d = 0; $d <= 7; $d++) {
+            $tag = strtotime('+' . $d . ' day', $now);
+            $mid = strtotime('today', $tag);
+            $idx = (int) date('N', $tag) - 1;
+            $slots = $this->schedules()->getSlots($variant, $idx);
+            if ($slots === []) {
+                continue;
+            }
+            $sun = $this->sunEvents($tag);
+            $res = [];
+            foreach ($slots as $s) {
+                $res[] = ['end' => $this->resolveEnd($s, $sun),
+                          'val' => is_numeric($s['val'] ?? null) ? (int) round((float) $s['val']) : null];
+            }
+            usort($res, static fn($a, $b) => $a['end'] - $b['end']);
+
+            foreach ($res as $i => $s) {
+                // Der Wechsel passiert am ENDE dieses Slots: dort uebernimmt der naechste.
+                $grenze = $mid + $s['end'] * 60;
+                if ($grenze <= $now) {
+                    $vorher = $s['val'];       // liegt hinter uns, gilt aber als Ausgangswert
+                    continue;
+                }
+                $next = $res[$i + 1]['val'] ?? null;
+                if ($next === null || $next === $vorher) {
+                    $vorher = ($next !== null) ? $next : $vorher;
+                    continue;
+                }
+                return ['ts' => $grenze, 'ziel' => $next,
+                        // 0 = offen, 100 = zu: ein groesserer Wert heisst schliessen.
+                        'richtung' => ($vorher === null || $next > $vorher) ? 'Ab' : 'Auf'];
+            }
+        }
+        return $leer;
+    }
+
+    /**
+     * Entscheidungsprotokoll in Variablen schreiben.
+     *
+     * Absichtlich JEDE Zwischengroesse und nicht nur das Ergebnis: die Frage
+     * "warum ist das Rollo jetzt zu?" laesst sich sonst nicht beantworten, ohne
+     * den Trockenlauf von Hand aufzurufen. Die Werte sind reine Anzeige und
+     * greifen nirgends in die Regelung ein.
+     *
+     * -1 steht durchgaengig fuer "keine Anforderung" (die Skala 0..100 ist belegt).
+     */
+    private function dokumentiere(array $d, ?int $cur): void
+    {
+        $z = static fn($v) => ($v === null) ? -1 : (int) $v;
+        $ziel = $d['target'] ?? null;
+
+        $this->setIfExists('AutoZiel',         $z($ziel));
+        $this->setIfExists('AutoGrund',        ($ziel === null) ? 'keine Anforderung' : $this->reasonOf($d));
+        $this->setIfExists('SonneRoh',         $z($d['rawSun'] ?? null));
+        $this->setIfExists('SonneZiel',        $z($d['sunTarget'] ?? null));
+        $this->setIfExists('Klarheit',         $z($d['clearIdx'] ?? null));
+        $this->setIfExists('KlarheitSchwelle', $z($d['clearThr'] ?? null));
+        $this->setIfExists('ZeitplanZiel',     $z($d['schedTarget'] ?? null));
+        $this->setIfExists('Variante',         (string) ($d['variant'] ?? ''));
+        $this->setIfExists('Sturm',            !empty($d['storm']));
+        $this->setIfExists('ManuellVorrang',   !empty($d['held']));
+        $this->setIfExists('TuerOffen',        !empty($d['doorOpen']));
+        $this->setIfExists('TuerSperrt',       !empty($d['blockedByDoor']));
+        $this->setIfExists('WuerdeFahren',     ($ziel !== null && $cur !== null && (int) $ziel !== (int) $cur));
+
+        $n = $this->naechsteFahrt();
+        $this->setIfExists('NaechsteFahrt',    (int) $n['ts']);
+        $this->setIfExists('NaechstesZiel',    $z($n['ziel']));
+        $this->setIfExists('NaechsteRichtung', (string) $n['richtung']);
+    }
+
+    /** Setzt eine Variable nur, wenn es sie gibt - haelt aeltere Instanzen ohne die neuen Idents heil. */
+    private function setIfExists(string $ident, $value): void
+    {
+        $vid = @$this->GetIDForIdent($ident);
+        if (is_int($vid) && $vid > 0) {
+            @$this->SetValue($ident, $value);
         }
     }
 
