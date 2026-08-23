@@ -2165,6 +2165,12 @@ class HomeSuiteHub extends EntityModule
                     'kind'     => (string) (@\IPS_GetProperty($iid, 'Kind') ?: 'Raum'),
                     'abbr'     => (string) (@\IPS_GetProperty($iid, 'Abbr') ?: ''),
                     'parent'   => (int) @\IPS_GetParent($iid),
+                    // Die POSITION im Objektbaum ist die Reihenfolge. Sie gibt es an jedem
+                    // IPS-Objekt, sie ist je Elternteil vergeben - also "1..x je Geschoss" -
+                    // und sie laesst sich in der Konsole durch Ziehen aendern. Ein eigenes
+                    // Indexfeld waere ein zweiter Ort fuer dieselbe Aussage; sobald Baum und
+                    // Feld auseinanderlaufen, weiss niemand mehr, welches gilt.
+                    'pos'      => (int) (@\IPS_GetObject($iid)['ObjectPosition'] ?? 0),
                     'children' => [],
                     'entities' => [],
                 ];
@@ -2220,6 +2226,21 @@ class HomeSuiteHub extends EntityModule
                 $roots[] = $iid;
             }
         }
+
+        // Nach Position sortieren, bei Gleichstand nach Namen. Ohne das kommt die
+        // Reihenfolge aus IPS_GetInstanceListByModuleID - also aus der Reihenfolge der
+        // ENTSTEHUNG. Genau daran lag es, dass das Obergeschoss mit dem Schlafzimmer
+        // begann und die Bereiche als OG, Garten, EG, DG kamen.
+        $nachPosition = function (int $a, int $b) use ($spaces): int {
+            $pa = $spaces[$a]['pos'] ?? 0; $pb = $spaces[$b]['pos'] ?? 0;
+            return ($pa <=> $pb) ?: strnatcasecmp((string) $spaces[$a]['name'], (string) $spaces[$b]['name']);
+        };
+        foreach ($spaces as $iid => $s) {
+            if ($s['children'] !== []) {
+                usort($spaces[$iid]['children'], $nachPosition);
+            }
+        }
+        usort($roots, $nachPosition);
 
         $build = function (int $iid) use (&$build, $spaces) {
             $s    = $spaces[$iid];
