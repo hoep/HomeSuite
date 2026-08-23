@@ -73,6 +73,9 @@ class HeatingZone extends EntityModule
     /** Datei mit dem Zeitstempel des letzten CCU-Profilzugriffs (prozessuebergreifend). */
     private const PUSH_STEMPEL = 'homesuite-ccu-push.stamp';
 
+    /** So selten wird nachgesehen, ob der Profilzeiger des Geraets noch stimmt. */
+    private const ZEIGER_PRUEFUNG_SEK = 900;
+
     /** Presence-Control-Wert (0..2) -> Zeitplan-Variante. */
     private const PRESENCE_VARIANTS = ['Normal', 'Erweitert', 'Abgesenkt'];
 
@@ -302,6 +305,18 @@ class HeatingZone extends EntityModule
 
         // Nach jedem Schreiben die Reflect-Controls frisch nachziehen.
         $this->reflectFromDriver($drv);
+
+        // Praesenzwechsel heisst am Geraet ZUERST: anderes Profil waehlen. Ein
+        // TC-IT fuehrt drei Wochenprogramme und entscheidet ueber den Zeiger
+        // WEEK_PROGRAM_POINTER, welches gilt - genau so macht es die
+        // Altsteuerung. Ohne diesen Schritt schaltet die Praesenz nur eine
+        // Modulvariable um, und das Geraet heizt weiter nach dem alten Profil.
+        // Geraete mit einem einzigen Profil melden true und bekommen den Plan
+        // im anschliessenden reconcile() geschrieben - dort IST die Wahl das
+        // Uebertragen.
+        if ($c->ident === 'Presence') {
+            $this->selectDeviceProfile($drv, (int) $value);
+        }
 
         // Praesenz-/Modus-Wechsel: Zeitplan sofort anwenden (device: Push,
         // controller: Sollwert nachfahren). Bei Setpoint NICHT (dort haelt der
@@ -668,7 +683,9 @@ class HeatingZone extends EntityModule
         $caps = $drv->capabilities();
 
         if (($caps['scheduleMode'] ?? 'controller') === 'device') {
-            // Geraet fuehrt den Plan; Modul sorgt nur fuer den aktuellen Push.
+            // Geraet fuehrt den Plan; Modul sorgt fuer den richtigen Zeiger und
+            // den aktuellen Push.
+            $this->zeigerAbgleichen($drv);
             $this->pushWeekIfChanged($drv);
             return;
         }
@@ -774,7 +791,17 @@ class HeatingZone extends EntityModule
         // Praesenzwechsel ist er nur noch nie gebildet worden. Blind zu schreiben
         // hiesse, 23 Geraeteprogramme anzufassen, um am Ende dasselbe hineinzulegen.
         $imGeraet = $drv->readWeekProfile($pi);
-        if ($imGeraet !== [] && self::wochenGleich($imGeraet, $week)) {
+        if ($imGeraet === []) {
+            // Nicht lesbar heisst NICHT "leer": die CCU war belegt, die Freigabe
+            // haengt, das Geraet antwortet nicht. Wer jetzt schreibt, ueberschreibt
+            // ein Programm, das er nicht kennt. Also warten und spaeter nachsehen.
+            $rt['pushNext'] = time() + self::PUSH_RUHE_SEK;
+            $this->writeRt($rt);
+            $this->ccuSlotSchliessen();
+            $this->SendDebug('HSHT.push', 'Geraeteprofil nicht lesbar - kein Schreibversuch', 0);
+            return;
+        }
+        if (self::wochenGleich($imGeraet, $week)) {
             $bekannt[$variant] = $hash;
             $rt['pushHashes']  = $bekannt;
             unset($rt['pushNext']);
@@ -800,6 +827,49 @@ class HeatingZone extends EntityModule
             $this->SendDebug('HSHT.push', 'Schreiben fehlgeschlagen (' . $variant . ') - Ruhe bis '
                 . date('H:i:s', (int) $rt['pushNext']), 0);
         }
+        $this->ccuSlotSchliessen();
+    }
+
+    /**
+     * Waehlt am Geraet das Profil der Praesenz. Fehler werden gemeldet, nicht
+     * geworfen - eine nicht erreichbare CCU darf die Bedienung nicht anhalten.
+     */
+    private function selectDeviceProfile(IThermostat $drv, int $presence): void
+    {
+        if (!method_exists($drv, 'selectProfile')) {
+            return;
+        }
+        $ok = $drv->selectProfile($presence);
+        $this->SendDebug('HSHT.profil', 'selectProfile(' . $presence . ') -> ' . ($ok ? 'ok' : 'FEHLER'), 0);
+    }
+
+    /**
+     * Steht der Zeiger des Geraets auf der Praesenz, die das Modul fuehrt?
+     *
+     * Geprueft wird nur, wenn es etwas zu pruefen gibt (mehrere Geraeteprofile)
+     * und hoechstens im Takt der CCU-Bremse - der Zeiger ist eine Kleinigkeit,
+     * aber er wird ueber dieselbe Leitung gelesen wie ein ganzes Wochenprofil.
+     */
+    private function zeigerAbgleichen(IThermostat $drv): void
+    {
+        $caps = $drv->capabilities();
+        if ((int) ($caps['deviceProfiles'] ?? 1) < 2 || !method_exists($drv, 'activeProfile')) {
+            return;
+        }
+        $rt = $this->readRt();
+        if ((int) ($rt['zeigerNext'] ?? 0) > time()) {
+            return;
+        }
+        if (!$this->ccuSlotFrei()) {
+            return;
+        }
+        $soll = $this->activeVariantIndex();
+        $ist  = $drv->activeProfile();
+        if ($ist !== null && $ist !== $soll) {
+            $this->selectDeviceProfile($drv, $soll);
+        }
+        $rt['zeigerNext'] = time() + self::ZEIGER_PRUEFUNG_SEK;
+        $this->writeRt($rt);
         $this->ccuSlotSchliessen();
     }
 

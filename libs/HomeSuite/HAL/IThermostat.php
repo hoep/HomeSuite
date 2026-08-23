@@ -76,4 +76,13 @@ interface IThermostat extends IDriver
      * @param int|null $presenceIndex 0..deviceProfiles-1 oder null = aktives
      */
     public function writeWeekProfile(array $week, ?int $presenceIndex = null): bool;
+
+    /**
+     * Waehlt am Geraet das Wochenprofil der Praesenz (0..n). Geraete mit nur einem
+     * Profil melden true, ohne etwas zu tun - dort ist die Wahl ein Uebertragen.
+     */
+    public function selectProfile(int $presenceIndex): bool;
+
+    /** Welches Profil fuehrt das Geraet gerade? null = unbekannt/kein Profilgeraet. */
+    public function activeProfile(): ?int;
 }

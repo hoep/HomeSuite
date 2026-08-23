@@ -181,6 +181,50 @@ final class HomeMaticThermostat implements IThermostat
     }
 
     /**
+     * Waehlt am GERAET aus, welches der drei Wochenprofile gilt.
+     *
+     * Das ist der Baustein, der bei der Migration fehlte: die Altsteuerung setzt
+     * bei jeder Praesenzwahl `WEEK_PROGRAM_POINTER` (0..2) im MASTER-Paramset -
+     * genau so waehlt ein TC-IT zwischen P1, P2 und P3. Ohne diesen Schritt
+     * schaltet die Praesenz im Modul nur eine Modulvariable um, waehrend das
+     * Geraet unbeirrt sein zuletzt gewaehltes Profil weiterfaehrt.
+     *
+     * Geraete mit nur EINEM Profil (RT-DN, CC-TC) kennen den Zeiger nicht; dort
+     * ist die Wahl kein Umschalten, sondern ein Uebertragen - das erledigt der
+     * Aufrufer, indem er den Plan der gewaehlten Variante schreibt.
+     */
+    public function selectProfile(int $presenceIndex): bool
+    {
+        if (!$this->hasProfileApi()) {
+            return false;
+        }
+        if ($this->model !== 'HM-TC-IT-WM-W-EU') {
+            return true; // ein Profil: nichts zu waehlen
+        }
+        $idx = max(0, min(2, $presenceIndex));
+        $ok  = CcuXmlRpc::putParamset($this->ccuHost, $this->ccuPort, $this->profileAddress(), [
+            'WEEK_PROGRAM_POINTER' => ['type' => 'int', 'value' => $idx],
+        ]);
+        if (!$ok) {
+            $this->log('selectProfile(' . $idx . '): putParamset meldete Fehler');
+        }
+        return $ok;
+    }
+
+    /** Welches Profil fuehrt das Geraet gerade? null = nicht ermittelbar. */
+    public function activeProfile(): ?int
+    {
+        if (!$this->hasProfileApi() || $this->model !== 'HM-TC-IT-WM-W-EU') {
+            return null;
+        }
+        $p = CcuXmlRpc::getParamset($this->ccuHost, $this->ccuPort, $this->profileAddress());
+        if (!is_array($p) || !array_key_exists('WEEK_PROGRAM_POINTER', $p)) {
+            return null;
+        }
+        return (int) $p['WEEK_PROGRAM_POINTER'];
+    }
+
+    /**
      * Schreibt ein Wochenprofil INS GERAET — mit Backup/Verify:
      * bestehendes Paramset sichern -> schreiben -> zuruecklesen -> verifizieren;
      * bei Abweichung Restore des Backups und false.

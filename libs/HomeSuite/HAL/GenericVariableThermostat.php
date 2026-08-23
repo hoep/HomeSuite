@@ -133,6 +133,17 @@ final class GenericVariableThermostat implements IThermostat
         return [];
     }
 
+    /** controller: das Geraet kennt keine Profile - die Wahl faellt im Modul. */
+    public function selectProfile(int $presenceIndex): bool
+    {
+        return true;
+    }
+
+    public function activeProfile(): ?int
+    {
+        return null;
+    }
+
     public function writeWeekProfile(array $week, ?int $presenceIndex = null): bool
     {
         // controller: kein Geraeteprofil; den Zeitplan faehrt die ScheduleEngine.
