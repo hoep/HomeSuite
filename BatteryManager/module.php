@@ -15,6 +15,15 @@ class BatteryManager extends IPSModule
     private const STATE_WARN = 1;   // bald tauschen
     private const STATE_EMPTY = 2;  // leer / tauschen
     private const STATE_UNKNOWN = 3;
+    /**
+     * Meldet sich nicht.
+     *
+     * Der wichtigste Zustand, und der einzige, den es vorher nicht gab: eine leere
+     * Batterie zeigt sich meistens NICHT als LOWBAT, sondern als Stille. Ein Geraet,
+     * das nichts mehr sendet, sendet auch kein "Batterie schwach" - es stand hier
+     * jahrelang als "OK" in der Liste.
+     */
+    private const STATE_SILENT = 4;
 
     /** true nur waehrend BM_Scan() -> Fortschritt wird live in die Progress-Variable geschrieben. */
     private $emitProgress = false;
@@ -33,6 +42,12 @@ class BatteryManager extends IPSModule
         $this->RegisterPropertyString('ExcludeIdents', '');    // Komma-Liste: Namens-/Ident-Teilstrings ueberspringen
         $this->RegisterPropertyString('ExcludeVars', '[]');    // Liste [{VarID:int}] — aus dem Baum gewaehlte Variablen ausschliessen (ganzes Geraet)
         $this->RegisterPropertyInteger('RootCategory', 0);     // optionaler Ziel-Ordner (0 = unter der Instanz)
+        // Die CCU ist fuer HomeMatic die einzige aktuelle Quelle: LOWBAT kommt dort als
+        // Servicemeldung an und verschwindet wieder, waehrend die Variable in IP-Symcon
+        // nur bei einer AENDERUNG geschrieben wird - ein "OK" von 2019 ist keine Messung,
+        // sondern die Abwesenheit von Nachrichten.
+        $this->RegisterPropertyString('CcuIp', '');            // leer = CCU nicht fragen
+        $this->RegisterPropertyInteger('SilentDays', 7);       // so lange still => meldet sich nicht (0 = aus)
 
         // Statistik-Variablen
         $this->maybeStatusProfile();
@@ -41,6 +56,7 @@ class BatteryManager extends IPSModule
         $this->RegisterVariableInteger('Warn', 'Bald tauschen', '', 30);
         $this->RegisterVariableInteger('Empty', 'Leer / tauschen', '', 40);
         $this->RegisterVariableInteger('Unknown', 'Unbekannt', '', 50);
+        $this->RegisterVariableInteger('Silent', 'Meldet sich nicht', '', 55);
         $this->RegisterVariableInteger('Weak', 'Handlungsbedarf (Bald+Leer)', '', 60);
         if (!IPS_VariableProfileExists('~Intensity.100')) { /* Standardprofil vorhanden; sonst 0-100 ok */ }
         $this->RegisterVariableInteger('OkPercent', 'OK-Anteil', '~Intensity.100', 65);
@@ -68,11 +84,12 @@ class BatteryManager extends IPSModule
         if (!IPS_VariableProfileExists('BATT.Status')) {
             IPS_CreateVariableProfile('BATT.Status', 1);
         }
-        IPS_SetVariableProfileValues('BATT.Status', 0, 3, 1);
+        IPS_SetVariableProfileValues('BATT.Status', 0, 4, 1);
         IPS_SetVariableProfileAssociation('BATT.Status', 0, 'OK', '', 0x2ECC71);
         IPS_SetVariableProfileAssociation('BATT.Status', 1, 'Bald tauschen', '', 0xF39C12);
         IPS_SetVariableProfileAssociation('BATT.Status', 2, 'Leer', '', 0xE74C3C);
         IPS_SetVariableProfileAssociation('BATT.Status', 3, 'Unbekannt', '', 0x95A5A6);
+        IPS_SetVariableProfileAssociation('BATT.Status', 4, 'Meldet sich nicht', '', 0xF2685A);
     }
 
     /**
@@ -213,6 +230,13 @@ class BatteryManager extends IPSModule
         }
 
         $this->setProg(72);
+        // Die CCU EINMAL fragen, nicht je Geraet: eine Antwort deckt alle 99 HomeMatic-
+        // Geraete ab. Und gezielt abfragen (HM_RequestStatus) hilft hier nicht - Batterie-
+        // geraete schlafen und hoeren nur kurz nach dem eigenen Senden zu; die Anfrage
+        // bliebe ausgerechnet bei ihnen liegen.
+        $ccu = $this->ccuStand();
+        $silentSec = max(0, $this->ReadPropertyInteger('SilentDays')) * 86400;
+
         // Pro Geraet einen Repraesentanten + Zustand
         $devices = [];
         foreach ($groups as $key => $cands) {
@@ -226,6 +250,34 @@ class BatteryManager extends IPSModule
                 if (!$real) continue;
             }
             $st  = $this->classify($rep, $emptyThr, $warnThr, $staleSec, $now);
+
+            // Die CCU hat fuer HomeMatic das letzte Wort. Ihre Servicemeldungen sind der
+            // aktuelle Stand; die Variable in IP-Symcon ist nur das Echo der letzten
+            // Aenderung - bei vier von fuenf "leeren" Batterien war dieses Echo Jahre alt.
+            $quelle = '';
+            if ($ccu['ok'] && str_starts_with($key, 'HM:')) {
+                $serie = substr($key, 3);
+                if (isset($ccu['unreach'][$serie])) {
+                    $st = ['state' => self::STATE_SILENT, 'value' => $st['value'], 'unit' => $st['unit'],
+                           'text' => 'meldet sich nicht', 'low' => false];
+                } elseif (isset($ccu['lowbat'][$serie])) {
+                    $st = ['state' => self::STATE_EMPTY, 'value' => 1, 'unit' => '',
+                           'text' => 'schwach', 'low' => true];
+                } elseif ($rep['class'] === 'bool') {
+                    // Keine Meldung heisst hier wirklich "kein Problem" - die CCU fuehrt
+                    // die anstehenden Meldungen, nicht deren Geschichte.
+                    $st = ['state' => self::STATE_OK, 'value' => 0, 'unit' => '', 'text' => 'ok', 'low' => false];
+                }
+                $quelle = 'CCU';
+            } elseif ($silentSec > 0 && $rep['class'] !== 'bool'
+                      && $rep['updated'] > 0 && ($now - $rep['updated']) > $silentSec) {
+                // Fuer alles ausser HomeMatic: Prozente und Spannungen kommen regelmaessig.
+                // Bleiben sie aus, ist das Geraet still - und Stille ist der haeufigste
+                // Auftritt einer leeren Batterie.
+                $st = ['state' => self::STATE_SILENT, 'value' => $st['value'], 'unit' => $st['unit'],
+                       'text' => 'meldet sich nicht', 'low' => false];
+            }
+
             [$device, $room, $path] = $this->labelFor($rep['vid']);
             $devices[] = [
                 'name'   => $device,
@@ -240,13 +292,15 @@ class BatteryManager extends IPSModule
                 'varId'  => $rep['vid'],
                 'low'    => $st['low'],
                 'ts'     => $rep['updated'],
+                'quelle' => $quelle,
                 'key'    => $key,
             ];
         }
 
         // Sortierung: schlechtester zuerst (Leer, Bald, Unbekannt, OK), dann Wert aufsteigend
         usort($devices, function ($a, $b) {
-            $ord = [self::STATE_EMPTY => 0, self::STATE_WARN => 1, self::STATE_UNKNOWN => 2, self::STATE_OK => 3];
+            $ord = [self::STATE_SILENT => 0, self::STATE_EMPTY => 1, self::STATE_WARN => 2,
+                    self::STATE_UNKNOWN => 3, self::STATE_OK => 4];
             $sa = $ord[$a['state']] ?? 9; $sb = $ord[$b['state']] ?? 9;
             if ($sa !== $sb) return $sa <=> $sb;
             $va = is_numeric($a['value']) ? (float) $a['value'] : 999;
@@ -255,17 +309,119 @@ class BatteryManager extends IPSModule
             return strcasecmp($a['name'], $b['name']);
         });
 
-        $counts = ['total' => count($devices), 'ok' => 0, 'warn' => 0, 'empty' => 0, 'unknown' => 0];
+        $counts = ['total' => count($devices), 'ok' => 0, 'warn' => 0, 'empty' => 0, 'unknown' => 0, 'silent' => 0];
         foreach ($devices as $d) {
             if ($d['state'] === self::STATE_OK) $counts['ok']++;
             elseif ($d['state'] === self::STATE_WARN) $counts['warn']++;
             elseif ($d['state'] === self::STATE_EMPTY) $counts['empty']++;
+            elseif ($d['state'] === self::STATE_SILENT) $counts['silent']++;
             else $counts['unknown']++;
         }
-        $counts['weak'] = $counts['warn'] + $counts['empty'];
+        // Handlungsbedarf schliesst die Stillen ein: eine Batterie, von der nichts mehr
+        // kommt, ist der dringendere Fall als eine, die sich noch meldet.
+        $counts['weak'] = $counts['warn'] + $counts['empty'] + $counts['silent'];
 
         $this->setProg(85);
         return ['devices' => $devices, 'counts' => $counts, 'ts' => $now];
+    }
+
+    // ==================================================================================
+    //  CCU: Servicemeldungen
+    // ==================================================================================
+    /**
+     * Was die CCU gerade meldet, nach Geraeteserie sortiert.
+     *
+     * Zwei Schnittstellen, weil zwei Funkwelten: 2001 ist BidCos-RF (klassisches
+     * HomeMatic), 2010 ist HmIP-RF. Wer nur eine fragt, uebersieht die Haelfte.
+     *
+     * @return array{lowbat:array<string,bool>,unreach:array<string,bool>,ok:bool}
+     */
+    private function ccuStand(): array
+    {
+        $ip = trim($this->ReadPropertyString('CcuIp'));
+        $leer = ['lowbat' => [], 'unreach' => [], 'ok' => false];
+        if ($ip === '' || !filter_var($ip, FILTER_VALIDATE_IP)) {
+            return $leer;
+        }
+        $lowbat = []; $unreach = []; $gesehen = false;
+        foreach ([2001, 2010] as $port) {
+            $xml = $this->xmlRpc($ip, $port, 'getServiceMessages');
+            if ($xml === null) { continue; }
+            $gesehen = true;
+            foreach ($this->parseServiceMessages($xml) as $m) {
+                $serie = explode(':', $m['addr'])[0];
+                if ($serie === '') { continue; }
+                if ($m['val'] === '0' || $m['val'] === 'false') { continue; }
+                $typ = strtoupper($m['type']);
+                if ($typ === 'LOWBAT' || $typ === 'LOW_BAT') { $lowbat[$serie] = true; }
+                elseif ($typ === 'UNREACH' || $typ === 'STICKY_UNREACH') { $unreach[$serie] = true; }
+            }
+        }
+        return ['lowbat' => $lowbat, 'unreach' => $unreach, 'ok' => $gesehen];
+    }
+
+    /** Die Servicemeldungen als JSON - fuer andere Skripte (Sicherheitslage). */
+    public function CcuMeldungen(): string
+    {
+        $m = $this->ccuStand();
+        return json_encode(['ok' => $m['ok'], 'lowbat' => array_keys($m['lowbat']),
+                            'unreach' => array_keys($m['unreach']),
+                            'namen' => $this->ccuNamen(array_merge(array_keys($m['lowbat']), array_keys($m['unreach'])))],
+                           JSON_UNESCAPED_UNICODE);
+    }
+
+    /** Serie -> Geraetename, aus den bekannten HomeMatic-Instanzen. */
+    private function ccuNamen(array $serien): array
+    {
+        if ($serien === []) { return []; }
+        $suche = array_flip($serien);
+        $out = [];
+        foreach (IPS_GetInstanceList() as $iid) {
+            $cfg = @json_decode(IPS_GetConfiguration($iid), true);
+            $addr = (string) ($cfg['Address'] ?? '');
+            if ($addr === '') { continue; }
+            $serie = explode(':', $addr)[0];
+            if (!isset($suche[$serie]) || isset($out[$serie])) { continue; }
+            $eltern = IPS_GetParent($iid);
+            $out[$serie] = ($eltern > 0 ? IPS_GetName($eltern) . ' · ' : '') . IPS_GetName($iid);
+        }
+        return $out;
+    }
+
+    private function xmlRpc(string $ip, int $port, string $method, int $timeout = 6): ?string
+    {
+        $body = '<?xml version="1.0"?><methodCall><methodName>' . $method . '</methodName><params></params></methodCall>';
+        $ch = curl_init("http://$ip:$port/");
+        curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => $timeout, CURLOPT_CONNECTTIMEOUT => 4, CURLOPT_HTTPHEADER => ['Content-Type: text/xml']]);
+        $r = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        return ($code === 200 && is_string($r)) ? $r : null;
+    }
+
+    /** @return list<array{addr:string,type:string,val:string}> */
+    private function parseServiceMessages(string $xml): array
+    {
+        $out = [];
+        $prev = libxml_use_internal_errors(true);
+        $sx = simplexml_load_string($xml);
+        libxml_use_internal_errors($prev);
+        if (!$sx) { return $out; }
+        $items = $sx->xpath('//params/param/value/array/data/value');
+        foreach (($items ?: []) as $it) {
+            $vals = $it->xpath('./array/data/value');
+            if (!$vals || count($vals) < 2) { continue; }
+            // Der Wert steht getypt als <value><boolean>1</boolean></value> - der direkte
+            // Text ist dann leer, die "1" steckt im Kindknoten.
+            $v = '1';
+            if (isset($vals[2])) {
+                $v = trim((string) $vals[2]);
+                if ($v === '') { foreach ($vals[2]->children() as $c) { $v = trim((string) $c); break; } }
+            }
+            $out[] = ['addr' => trim((string) $vals[0]), 'type' => trim((string) $vals[1]), 'val' => $v];
+        }
+        return $out;
     }
 
     /** Ist die Variable eine Geraetebatterie? Gibt ['class'=>pct|bool|volt|enum] oder null. */
@@ -394,9 +550,12 @@ class BatteryManager extends IPSModule
         $this->SetValue('Warn', $c['warn']);
         $this->SetValue('Empty', $c['empty']);
         $this->SetValue('Unknown', $c['unknown']);
+        $this->SetValue('Silent', $c['silent'] ?? 0);
         $this->SetValue('Weak', $c['weak']);
         $this->SetValue('OkPercent', $c['total'] > 0 ? (int) round($c['ok'] / $c['total'] * 100) : 0);
-        $this->SetValue('Status', $c['empty'] > 0 ? self::STATE_EMPTY : ($c['warn'] > 0 ? self::STATE_WARN : self::STATE_OK));
+        // Stille sticht Leer: ein Geraet, von dem nichts mehr kommt, ist der dringendere Fall.
+        $this->SetValue('Status', ($c['silent'] ?? 0) > 0 ? self::STATE_SILENT
+            : ($c['empty'] > 0 ? self::STATE_EMPTY : ($c['warn'] > 0 ? self::STATE_WARN : self::STATE_OK)));
         $this->SetValue('Register', $this->buildRegister($res));
         $this->SetValue('Table', $this->buildTable($res));
         $this->SetValue('LastRun', $res['ts']);
@@ -407,7 +566,8 @@ class BatteryManager extends IPSModule
 
     private function stateKey(int $s): string
     {
-        return [self::STATE_OK => 'ok', self::STATE_WARN => 'warn', self::STATE_EMPTY => 'empty', self::STATE_UNKNOWN => 'unknown'][$s] ?? 'unknown';
+        return [self::STATE_OK => 'ok', self::STATE_WARN => 'warn', self::STATE_EMPTY => 'empty',
+                self::STATE_UNKNOWN => 'unknown', self::STATE_SILENT => 'silent'][$s] ?? 'unknown';
     }
 
     private function buildRegister(array $res): string
@@ -427,15 +587,34 @@ class BatteryManager extends IPSModule
     /** JSON-Tabelle fuers LVB table-Widget: Zeile 0 = Spaltenkopf, dann Datenzeilen. */
     private function buildTable(array $res): string
     {
-        $rows = [['Gerät', 'Ort', 'System', 'Status', 'Wert', 'Aktualisiert']];
-        $lbl = ['ok' => 'OK', 'warn' => 'Bald', 'empty' => 'Leer', 'unknown' => '?'];
+        $rows = [['Gerät', 'Ort', 'System', 'Status', 'Wert', 'Aussage von']];
+        $lbl = ['ok' => 'OK', 'warn' => 'Bald', 'empty' => 'Leer', 'unknown' => '?', 'silent' => 'meldet sich nicht'];
         foreach ($res['devices'] as $d) {
             $rows[] = [
                 $d['name'], $d['room'], $d['system'], $lbl[$this->stateKey($d['state'])],
-                $d['text'], $d['ts'] ? date('d.m. H:i', $d['ts']) : '',
+                $d['text'], $this->alterText((int) $d['ts'], (string) ($d['quelle'] ?? ''), $res['ts']),
             ];
         }
         return json_encode($rows, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    }
+
+    /**
+     * Wie alt die Aussage ist - in Worten.
+     *
+     * Ein Datum beantwortet die Frage nicht, um die es hier geht. "23.08. 13:33" und
+     * "12.04. 09:02" sehen gleich aus; "vor 2 h" und "vor 4,4 Jahren" nicht. Und wo die
+     * CCU geantwortet hat, ist die Aussage von jetzt - dann steht das da.
+     */
+    private function alterText(int $ts, string $quelle, int $now): string
+    {
+        if ($quelle === 'CCU') { return 'CCU, jetzt'; }
+        if ($ts <= 0) { return 'nie'; }
+        $s = max(0, $now - $ts);
+        if ($s < 3600)   { return 'vor ' . max(1, (int) round($s / 60)) . ' min'; }
+        if ($s < 86400)  { return 'vor ' . (int) round($s / 3600) . ' h'; }
+        if ($s < 86400 * 60)  { return 'vor ' . (int) round($s / 86400) . ' Tagen'; }
+        if ($s < 86400 * 365) { return 'vor ' . (int) round($s / (86400 * 30)) . ' Monaten'; }
+        return 'vor ' . number_format($s / (86400 * 365), 1, ',', '') . ' Jahren';
     }
 
     /** Links nach Status gruppiert anlegen/verschieben/entfernen (idempotent). Namen = klare Geraetezuordnung. */
@@ -449,6 +628,7 @@ class BatteryManager extends IPSModule
             self::STATE_WARN  => $this->ensureCategory($root, 'catWarn', 'Bald tauschen'),
             self::STATE_OK    => $this->ensureCategory($root, 'catOk', 'OK'),
             self::STATE_UNKNOWN => $this->ensureCategory($root, 'catUnknown', 'Unbekannt'),
+            self::STATE_SILENT  => $this->ensureCategory($root, 'catSilent', 'Meldet sich nicht'),
         ];
 
         // Bestehende Links je Ziel einsammeln
@@ -577,6 +757,13 @@ class BatteryManager extends IPSModule
                     ['type' => 'NumberSpinner', 'name' => 'EmptyThreshold', 'caption' => 'Leer unter (%)'],
                     ['type' => 'NumberSpinner', 'name' => 'StaleDays', 'caption' => '0%-Karenz (Tage)'],
                     ['type' => 'NumberSpinner', 'name' => 'MaxAgeDays', 'caption' => 'Max. Alter %/Spannung (Tage, 0=aus)'],
+                    ['type' => 'NumberSpinner', 'name' => 'SilentDays', 'caption' => 'Still seit (Tage) => meldet sich nicht'],
+                    ['type' => 'ValidationTextBox', 'name' => 'CcuIp', 'caption' => 'HomeMatic-CCU (IP, leer = nicht fragen)'],
+                    ['type' => 'Label', 'caption' =>
+                        'Fuer HomeMatic entscheidet die CCU. LOWBAT wird in IP-Symcon nur bei einer AENDERUNG '
+                        . 'geschrieben - ein "OK" von 2019 ist keine Messung, sondern die Abwesenheit von Nachrichten. '
+                        . 'Die CCU dagegen fuehrt die anstehenden Meldungen. Gezieltes Abfragen hilft nicht: '
+                        . 'Batteriegeraete schlafen und hoeren nur kurz nach dem eigenen Senden zu.'],
                 ]],
                 ['type' => 'RowLayout', 'items' => [
                     ['type' => 'CheckBox', 'name' => 'IncludeHidden', 'caption' => 'Versteckte Variablen einbeziehen'],
