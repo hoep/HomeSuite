@@ -56,6 +56,23 @@ class HeatingZone extends EntityModule
     /** Periodisches Re-Assert des Sollwerts spaetestens alle N Sekunden (Failsafe). */
     private const REASSERT_SECONDS = 300;
 
+    /**
+     * Mindestabstand zwischen zwei CCU-Profilzugriffen - ueber ALLE Zonen hinweg.
+     *
+     * Am 23.08.2026 wurde die Domaene scharf geschaltet: alle 23 Zonen wollten im
+     * selben Tick ihr Wochenprogramm schreiben, die CCU brach ein (getParamset
+     * leer, putParamset Fehler, danach Timeout des HomeMatic-Sockets). Ein
+     * Wochenprofil ist ein grosses Paramset - die Zentrale vertraegt das nur
+     * einzeln. Ohne diese Bremse ist Scharfstellen ein Angriff auf die eigene CCU.
+     */
+    private const PUSH_ABSTAND_SEK = 20;
+
+    /** Nach einem fehlgeschlagenen Schreibversuch so lange Ruhe geben. */
+    private const PUSH_RUHE_SEK = 300;
+
+    /** Datei mit dem Zeitstempel des letzten CCU-Profilzugriffs (prozessuebergreifend). */
+    private const PUSH_STEMPEL = 'homesuite-ccu-push.stamp';
+
     /** Presence-Control-Wert (0..2) -> Zeitplan-Variante. */
     private const PRESENCE_VARIANTS = ['Normal', 'Erweitert', 'Abgesenkt'];
 
@@ -156,6 +173,7 @@ class HeatingZone extends EntityModule
                 ['op' => 'assignProfile',     'label' => 'Profil zuweisen'],
                 ['op' => 'setActivePresence', 'label' => 'Praesenz setzen'],
                 ['op' => 'importLegacy',      'label' => 'Aus Altsteuerung importieren'],
+                ['op' => 'pruefePush',        'label' => 'Fuehrt das Geraet den Plan schon? (nur lesen)'],
                 ['op' => 'adoptDevice',       'label' => 'Geraeteprogramm uebernehmen'],
                 ['op' => 'syncStatus',        'label' => 'Sync-Status'],
                 ['op' => 'loadFromDevice',    'label' => 'Vom Geraet laden'],
@@ -721,21 +739,200 @@ class HeatingZone extends EntityModule
      */
     private function pushWeekIfChanged(IThermostat $drv): void
     {
+        $caps    = $drv->capabilities();
+        $pi      = $this->activeVariantIndex();
         $variant = $this->activeVariant();
-        $week    = $this->schedules()->toHomematicWeek($variant, 10, 13);
+        // Dieselben Rasterwerte wie beim Seeden (seedPushHash) - vorher rechnete
+        // die eine Stelle mit fest 10/13, die andere mit den Treiberwerten. Bei
+        // einem CC-TC (24 Slots) kamen dabei zwei verschiedene Hashes derselben
+        // Woche heraus, und die Zone wollte bei JEDEM Tick schreiben.
+        $week = $this->schedules()->toHomematicWeek(
+            $variant,
+            (int) ($caps['rasterMinutes'] ?? 10),
+            (int) ($caps['maxSlots'] ?? 13)
+        );
         if ($this->weekIsEmpty($week)) {
             return; // kein Plan hinterlegt -> Geraeteprogramm nicht anfassen
         }
         $hash = md5($variant . '|' . json_encode($week));
         $rt   = $this->readRt();
-        if (($rt['pushHash'] ?? '') === $hash) {
-            return; // schon aktuell
+        // Je Variante ein eigener Merker: das Geraet fuehrt drei Profile (P1..P3),
+        // und ein Wechsel der Praesenz darf nicht wie ein geaenderter Plan aussehen.
+        $bekannt = is_array($rt['pushHashes'] ?? null) ? $rt['pushHashes'] : [];
+        if (($bekannt[$variant] ?? '') === $hash) {
+            return; // schon aktuell - ohne einen einzigen Netzzugriff
         }
-        if ($drv->writeWeekProfile($week)) {
-            $rt['pushHash'] = $hash;
+        if ((int) ($rt['pushNext'] ?? 0) > time()) {
+            return; // nach einem Fehlschlag erst wieder nach einer Ruhezeit
+        }
+        if (!$this->ccuSlotFrei()) {
+            return; // eine andere Zone ist gerade dran
+        }
+
+        // ERST NACHSEHEN, DANN SCHREIBEN. Ein unbekannter Hash heisst nicht, dass
+        // das Geraet etwas anderes fuehrt - nach einer Migration oder einem
+        // Praesenzwechsel ist er nur noch nie gebildet worden. Blind zu schreiben
+        // hiesse, 23 Geraeteprogramme anzufassen, um am Ende dasselbe hineinzulegen.
+        $imGeraet = $drv->readWeekProfile($pi);
+        if ($imGeraet !== [] && self::wochenGleich($imGeraet, $week)) {
+            $bekannt[$variant] = $hash;
+            $rt['pushHashes']  = $bekannt;
+            unset($rt['pushNext']);
+            $this->writeRt($rt);
+            $this->ccuSlotSchliessen();
+            $this->SendDebug('HSHT.push', 'Geraet fuehrt den Plan bereits (' . $variant . ')', 0);
+            return;
+        }
+
+        // Die Variante gehoert in IHR Profil: bis 23.08.2026 wurde ohne Index
+        // geschrieben, und das ist bei einem TC-IT immer P1 - der Abgesenkt-Plan
+        // waere im Normal-Profil gelandet.
+        if ($drv->writeWeekProfile($week, $pi)) {
+            $bekannt[$variant] = $hash;
+            $rt['pushHashes']  = $bekannt;
+            $rt['pushHash']    = $hash;
+            unset($rt['pushNext']);
             $this->writeRt($rt);
             $this->SendDebug('HSHT.push', 'Wochenprogramm gepusht (' . $variant . ')', 0);
+        } else {
+            $rt['pushNext'] = time() + self::PUSH_RUHE_SEK;
+            $this->writeRt($rt);
+            $this->SendDebug('HSHT.push', 'Schreiben fehlgeschlagen (' . $variant . ') - Ruhe bis '
+                . date('H:i:s', (int) $rt['pushNext']), 0);
         }
+        $this->ccuSlotSchliessen();
+    }
+
+    /**
+     * Vorflug fuer das Scharfstellen: fuehrt das Geraet den Plan der aktiven
+     * Variante bereits? Liest das Geraeteprofil und vergleicht - ohne einen
+     * einzigen Schreibzugriff. Mit seed=true wird bei Gleichheit der Merker
+     * gesetzt, damit spaeteres Scharfstellen gar keinen Push mehr ausloest.
+     *
+     * @return array<string,mixed>
+     */
+    private function mgmtPruefePush(bool $seed, bool $detail = false): array
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof IThermostat) {
+            return ['ok' => false, 'error' => 'kein Treiber'];
+        }
+        $caps = $drv->capabilities();
+        if (($caps['scheduleMode'] ?? '') !== 'device') {
+            return ['ok' => false, 'error' => 'nur im device-Modus'];
+        }
+        $pi      = $this->activeVariantIndex();
+        $variant = $this->activeVariant();
+        $week    = $this->schedules()->toHomematicWeek(
+            $variant,
+            (int) ($caps['rasterMinutes'] ?? 10),
+            (int) ($caps['maxSlots'] ?? 13)
+        );
+        $hash    = md5($variant . '|' . json_encode($week));
+        $rt      = $this->readRt();
+        $bekannt = is_array($rt['pushHashes'] ?? null) ? $rt['pushHashes'] : [];
+        $leer    = $this->weekIsEmpty($week);
+        $dev     = $leer ? [] : $drv->readWeekProfile($pi);
+        $gleich  = ($dev !== [] && self::wochenGleich($dev, $week));
+        if ($seed && $gleich) {
+            $bekannt[$variant] = $hash;
+            $rt['pushHashes']  = $bekannt;
+            unset($rt['pushNext']);
+            $this->writeRt($rt);
+        }
+        $antwort = [
+            'ok' => true, 'variante' => $variant, 'praesenz' => $pi, 'planLeer' => $leer,
+            'geraetGelesen' => $dev !== [], 'gleich' => $gleich,
+            'geseedet' => ($seed && $gleich), 'merkerPasst' => (($bekannt[$variant] ?? '') === $hash),
+        ];
+        if ($detail) {
+            // Beide Seiten in Vergleichsform, Tag fuer Tag: nur so sieht man, WO sie
+            // auseinandergehen, statt nur DASS sie es tun.
+            $antwort['plan']   = self::wochenText($week);
+            $antwort['geraet'] = self::wochenText($dev);
+        }
+        return $antwort;
+    }
+
+    /**
+     * Darf DIESE Zone jetzt an die CCU? Der Zeitstempel liegt in einer Datei, weil
+     * die Zonen eigenstaendige Instanzen sind und ein Attribut nur die eigene
+     * kennt. Die Semaphore macht Lesen und Setzen unteilbar - sonst kaeme bei 23
+     * gleichzeitigen Ticks doch wieder ein Schwarm durch.
+     */
+    private function ccuSlotFrei(): bool
+    {
+        $datei = \IPS_GetKernelDir() . self::PUSH_STEMPEL;
+        if (!@\IPS_SemaphoreEnter('HS.CcuPush', 400)) {
+            return false;
+        }
+        $frei = false;
+        $letzt = (int) @file_get_contents($datei);
+        if ((time() - $letzt) >= self::PUSH_ABSTAND_SEK) {
+            @file_put_contents($datei, (string) time());
+            $frei = true;
+        }
+        @\IPS_SemaphoreLeave('HS.CcuPush');
+        return $frei;
+    }
+
+    /**
+     * Den Zeitstempel NACH getaner Arbeit noch einmal setzen: der Abstand soll ab
+     * dem ENDE des letzten Zugriffs zaehlen. Ein Profil zu schreiben und zu
+     * verifizieren dauert laenger als der Abstand selbst.
+     */
+    private function ccuSlotSchliessen(): void
+    {
+        @file_put_contents(\IPS_GetKernelDir() . self::PUSH_STEMPEL, (string) time());
+    }
+
+    /**
+     * Zwei Wochenprofile inhaltlich vergleichen (Endzeit und Wert je Slot, auf
+     * Zehntelgrad). Ein reiner Hash taugt hier nicht: das Geraet liefert Werte als
+     * Fliesskomma und fuellt bis zur Slotzahl auf.
+     *
+     * @param array<int,array<int,array{end:int,val:mixed}>> $a
+     * @param array<int,array<int,array{end:int,val:mixed}>> $b
+     */
+    private static function wochenGleich(array $a, array $b): bool
+    {
+        return self::wochenText($a) === self::wochenText($b);
+    }
+
+    /** @param array<int,array<int,array{end:int,val:mixed}>> $w */
+    private static function wochenText(array $w): array
+    {
+        // Verglichen wird der TAGESVERLAUF, nicht die Slot-Liste. Das Geraet fuehrt
+        // dieselbe Kurve oft in mehr Stufen, als der Plan sie schreibt: zwei
+        // benachbarte Slots mit demselben Wert (17:30 auf 18 Grad, 22:30 auf 18
+        // Grad) sind derselbe Verlauf wie ein Slot bis 22:30. Ohne dieses
+        // Zusammenfassen galten 14 von 23 Zonen als abweichend und haetten ihr
+        // Geraeteprogramm neu geschrieben bekommen, um exakt dasselbe hineinzulegen.
+        $norm = static function (array $w): array {
+            $out = [];
+            for ($d = 0; $d < 7; $d++) {
+                $tag  = [];
+                $letzt = null;
+                foreach (($w[$d] ?? []) as $slot) {
+                    $end = (int) ($slot['end'] ?? 0);
+                    $val = number_format((float) ($slot['val'] ?? 0), 1, '.', '');
+                    if ($end <= 0) {
+                        continue;
+                    }
+                    if ($letzt !== null && $letzt === $val && $tag !== []) {
+                        array_pop($tag);            // gleicher Wert -> Grenze faellt weg
+                    }
+                    $tag[]  = $end . ':' . $val;
+                    $letzt  = $val;
+                    if ($end >= 1440) {
+                        break;                      // alles dahinter ist Auffuellung
+                    }
+                }
+                $out[$d] = implode(',', $tag);
+            }
+            return $out;
+        };
+        return $norm($w);
     }
 
     private function weekIsEmpty(array $week): bool
@@ -877,6 +1074,8 @@ class HeatingZone extends EntityModule
                 return $this->ImportLegacy($args);
             case 'adoptDevice':          // Alias der generischen Basis-Op
                 return $this->opLoadFromDevice();
+            case 'pruefePush':           // liest das Geraet und vergleicht - schreibt NICHTS ans Geraet
+                return $this->mgmtPruefePush(!empty($args['seed']), !empty($args['detail']));
             case 'getConfig':
                 return ['ok' => true, 'config' => $this->cfg()];
             case 'migrateConfig':

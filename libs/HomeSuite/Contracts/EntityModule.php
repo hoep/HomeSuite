@@ -1037,7 +1037,13 @@ abstract class EntityModule extends \IPSModule
         $variant = $this->scheduleVariants()[$pi] ?? 'Standard';
         $week    = $this->schedules()->toHomematicWeek($variant, (int) ($caps['rasterMinutes'] ?? 10), (int) ($caps['maxSlots'] ?? 13));
         $rt      = $this->readRt();
-        $rt['pushHash'] = md5($variant . '|' . json_encode($week));
+        $hash    = md5($variant . '|' . json_encode($week));
+        // Zusaetzlich je Variante merken: das Geraet fuehrt mehrere Profile, und ein
+        // Praesenzwechsel darf spaeter nicht wie ein geaenderter Plan aussehen.
+        $map = is_array($rt['pushHashes'] ?? null) ? $rt['pushHashes'] : [];
+        $map[$variant]     = $hash;
+        $rt['pushHashes']  = $map;
+        $rt['pushHash']    = $hash;
         $this->writeRt($rt);
     }
 
