@@ -520,6 +520,7 @@ class HomeSuiteHub extends EntityModule
             ['lightSceneSave',    'Szene speichern (authored)'],
             ['lightSceneCapture', 'Szene aus Ist-Zustand aufnehmen'],
             ['lightSceneApply',   'Szene anwenden'],
+            ['lightSceneOff',     'Szene ausschalten'],
             ['lightSceneRename',  'Szene umbenennen'],
             ['lightSceneDelete',  'Szene loeschen'],
         ] as $sa) {
@@ -954,8 +955,18 @@ class HomeSuiteHub extends EntityModule
         $floor = (strpos($pIdent, 'HSLT_FLOOR_') === 0)
             ? (string) @\IPS_GetName($parent)
             : ($parent > 0 ? (string) @\IPS_GetName((int) @\IPS_GetParent($parent)) : '');
+        // Praesenzmelder kommt vom RAUM (HSSP-Eigenschaft), nicht vom Geraet.
+        // Ueber IPS_GetConfiguration statt IPS_GetProperty gelesen, weil letzteres
+        // wirft, wenn die Eigenschaft (noch) nicht existiert - etwa bei aelteren
+        // Raeumen vor dem Modul-Update.
+        $praesenz = 0;
+        if ($room !== '' && $parent > 0) {
+            $rcfg = json_decode((string) @\IPS_GetConfiguration($parent), true);
+            $praesenz = is_array($rcfg) ? (int) ($rcfg['PresenceVid'] ?? 0) : 0;
+        }
         return ['id' => $iid, 'name' => (string) @\IPS_GetName($iid),
             'room' => $room, 'roomId' => $room !== '' ? $parent : 0, 'floor' => $floor,
+            'presenceVid' => $praesenz,
             'on' => (bool) ($st['on'] ?? false), 'level' => (int) ($st['level'] ?? -1),
             'color' => (int) ($st['color'] ?? -1), 'cct' => (int) ($st['cct'] ?? 0),
             'caps' => is_array($rs['caps'] ?? null) ? $rs['caps'] : []];
@@ -979,7 +990,12 @@ class HomeSuiteHub extends EntityModule
     }
 
     /** Szene anwenden: je Mitglied Power/Brightness/ColorTemp per RequestAction (Schatten-sicher). */
-    private function applyScene(array $scene): array
+    /**
+     * Szene anwenden. $ein=false schaltet sie AUS: alle Leuchten aus, alle Variablen
+     * auf ihren Aus-Wert. Eine Szene ohne Gegenrichtung waere nur halb bedienbar -
+     * man koennte "Fernsehen" einschalten, aber nicht beenden.
+     */
+    private function applyScene(array $scene, bool $ein = true): array
     {
         $applied = 0; $skipped = 0;
         $set = function (int $iid, string $ident, $val) {
@@ -996,14 +1012,51 @@ class HomeSuiteHub extends EntityModule
         foreach ((array) ($scene['members'] ?? []) as $m) {
             $iid = (int) ($m['device'] ?? 0);
             if ($iid <= 0 || !@\IPS_InstanceExists($iid)) { $skipped++; continue; }
-            $on = (bool) ($m['on'] ?? false);
+            $on = $ein ? (bool) ($m['on'] ?? false) : false;
             $set($iid, 'Power', $on);
             if ($on && (int) ($m['level'] ?? -1) >= 0) { $set($iid, 'Brightness', (int) $m['level']); }
             if ($on && (int) ($m['cct'] ?? 0) > 0)     { $set($iid, 'ColorTemp', (int) $m['cct']); }
             if ($on && (int) ($m['color'] ?? -1) >= 0) { $set($iid, 'Color', (int) $m['color']); }
             $applied++;
         }
-        return ['applied' => $applied, 'skipped' => $skipped];
+        // Schaltbare Variablen: RequestAction, wenn die Variable eine Aktion hat, sonst
+        // SetValue. Der Wert wird auf den Typ der Variablen gecastet - der Editor kennt
+        // nur Text, ein Integer-Ziel bekaeme sonst "1" statt 1.
+        $vAppl = 0; $vSkip = 0;
+        foreach ((array) ($scene['vars'] ?? []) as $v) {
+            $vid = (int) ($v['vid'] ?? 0);
+            if ($vid <= 0 || !@\IPS_VariableExists($vid)) { $vSkip++; continue; }
+            $roh = $ein ? ($v['on'] ?? true) : ($v['off'] ?? false);
+            $var = @\IPS_GetVariable($vid);
+            switch ((int) ($var['VariableType'] ?? 0)) {
+                case 0: $wert = is_bool($roh) ? $roh
+                        : in_array(strtolower(trim((string) $roh)), ['1','true','ein','an','on','ja'], true); break;
+                case 1: $wert = (int) $roh; break;
+                case 2: $wert = (float) str_replace(',', '.', (string) $roh); break;
+                default: $wert = (string) $roh;
+            }
+            if ((int) ($var['VariableAction'] ?? 0) > 0 || (int) ($var['VariableCustomAction'] ?? 0) > 0) {
+                @\RequestAction($vid, $wert);
+            } else {
+                @\SetValue($vid, $wert);
+            }
+            $vAppl++;
+        }
+        // Skripte ZULETZT: so sehen sie den bereits gesetzten Zustand. Bewusst
+        // asynchron - eine Szene darf nicht an einem langsamen Skript haengenbleiben.
+        // Das Skript bekommt die Richtung mit, damit EIN Skript beide Faelle bedienen kann.
+        $sRun = 0; $sSkip = 0;
+        foreach ((array) ($scene['scripts'] ?? []) as $sc) {
+            $sid = (int) ($sc['sid'] ?? 0);
+            if ($sid <= 0 || !@\IPS_ScriptExists($sid)) { $sSkip++; continue; }
+            $when = (string) ($sc['when'] ?? 'on');
+            if ($ein && $when === 'off')  { continue; }
+            if (!$ein && $when === 'on')  { continue; }
+            @\IPS_RunScriptEx($sid, ['SCENE' => (string) ($scene['id'] ?? ''), 'STATE' => $ein ? 'on' : 'off']);
+            $sRun++;
+        }
+        return ['applied' => $applied, 'skipped' => $skipped, 'vars' => $vAppl,
+                'varsSkipped' => $vSkip, 'scripts' => $sRun, 'scriptsSkipped' => $sSkip];
     }
 
     private function mgmtLightScene(string $op, array $args, array $ctx): array
@@ -1039,12 +1092,19 @@ class HomeSuiteHub extends EntityModule
                     'scope' => $scope,
                     'transitionMs' => (int) ($args['transitionMs'] ?? 0),
                     'members' => $members,
+                    // Beim Neu-Aufnehmen bleiben die Variablen der Szene erhalten -
+                    // aufgenommen wird der LICHT-Zustand, nicht der Rest.
+                    'vars' => (array) ($eng->get((string) ($args['id'] ?? ''))['vars'] ?? []),
                 ], time());
                 return ['ok' => true, 'scene' => $scene, 'captured' => count($members)];
             case 'lightSceneApply':
                 $s = $eng->get((string) ($args['id'] ?? ''));
                 if (!$s) { return ['ok' => false, 'error' => 'not_found']; }
-                return ['ok' => true] + $this->applyScene($s);
+                return ['ok' => true] + $this->applyScene($s, true);
+            case 'lightSceneOff':
+                $s = $eng->get((string) ($args['id'] ?? ''));
+                if (!$s) { return ['ok' => false, 'error' => 'not_found']; }
+                return ['ok' => true] + $this->applyScene($s, false);
             default:
                 return ['ok' => false, 'op' => $op, 'error' => 'not_implemented'];
         }

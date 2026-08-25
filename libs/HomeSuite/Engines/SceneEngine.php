@@ -114,6 +114,40 @@ final class SceneEngine
                 'cct'    => array_key_exists('cct', $m) ? (int) $m['cct'] : 0,
             ];
         }
+        // Schaltbare Variablen als zweite Mitgliederart. Eine Szene ist selten nur Licht:
+        // "Fernsehen" heisst Stehlampe + Ambiente + Receiver an - und beim Ausschalten
+        // wieder alle drei aus. Deshalb je Variable ein Ein- UND ein Aus-Wert; ohne
+        // Aus-Wert wuesste die Szene beim Abschalten nicht, wohin.
+        $vars = [];
+        foreach ((array) ($scene['vars'] ?? []) as $v) {
+            $vid = (int) ($v['vid'] ?? 0);
+            if ($vid <= 0) {
+                continue;
+            }
+            $vars[] = [
+                'vid'  => $vid,
+                'name' => trim((string) ($v['name'] ?? '')),
+                'on'   => $v['on']  ?? true,
+                'off'  => $v['off'] ?? false,
+            ];
+        }
+
+        // Skripte als dritte Mitgliederart. Manches laesst sich nicht als Variable
+        // ausdruecken - eine Geraetesequenz, eine Fahrt, eine Benachrichtigung.
+        // 'when' sagt, in welche Richtung das Skript laeuft.
+        $scripts = [];
+        foreach ((array) ($scene['scripts'] ?? []) as $sc) {
+            $sid = (int) ($sc['sid'] ?? 0);
+            if ($sid <= 0) {
+                continue;
+            }
+            $when = (string) ($sc['when'] ?? 'on');
+            if (!in_array($when, ['on', 'off', 'both'], true)) {
+                $when = 'on';
+            }
+            $scripts[] = ['sid' => $sid, 'name' => trim((string) ($sc['name'] ?? '')), 'when' => $when];
+        }
+
         $rec = [
             'id'           => $id,
             'name'         => $name,
@@ -121,6 +155,8 @@ final class SceneEngine
             'scope'        => is_array($scene['scope'] ?? null) ? $scene['scope'] : ['type' => 'house', 'ref' => ''],
             'transitionMs' => max(0, (int) ($scene['transitionMs'] ?? 0)),
             'members'      => $members,
+            'vars'         => $vars,
+            'scripts'      => $scripts,
             'updated'      => $now > 0 ? $now : (int) ($scene['updated'] ?? 0),
         ];
         $all = $this->all();
