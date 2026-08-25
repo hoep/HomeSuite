@@ -1050,26 +1050,50 @@ abstract class EntityModule extends \IPSModule
     /** Vergleicht zwei Wochenstrukturen [day => [{end,val}]] mit Toleranz. */
     protected function weeksEqual(array $a, array $b): bool
     {
+        return self::weekCurve($a) === self::weekCurve($b);
+    }
+
+    /**
+     * Tagesverlauf statt Slot-Liste.
+     *
+     * Verglichen wird, WAS der Tag tut, nicht in wie vielen Stufen er es
+     * aufschreibt. Ein Geraet fuehrt dieselbe Kurve oft feiner unterteilt als der
+     * Plan sie schreibt: zwei benachbarte Slots mit demselben Wert (17:30 auf 18
+     * Grad, 22:30 auf 18 Grad) sind derselbe Verlauf wie ein Slot bis 22:30. Der
+     * fruehere Vergleich zaehlte erst die Slots und erklaerte solche Tage fuer
+     * verschieden - bei der Heizung galten dadurch 14 von 23 Zonen als abweichend,
+     * obwohl beide Seiten dasselbe fuhren.
+     *
+     * @param array<int,array<int,array{end:int,val:mixed}>> $w
+     * @return array<int,string>
+     */
+    private static function weekCurve(array $w): array
+    {
+        $out = [];
         for ($d = 0; $d < 7; $d++) {
-            $sa = $a[$d] ?? [];
-            $sb = $b[$d] ?? [];
-            if (count($sa) !== count($sb)) {
-                return false;
+            $tag   = [];
+            $letzt = null;
+            foreach (($w[$d] ?? []) as $slot) {
+                if (!is_array($slot)) {
+                    continue;
+                }
+                $end = (int) ($slot['end'] ?? 0);
+                $val = number_format((float) ($slot['val'] ?? 0), 1, '.', '');
+                if ($end <= 0) {
+                    continue;
+                }
+                if ($letzt !== null && $letzt === $val && $tag !== []) {
+                    array_pop($tag);            // gleicher Wert -> Grenze faellt weg
+                }
+                $tag[]  = $end . ':' . $val;
+                $letzt  = $val;
+                if ($end >= 1440) {
+                    break;                      // alles dahinter ist Auffuellung
+                }
             }
-            foreach ($sa as $i => $slot) {
-                $eb = $sb[$i] ?? null;
-                if (!is_array($eb)) {
-                    return false;
-                }
-                if ((int) ($slot['end'] ?? -1) !== (int) ($eb['end'] ?? -2)) {
-                    return false;
-                }
-                if (abs((float) ($slot['val'] ?? 0) - (float) ($eb['val'] ?? 0)) > 0.05) {
-                    return false;
-                }
-            }
+            $out[$d] = implode(',', $tag);
         }
-        return true;
+        return $out;
     }
 
     /** Volatiler Laufzeit-Status (eigenes Attribut, Blocker D). */

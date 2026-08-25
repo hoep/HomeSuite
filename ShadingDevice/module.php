@@ -2833,6 +2833,24 @@ class ShadingDevice extends EntityModule
         if ($Message !== VM_UPDATE) {
             return;
         }
+
+        // Wind und Regen werden im 5-Sekunden-Takt GESCHRIEBEN, aendern sich dabei
+        // aber fast nie. Eine Sturm-Flanke setzt zwingend einen geaenderten Wert
+        // voraus, also ist jedes readInputs()/stormActive() auf eine unveraenderte
+        // Aktualisierung reine Last: allein die Regenvariable kam so auf 19.089
+        // Handler-Laeufe in viereinhalb Tagen (je ~128 ms) - zusammen mit Wind
+        // 48 Minuten blockierte Nachrichtenzeit ueber alle Beschattungsinstanzen.
+        // $Data[1] ist das Changed-Flag von VM_UPDATE. Fehlt es, wird nicht
+        // gefiltert. Die Positions-Variable bleibt bewusst aussen vor: dort ist
+        // auch ein wertgleicher Fremdschreibvorgang ein Eingriff. Alles Uebrige
+        // deckt weiterhin der 30-s-Tick ab.
+        if (isset($Data[1]) && !$Data[1]) {
+            $wVid = $this->envId('windId', self::WIND_ID);
+            $rVid = $this->envId('rainId', self::RAIN_ID);
+            if (($wVid > 0 && (int) $Sender === $wVid) || ($rVid > 0 && (int) $Sender === $rVid)) {
+                return;
+            }
+        }
         $rt      = $this->readRt();
         $posVid  = (int) ($rt['watchVid'] ?? 0);
         $windVid = $this->envId('windId', self::WIND_ID);

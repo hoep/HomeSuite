@@ -223,6 +223,7 @@ class HeatingZone extends EntityModule
             'sensorId'  => $this->ReadPropertyInteger('SensorId'),
             'frostTemp' => $this->ReadPropertyFloat('FrostTemp'),
             'armed'     => $this->ReadPropertyBoolean('Armed'),
+            'weekWrite' => $this->weekWriteMode(),
         ];
     }
 
@@ -450,6 +451,10 @@ class HeatingZone extends EntityModule
         $this->RegisterPropertyBoolean('Armed', false);    // Schatten-Modus bis Cutover
         $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
         $this->RegisterPropertyInteger('QueryInterval', 30); // Abfrage-Intervall in SEKUNDEN (default = REFRESH_MS/1000)
+        // Wann darf der Abgleich das WOCHENPROGRAMM ins Geraet schreiben?
+        //   0 = nur auf Befehl   1 = bei Aenderung (Vorgabe)   2 = laufend
+        // Siehe weekWriteMode() - die Begruendung steht dort.
+        $this->RegisterPropertyInteger('WeekWrite', 1);
     }
 
     /** Effektives Refresh-Intervall in Millisekunden aus QueryInterval (Boden 2s gegen Hot-Loop). */
@@ -754,6 +759,38 @@ class HeatingZone extends EntityModule
      * device-Modus: pusht das Wochenprogramm der aktiven Variante ins Geraet,
      * wenn es sich gegenueber dem zuletzt gepushten Stand geaendert hat.
      */
+    /**
+     * Wann der Abgleich das Wochenprogramm ins Geraet schreiben darf.
+     *
+     * Am 23.08.2026 hat das Scharfschalten der Heizdomaene 23 Zonen gleichzeitig
+     * an die CCU geschickt, weil fuer KEINE ein Merker existierte - ein
+     * unbekannter Merker sah aus wie "der Plan hat sich geaendert". Die CCU ist
+     * dabei zusammengebrochen. Takt, Semaphore und Lesen-vor-Schreiben verhindern
+     * den Schwarm inzwischen; die eigentliche Frage bleibt aber, warum ein
+     * ROUTINEDURCHLAUF ueberhaupt schreibt.
+     *
+     *   0 nur auf Befehl  Der Abgleich schreibt nie. Geschrieben wird ausschliesslich
+     *                     ueber `syncToDevice`. Ein im Haus geaenderter Zeitplan
+     *                     erreicht das Geraet dann NICHT von selbst.
+     *   1 bei Aenderung   Vorgabe. Geschrieben wird nur, wenn sich der Plan
+     *                     gegenueber einem BEKANNTEN Merker geaendert hat. Beim
+     *                     ersten Beruehren einer Zone wird nur gelesen und der
+     *                     Merker gesetzt - ein unbekannter Merker kann damit
+     *                     keinen Schreibvorgang mehr ausloesen.
+     *   2 laufend         Verhalten bis 23.08.2026: unbekannter Merker fuehrt zu
+     *                     Lesen, Vergleichen und gegebenenfalls Schreiben.
+     */
+    private function weekWriteMode(): int
+    {
+        $m = 1;
+        try {
+            $m = (int) $this->ReadPropertyInteger('WeekWrite');
+        } catch (\Throwable $e) {
+            $m = 1; // Eigenschaft noch nicht registriert (vor Modul-Neuladen)
+        }
+        return ($m >= 0 && $m <= 2) ? $m : 1;
+    }
+
     private function pushWeekIfChanged(IThermostat $drv): void
     {
         $caps    = $drv->capabilities();
@@ -771,12 +808,17 @@ class HeatingZone extends EntityModule
         if ($this->weekIsEmpty($week)) {
             return; // kein Plan hinterlegt -> Geraeteprogramm nicht anfassen
         }
+        $modus = $this->weekWriteMode();
+        if ($modus === 0) {
+            return; // nur auf Befehl - der Routinedurchlauf fasst das Geraet nicht an
+        }
         $hash = md5($variant . '|' . json_encode($week));
         $rt   = $this->readRt();
         // Je Variante ein eigener Merker: das Geraet fuehrt drei Profile (P1..P3),
         // und ein Wechsel der Praesenz darf nicht wie ein geaenderter Plan aussehen.
         $bekannt = is_array($rt['pushHashes'] ?? null) ? $rt['pushHashes'] : [];
-        if (($bekannt[$variant] ?? '') === $hash) {
+        $vorher  = (string) ($bekannt[$variant] ?? '');
+        if ($vorher === $hash) {
             return; // schon aktuell - ohne einen einzigen Netzzugriff
         }
         if ((int) ($rt['pushNext'] ?? 0) > time()) {
@@ -811,6 +853,25 @@ class HeatingZone extends EntityModule
             return;
         }
 
+        // ERSTBERUEHRUNG IM MODUS "bei Aenderung": es gab noch nie einen Merker,
+        // also ist NICHT belegt, dass sich etwas geaendert hat - belegt ist nur,
+        // dass beide Seiten auseinanderliegen. Das kann genauso gut heissen, dass
+        // im Geraet der bessere Plan steht. Wer hier schreibt, entscheidet das
+        // ungefragt fuer 23 Zonen auf einmal; genau das ist am 23.08. passiert.
+        // Also: vermerken, sichtbar machen, und die Entscheidung dem Menschen
+        // lassen (`syncToDevice` schreibt, `adoptDevice` uebernimmt).
+        if ($modus === 1 && $vorher === '') {
+            $ab = is_array($rt['pushDiff'] ?? null) ? $rt['pushDiff'] : [];
+            $ab[$variant] = time();
+            $rt['pushDiff'] = $ab;
+            $rt['pushNext'] = time() + self::PUSH_RUHE_SEK;
+            $this->writeRt($rt);
+            $this->ccuSlotSchliessen();
+            $this->SendDebug('HSHT.push', 'Plan und Geraet gehen auseinander (' . $variant
+                . ') - erste Beruehrung, kein Schreibversuch. syncToDevice oder adoptDevice entscheidet.', 0);
+            return;
+        }
+
         // Die Variante gehoert in IHR Profil: bis 23.08.2026 wurde ohne Index
         // geschrieben, und das ist bei einem TC-IT immer P1 - der Abgesenkt-Plan
         // waere im Normal-Profil gelandet.
@@ -819,6 +880,9 @@ class HeatingZone extends EntityModule
             $rt['pushHashes']  = $bekannt;
             $rt['pushHash']    = $hash;
             unset($rt['pushNext']);
+            if (is_array($rt['pushDiff'] ?? null)) {
+                unset($rt['pushDiff'][$variant]);
+            }
             $this->writeRt($rt);
             $this->SendDebug('HSHT.push', 'Wochenprogramm gepusht (' . $variant . ')', 0);
         } else {
@@ -914,6 +978,16 @@ class HeatingZone extends EntityModule
             'ok' => true, 'variante' => $variant, 'praesenz' => $pi, 'planLeer' => $leer,
             'geraetGelesen' => $dev !== [], 'gleich' => $gleich,
             'geseedet' => ($seed && $gleich), 'merkerPasst' => (($bekannt[$variant] ?? '') === $hash),
+            'schreibmodus' => $this->weekWriteMode(),
+            // Worauf zeigt das GERAET gerade? Beim Scharfstellen zieht der Abgleich
+            // den Zeiger auf die Praesenz des Moduls - das ist ein echter Eingriff
+            // in den Heizbetrieb und gehoert in den Vorflug, nicht in die Ueberraschung.
+            'zeigerGeraet' => (method_exists($drv, 'activeProfile') && (int) ($caps['deviceProfiles'] ?? 1) >= 2)
+                ? $drv->activeProfile() : null,
+            // Wann der Abgleich zuletzt eine Abweichung gesehen und BEWUSST nicht
+            // geschrieben hat - sonst bliebe das Auseinanderlaufen unsichtbar.
+            'abweichungSeit' => isset($rt['pushDiff'][$variant])
+                ? date('d.m.Y H:i:s', (int) $rt['pushDiff'][$variant]) : null,
         ];
         if ($detail) {
             // Beide Seiten in Vergleichsform, Tag fuer Tag: nur so sieht man, WO sie
@@ -1150,6 +1224,23 @@ class HeatingZone extends EntityModule
                 return ['ok' => true, 'config' => $this->cfg()];
             case 'migrateConfig':
                 return $this->migrateConfig();
+            case 'syncToDevice':
+                // Der ausdrueckliche Befehl umgeht Takt und Merker - aber NICHT den
+                // Schattenmodus. Eine Zone, die laut Konfiguration nichts schreiben
+                // darf, schreibt auch auf Knopfdruck nichts, solange niemand das
+                // ausdruecklich erzwingt.
+                if (!$this->armed() && empty($args['force'])) {
+                    return ['ok' => false, 'error' => 'Zone ist im Schattenmodus - mit force:true erzwingen'];
+                }
+                return $this->opSyncToDevice();
+            case 'setWeekWrite':   // 0 nur auf Befehl | 1 bei Aenderung | 2 laufend
+                $m = (int) ($args['mode'] ?? 1);
+                if ($m < 0 || $m > 2) {
+                    return ['ok' => false, 'error' => 'mode 0..2 erwartet'];
+                }
+                @\IPS_SetProperty($this->InstanceID, 'WeekWrite', $m);
+                @\IPS_ApplyChanges($this->InstanceID);
+                return ['ok' => true, 'weekWrite' => $this->weekWriteMode()];
             case 'setArmed':
                 @\IPS_SetProperty($this->InstanceID, 'Armed', (bool) ($args['armed'] ?? false));
                 @\IPS_ApplyChanges($this->InstanceID);
