@@ -29,6 +29,11 @@ class HomeSuiteBereich extends IPSModule
         parent::Create();
         $this->RegisterPropertyString('Kind', 'Raum');  // Haus | Bereich | Raum
         $this->RegisterPropertyString('Abbr', '');       // Kuerzel (optional)
+        // Praesenz gehoert zum RAUM, nicht zu einzelnen Geraeten: derselbe Melder
+        // gilt fuer jede Leuchte, jeden Heizkoerper und jede Beschattung darin.
+        // Frueher stand dieselbe Variablen-ID in 39 Leuchten-Widgets - ein Tausch
+        // haette 39 Aenderungen bedeutet.
+        $this->RegisterPropertyInteger('PresenceVid', 0);
     }
 
     /**
@@ -46,6 +51,8 @@ class HomeSuiteBereich extends IPSModule
                     ['caption' => 'Raum',          'value' => 'Raum'],
                 ]],
                 ['type' => 'ValidationTextBox', 'name' => 'Abbr', 'caption' => 'Kuerzel (optional)'],
+                ['type' => 'SelectVariable', 'name' => 'PresenceVid',
+                 'caption' => 'Praesenz-/Bewegungsmelder des Raums (optional)'],
                 ['type' => 'Label', 'caption' =>
                     'Struktur = Objektbaum: dieses Element unter sein uebergeordnetes haengen '
                     . '(Haus > Bereich > Raum) und die Entitaeten (Heizung, ...) unter den Raum. '
