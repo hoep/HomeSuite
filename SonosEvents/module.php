@@ -66,7 +66,7 @@ class HomeSuiteSonosEvents extends IPSModule
     /** Rueckruf-Adresse, die der Player anspricht. */
     private function callback(): string
     {
-        $host = trim($this->ReadPropertyString('CallbackHost'));
+        $host = trim((string) $this->ReadPropertyString('CallbackHost'));
         if ($host === '') {
             // Die Adresse, unter der uns die Player sehen: die des eigenen Netzes.
             $host = (string) (gethostbyname(gethostname()) ?: '');

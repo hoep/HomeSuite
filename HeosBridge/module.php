@@ -66,7 +66,7 @@ class HeosBridge extends IPSModule
         if ($pid <= 0) {
             return;
         }
-        $host = trim($this->ReadPropertyString('Host'));
+        $host = trim((string) $this->ReadPropertyString('Host'));
         $port = max(1, $this->ReadPropertyInteger('Port'));
         @IPS_SetProperty($pid, 'Host', $host);
         @IPS_SetProperty($pid, 'Port', $port);

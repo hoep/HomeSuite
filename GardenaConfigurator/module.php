@@ -44,15 +44,15 @@ class GardenaConfigurator extends \IPSModule
     // ------------------------------------------------------------------
     private function hasCreds(): bool
     {
-        return trim($this->ReadPropertyString('ClientID')) !== ''
-            && trim($this->ReadPropertyString('ClientSecret')) !== '';
+        return trim((string) $this->ReadPropertyString('ClientID')) !== ''
+            && trim((string) $this->ReadPropertyString('ClientSecret')) !== '';
     }
 
     /** Client ID/Secret aus dem Formular in die (root-only) Datei schreiben; Token-Cache verwerfen. */
     private function saveCreds(): void
     {
-        $id = trim($this->ReadPropertyString('ClientID'));
-        $se = trim($this->ReadPropertyString('ClientSecret'));
+        $id = trim((string) $this->ReadPropertyString('ClientID'));
+        $se = trim((string) $this->ReadPropertyString('ClientSecret'));
         if ($id === '' || $se === '') {
             return;
         }

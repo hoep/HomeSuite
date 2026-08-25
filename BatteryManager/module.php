@@ -338,7 +338,7 @@ class BatteryManager extends IPSModule
      */
     private function ccuStand(): array
     {
-        $ip = trim($this->ReadPropertyString('CcuIp'));
+        $ip = trim((string) $this->ReadPropertyString('CcuIp'));
         $leer = ['lowbat' => [], 'unreach' => [], 'ok' => false];
         if ($ip === '' || !filter_var($ip, FILTER_VALIDATE_IP)) {
             return $leer;
@@ -377,7 +377,13 @@ class BatteryManager extends IPSModule
         $suche = array_flip($serien);
         $out = [];
         foreach (IPS_GetInstanceList() as $iid) {
-            $cfg = @json_decode(IPS_GetConfiguration($iid), true);
+            // IPS_GetConfiguration liefert FALSE, wenn eine Instanz keine Konfiguration
+            // hat oder zwischen Auflisten und Abfragen verschwindet. json_decode(false)
+            // ist unter PHP 8 ein TypeError - und den faengt das @ NICHT ab. Der Fehler
+            // riss am 24.08.2026 die Sicherheitslage (#<ID>) viermal mit in den Abbruch,
+            // weil sie ueber die Batterieliste hier hereinkommt.
+            $cfg = json_decode((string) @IPS_GetConfiguration($iid), true);
+            if (!is_array($cfg)) { continue; }
             $addr = (string) ($cfg['Address'] ?? '');
             if ($addr === '') { continue; }
             $serie = explode(':', $addr)[0];

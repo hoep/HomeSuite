@@ -67,8 +67,8 @@ class AudioZoneBridged extends AudioZone
         $this->driverResolved = true;
         $this->driverInstance = null;
 
-        $pid = trim($this->ReadPropertyString('PID'));
-        $vendor = trim($this->ReadPropertyString('Vendor')) ?: 'heos';
+        $pid = trim((string) $this->ReadPropertyString('PID'));
+        $vendor = trim((string) $this->ReadPropertyString('Vendor')) ?: 'heos';
         if ($pid === '' || !DriverFactory::has($vendor)) {
             return null;
         }
