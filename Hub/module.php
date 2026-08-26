@@ -663,6 +663,66 @@ class HomeSuiteHub extends EntityModule
             }
             $this->WriteAttributeBoolean('ArmModeSeeded', true);
         }
+
+        // ---- Wie viele Lichter brennen gerade? ------------------------------------
+        //
+        // Eine Zahl, die man binden kann: fuer die Visu, fuer "alles aus"-Hinweise, fuer
+        // Auswertungen. Sie wird NICHT gerechnet, wenn jemand danach fragt, sondern
+        // fortlaufend nachgefuehrt - sonst zeigt sie beim Ansehen einen Stand von vorhin.
+        //
+        // Zwei Wege zusammen, weil jeder allein eine Luecke hat: der MessageSink meldet
+        // jede Aenderung sofort (das ist der Normalfall), und der Provision-Timer zaehlt
+        // zusaetzlich turnusmaessig nach - falls eine Leuchte neu dazukommt, verschwindet
+        // oder ihre Statusvariable getauscht wird, ohne dass jemand ApplyChanges drueckt.
+        if (!@$this->GetIDForIdent('LightsOn')) {
+            $this->RegisterVariableInteger('LightsOn', 'Lichter an', '', 120);
+        }
+        if (!@$this->GetIDForIdent('LightsOff')) {
+            $this->RegisterVariableInteger('LightsOff', 'Lichter aus', '', 121);
+        }
+        if (!@$this->GetIDForIdent('LightsTotal')) {
+            $this->RegisterVariableInteger('LightsTotal', 'Lichter gesamt', '', 122);
+        }
+        $this->lichterHorchen();
+        $this->lichterZaehlen();
+    }
+
+    /**
+     * Auf die Schaltzustaende ALLER Leuchten horchen.
+     *
+     * Angemeldet wird die Power-Statusvariable jeder LightDevice-Instanz. Doppelte
+     * Anmeldungen sind unschaedlich (IPS haelt die Liste eindeutig), deshalb genuegt
+     * der Aufruf bei jedem ApplyChanges - so werden neu angelegte Leuchten mit
+     * eingesammelt.
+     */
+    private function lichterHorchen(): void
+    {
+        foreach ($this->hsltList() as $iid) {
+            $vid = (int) @\IPS_GetObjectIDByIdent('Power', $iid);
+            if ($vid > 0) {
+                @$this->RegisterMessage($vid, 10603 /* VM_UPDATE */);
+            }
+        }
+    }
+
+    /** Brennende und dunkle Leuchten zaehlen und in die drei Variablen schreiben. */
+    private function lichterZaehlen(): void
+    {
+        $an = 0;
+        $gesamt = 0;
+        foreach ($this->hsltList() as $iid) {
+            $vid = (int) @\IPS_GetObjectIDByIdent('Power', $iid);
+            if ($vid <= 0) {
+                continue;
+            }
+            $gesamt++;
+            if ((bool) @\GetValue($vid)) {
+                $an++;
+            }
+        }
+        if (@$this->GetIDForIdent('LightsOn'))    { @$this->SetValue('LightsOn', $an); }
+        if (@$this->GetIDForIdent('LightsOff'))   { @$this->SetValue('LightsOff', $gesamt - $an); }
+        if (@$this->GetIDForIdent('LightsTotal')) { @$this->SetValue('LightsTotal', $gesamt); }
     }
 
     /**
@@ -1398,6 +1458,9 @@ class HomeSuiteHub extends EntityModule
         if ((int) $Message !== 10603) { // VM_UPDATE
             return;
         }
+        // Zuerst zaehlen, DANN die Automatik. Sonst haengt der Zaehler daran, ob die
+        // Lichtautomatik ueberhaupt eingeschaltet ist - er soll aber immer stimmen.
+        $this->lichterZaehlen();
         $cfg = $this->lightAutoCfg();
         if (!$cfg['enabled'] || !$this->automationEnabled()) {
             return;
