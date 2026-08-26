@@ -80,6 +80,9 @@ class HomeSuiteHub extends EntityModule
     private const TIMER_PROVISION = 'ProvisionJob';
     private const TIMER_LIGHTAUTO = 'LightAuto';
     private const LIGHTAUTO_TICK_MS = 60000;
+    /** Wie lange einem stummen Geraet nachgefasst wird, und wie viele Faelle gleichzeitig. */
+    private const NACHFASS_SEK = 300;
+    private const NACHFASS_MAX = 24;
 
     /** Intervall (ms), in dem der Provision-Timer die Queue abarbeitet. */
     private const PROVISION_TICK_MS = 500;
@@ -1055,9 +1058,67 @@ class HomeSuiteHub extends EntityModule
      * auf ihren Aus-Wert. Eine Szene ohne Gegenrichtung waere nur halb bedienbar -
      * man koennte "Fernsehen" einschalten, aber nicht beenden.
      */
+    /**
+     * Nachfassen bei einem Befehl, der nicht angekommen ist.
+     *
+     * Die Lichtautomatik schaltet auf der KANTE und setzt bewusst keinen Sollzustand
+     * durch - sonst wuerde sie eine von Hand eingeschaltete Lampe wieder ausknipsen.
+     * Genau deshalb merkt sie aber auch nicht, wenn ein Befehl verpufft: die
+     * Statusvariable wird beim Schalten optimistisch vorgeschrieben, ein stummes
+     * Geraet sieht darin aus wie ein gehorsames.
+     *
+     * Diese Schlange liest deshalb den ECHTEN Zustand zurueck (Refresh holt ihn vom
+     * Treiber) und wiederholt NUR den Befehl, der nicht angekommen ist. Ein Mensch,
+     * der zwischendurch von Hand gegengesteuert hat, behaelt den Vorrang - erkannt
+     * daran, dass sich der beobachtete Zustand GEAENDERT hat. Ein taubes Geraet
+     * aendert sich nicht, ein bedienter Schalter schon. Zeitstempel taugen dafuer
+     * nicht: Refresh schreibt die Variable selbst und saehe wie ein Eingriff aus.
+     *
+     * @param array<int,array{iid:int,want:bool,bis:int,versuche:int,zuletzt?:bool}> $liste
+     * @return array<int,array<string,mixed>> die noch offenen Faelle
+     */
+    private function nachfassen(array $liste, int $now): array
+    {
+        $bleibt = [];
+        foreach ($liste as $e) {
+            $iid = (int) ($e['iid'] ?? 0);
+            if ($iid <= 0 || !@\IPS_InstanceExists($iid)) {
+                continue;
+            }
+            // Ist-Zustand vom Geraet holen, nicht aus der optimistisch gesetzten Anzeige.
+            if (\function_exists('HSLT_Refresh')) {
+                @\HSLT_Refresh($iid);
+            }
+            $pv = (int) (@\IPS_GetObjectIDByIdent('Power', $iid) ?: 0);
+            if ($pv <= 0) {
+                continue;
+            }
+            $ist  = (bool) @\GetValue($pv);
+            $want = (bool) ($e['want'] ?? false);
+            if ($ist === $want) {
+                continue;                       // angekommen - erledigt
+            }
+            if (array_key_exists('zuletzt', $e) && (bool) $e['zuletzt'] !== $ist) {
+                continue;                       // jemand hat gegengesteuert - der hat Vorrang
+            }
+            if ($now >= (int) ($e['bis'] ?? 0)) {
+                $this->LogMessage(sprintf(
+                    'Licht-Automatik: %s (#%d) nimmt "%s" nicht an - nach %d Versuchen aufgegeben.',
+                    (string) @\IPS_GetName($iid), $iid, $want ? 'ein' : 'aus', (int) ($e['versuche'] ?? 0)
+                ), KL_WARNING);
+                continue;
+            }
+            @\RequestAction($pv, $want);
+            $e['versuche'] = (int) ($e['versuche'] ?? 0) + 1;
+            $e['zuletzt']  = $ist;
+            $bleibt[] = $e;
+        }
+        return $bleibt;
+    }
+
     private function applyScene(array $scene, bool $ein = true): array
     {
-        $applied = 0; $skipped = 0;
+        $applied = 0; $skipped = 0; $pending = [];
         $set = function (int $iid, string $ident, $val) {
             $vid = (int) (@\IPS_GetObjectIDByIdent($ident, $iid) ?: 0);
             if ($vid <= 0 || !@\IPS_VariableExists($vid)) { return false; }
@@ -1074,6 +1135,7 @@ class HomeSuiteHub extends EntityModule
             if ($iid <= 0 || !@\IPS_InstanceExists($iid)) { $skipped++; continue; }
             $on = $ein ? (bool) ($m['on'] ?? false) : false;
             $set($iid, 'Power', $on);
+            $pending[] = ['iid' => $iid, 'want' => $on];
             if ($on && (int) ($m['level'] ?? -1) >= 0) { $set($iid, 'Brightness', (int) $m['level']); }
             if ($on && (int) ($m['cct'] ?? 0) > 0)     { $set($iid, 'ColorTemp', (int) $m['cct']); }
             if ($on && (int) ($m['color'] ?? -1) >= 0) { $set($iid, 'Color', (int) $m['color']); }
@@ -1115,7 +1177,7 @@ class HomeSuiteHub extends EntityModule
             @\IPS_RunScriptEx($sid, ['SCENE' => (string) ($scene['id'] ?? ''), 'STATE' => $ein ? 'on' : 'off']);
             $sRun++;
         }
-        return ['applied' => $applied, 'skipped' => $skipped, 'vars' => $vAppl,
+        return ['pending' => $pending, 'applied' => $applied, 'skipped' => $skipped, 'vars' => $vAppl,
                 'varsSkipped' => $vSkip, 'scripts' => $sRun, 'scriptsSkipped' => $sSkip];
     }
 
@@ -1367,11 +1429,21 @@ class HomeSuiteHub extends EntityModule
         $prevMin = isset($st['prevMin']) ? (int) $st['prevMin'] : $nowMin;
 
         // --- L7/L9: faellige Zeit-/Sonnen-Trigger + Wecken ---
+        // Offene Prueflinge aus frueheren Durchgaengen zuerst: erst nachfassen, dann neu schalten.
+        $st['nachfassen'] = $this->nachfassen(is_array($st['nachfassen'] ?? null) ? $st['nachfassen'] : [], $now);
         foreach (\Hoep\HomeSuite\Engines\LightAutomation::dueTriggers($rules, $prevMin, $nowMin, $weekday, $sunMin) as $act) {
             if (($act['kind'] ?? '') === 'applyScene') {
                 $sc = $this->scenes()->get((string) $act['sceneId']);
                 if ($sc) {
-                    $this->applyScene($sc);
+                    // Richtung kommt aus der Regel: eine Szene kann angewandt ODER
+                    // ausgeschaltet werden. Fehlt die Angabe, gilt wie bisher "ein".
+                    $r = $this->applyScene($sc, (bool) ($act['ein'] ?? true));
+                    // Ein Schaltbefehl kann verpuffen. Die Kante feuert nur einmal, also
+                    // wird das Ergebnis in den naechsten Durchgaengen nachgeprueft.
+                    foreach ((array) ($r['pending'] ?? []) as $p) {
+                        $st['nachfassen'][] = $p + ['bis' => $now + self::NACHFASS_SEK, 'versuche' => 0];
+                    }
+                    $st['nachfassen'] = array_slice($st['nachfassen'], -self::NACHFASS_MAX);
                 }
             } elseif (($act['kind'] ?? '') === 'wake') {
                 $this->applyWake($act['rule'] ?? []);
@@ -1508,7 +1580,10 @@ class HomeSuiteHub extends EntityModule
                 // Speichern neu entstehen). Sie werden im Baender-Widget bearbeitet.
                 $cfg = $this->lightAutoCfg();
                 $cfg['rules'] = array_values(array_filter($cfg['rules'], static fn($r) => ($r['src'] ?? '') !== 'band'));
-                return ['ok' => true, 'sun' => $sun,
+                // ... sie gehoeren aber sehr wohl in die ANZEIGE: der Tagesverlauf muss alles
+                // zeigen, was heute schaltet, sonst versteckt der eine Weg wieder den anderen.
+                // Getrennter Schluessel, damit ein Speichern des Regel-Editors sie nicht mitnimmt.
+                return ['ok' => true, 'sun' => $sun, 'bandRules' => $this->bandRules(),
                     'automationEnabled' => $this->automationEnabled(),
                     'automationVar'     => (int) (@\IPS_GetObjectIDByIdent('AutomationEnabled', $this->InstanceID) ?: 0),
                 ] + $cfg;

@@ -14,13 +14,15 @@ namespace Hoep\HomeSuite\Engines;
  *
  * Regel-Modell (im Hub-Store 'lightAuto' = ['enabled'=>bool,'rules'=>[...]]):
  *   schedule : {type:'schedule', trigger:{kind:'time'|'sun', time:'HH:MM'|offsetMin,
- *              event:'sunrise'|'sunset', days:[0..6]}, sceneId}
+ *              event:'sunrise'|'sunset', days:[0..6]}, sceneId,
+ *              sceneAction:'on'|'off' (Vorgabe 'on'),
+ *              endTrigger:{...wie trigger...} (optional; feuert die GEGENrichtung)}
  *   circadian: {type:'circadian', devices:[iid,...], minK, maxK, minLevel, maxLevel}
  *   wake     : {type:'wake', time:'HH:MM', days:[...], sceneId, rampMin, audioZone, audioSource}
  *   motion   : {type:'motion', sensor:iid|varId, lux:varId, luxMax, sceneOn|deviceOn, holdSec, off:'scene'|'devices'}
  *   presence : {type:'presence', awayVar:varId, from:'HH:MM', to:'HH:MM', devices:[iid,...], every:minMinutes}
  *
- * ACTIONS (Rueckgabe): [ ['kind'=>'applyScene','sceneId'=>..], ['kind'=>'setDevice','device'=>iid,'on'=>..,'level'=>..,'cct'=>..], ... ]
+ * ACTIONS (Rueckgabe): [ ['kind'=>'applyScene','sceneId'=>..,'ein'=>bool], ['kind'=>'setDevice','device'=>iid,'on'=>..,'level'=>..,'cct'=>..], ... ]
  */
 final class LightAutomation
 {
@@ -50,31 +52,48 @@ final class LightAutomation
                 if (is_array($days) && $days !== [] && !in_array($weekday, array_map('intval', $days), true)) {
                     continue;
                 }
-                $target = -1;
                 if ($type === 'wake') {
                     $target = self::hhmm((string) ($r['time'] ?? ''));
-                } else {
-                    $tr = is_array($r['trigger'] ?? null) ? $r['trigger'] : [];
-                    if (($tr['kind'] ?? 'time') === 'sun') {
-                        $base = (int) ($sunMin[(string) ($tr['event'] ?? 'sunset')] ?? -1);
-                        $target = $base >= 0 ? $base + (int) ($tr['offsetMin'] ?? $tr['time'] ?? 0) : -1;
-                    } else {
-                        $target = self::hhmm((string) ($tr['time'] ?? ''));
+                    if ($target >= 0 && self::crossed($prevMin, $nowMin, $target)) {
+                        $acts[] = ['kind' => 'wake', 'rule' => $r];
                     }
-                }
-                if ($target < 0) {
                     continue;
                 }
-                if (self::crossed($prevMin, $nowMin, $target)) {
-                    if ($type === 'wake') {
-                        $acts[] = ['kind' => 'wake', 'rule' => $r];
-                    } elseif (($r['sceneId'] ?? '') !== '') {
-                        $acts[] = ['kind' => 'applyScene', 'sceneId' => (string) $r['sceneId']];
+                if (($r['sceneId'] ?? '') === '') {
+                    continue;
+                }
+                // Eine Regel kann ZWEI Zeitpunkte haben: den eigentlichen Ausloeser und
+                // einen optionalen Endzeitpunkt, der die Gegenrichtung schaltet. Damit
+                // genuegt EINE Szene fuer "ab Sonnenuntergang an, um 23:00 wieder aus" -
+                // vorher brauchte es dafuer zwei Szenen und zwei Regeln.
+                $ein = ((string) ($r['sceneAction'] ?? 'on')) !== 'off';
+                $punkte = [[$r['trigger'] ?? null, $ein]];
+                if (is_array($r['endTrigger'] ?? null) && $r['endTrigger'] !== []) {
+                    $punkte[] = [$r['endTrigger'], !$ein];
+                }
+                foreach ($punkte as [$tr, $richtung]) {
+                    $target = self::triggerMin(is_array($tr) ? $tr : [], $sunMin);
+                    if ($target >= 0 && self::crossed($prevMin, $nowMin, $target)) {
+                        $acts[] = ['kind' => 'applyScene', 'sceneId' => (string) $r['sceneId'],
+                                   'ein' => $richtung];
                     }
                 }
             }
         }
         return $acts;
+    }
+
+    /**
+     * Minute eines Ausloesers auf der Tagesachse. -1, wenn er nicht bestimmbar ist
+     * (leerer Ausloeser, oder Sonnenzeit fehlt). Gilt fuer trigger UND endTrigger.
+     */
+    public static function triggerMin(array $tr, array $sunMin): int
+    {
+        if (($tr['kind'] ?? 'time') === 'sun') {
+            $base = (int) ($sunMin[(string) ($tr['event'] ?? 'sunset')] ?? -1);
+            return $base >= 0 ? $base + (int) ($tr['offsetMin'] ?? $tr['time'] ?? 0) : -1;
+        }
+        return self::hhmm((string) ($tr['time'] ?? ''));
     }
 
     /** Wurde $target im (halboffenen) Fenster (prev, now] ueberschritten? Mitternachts-Wrap beachtet. */
