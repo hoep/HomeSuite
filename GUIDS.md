@@ -31,6 +31,7 @@ ModuleType-Angabe (sie ist Container, kein Modul).
 | `HSIR`  | IrrigationCircuit (Bewaesserung)              | `{D264A82B-DE31-45CC-8AF2-8F4C5D076508}` | 3          |
 | `HSSP`  | Bereich (Struktur: Haus/Bereich/Raum)         | `{5598F752-886D-475F-91CE-5813A3C581E5}` | 3          |
 | `HSPC`  | PoolController (ProCon.IP Pool-Steuerung)     | `{878CA345-86D1-84FC-B196-5B3224C067CF}` | 3          |
+| `HSSC`  | SecurityCenter (Waechter, Einbruchmeldung)    | `{0E7216C3-FCCA-41FF-BE4E-E5939D9AA571}` | 3          |
 
 ## Audio-Bridges (Splitter, type 2)
 

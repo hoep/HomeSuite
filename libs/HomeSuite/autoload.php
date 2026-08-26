@@ -102,6 +102,10 @@ $__hs_files = [
     'ShadingProfiles.php',             // Beschattungs-Profiltypen (Schema) + Profil->Config-Mapper
     'Engines/ShadeKinematics.php',     // Positions-/Lamellen-Kinematik der Beschattung
 
+    // --- Waechter (HSSC): reine Entscheidungslogik, kernelfrei und geprueft ---
+    'Engines/SecurityAssessment.php',  // Meldergesundheit, Abdeckung, Verlaesslichkeit
+    'Engines/WatchStateMachine.php',   // Zustaende, Verzoegerungen, Ausloesung
+
     // --- Provision ---
     'Provision/Provisioner.php',       // idempotentes Anlegen von Objekten/Profilen/Instanzen
 

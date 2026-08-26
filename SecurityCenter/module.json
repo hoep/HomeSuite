@@ -1,0 +1,12 @@
+{
+    "id": "{0E7216C3-FCCA-41FF-BE4E-E5939D9AA571}",
+    "name": "HomeSuite Waechter",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["HomeSuite Waechter", "HSSC", "Alarmanlage", "Sicherheit", "Einbruchmeldung"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSSC",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}
