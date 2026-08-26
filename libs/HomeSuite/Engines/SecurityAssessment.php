@@ -218,6 +218,12 @@ final class SecurityAssessment
     /** Eine Zahl fuer die ganze Anlage — Selbstauskunft, NIEMALS ein Alarmkriterium. */
     public static function verlaesslichkeit(array $abdeckung, array $zonenAktiv): array
     {
+        // Ist nichts scharf, gilt die Zahl fuer das GANZE Haus. Sonst zeigte das
+        // Panel im unscharfen Zustand 0 % — was aussieht wie "kein Melder taugt",
+        // aber nur heisst "es ist gerade nichts ueberwacht".
+        if ($zonenAktiv === []) {
+            $zonenAktiv = array_keys($abdeckung);
+        }
         $g = 0; $b = 0;
         foreach ($abdeckung as $zone => $a) {
             if (!in_array($zone, $zonenAktiv, true)) {

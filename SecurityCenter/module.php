@@ -142,6 +142,8 @@ class HomeSuiteWaechter extends EntityModule
                  'label' => 'Nicht belastbar', 'varType' => 1, 'actionable' => false],
                 ['ident' => 'Incident', 'type' => ControlContract::T_REFLECT, 'role' => 'security:incident',
                  'label' => 'Offener Vorfall', 'varType' => 0, 'profile' => '~Alert', 'actionable' => false],
+                ['ident' => 'ChronikTable', 'type' => ControlContract::T_REFLECT, 'role' => 'security:chronik',
+                 'label' => 'Chronik (Tabelle)', 'varType' => 3, 'actionable' => false],
             ],
 
             'managementActions' => [
@@ -150,6 +152,7 @@ class HomeSuiteWaechter extends EntityModule
                 ['op' => 'setMatrix',      'label' => 'Wie scharf — Rolle mal Modus'],
                 ['op' => 'setReactions',   'label' => 'Was passiert — Anlass mal Ring'],
                 ['op' => 'setRegister',    'label' => 'Melderregister setzen'],
+                ['op' => 'setChannels',    'label' => 'Meldewege — Push, Licht'],
                 ['op' => 'scanRegister',   'label' => 'Melder suchen (Vorschlag, wirkt nicht)'],
                 ['op' => 'arm',            'label' => 'Scharf schalten (Profil)'],
                 ['op' => 'disarm',         'label' => 'Ausschalten'],
@@ -370,8 +373,11 @@ class HomeSuiteWaechter extends EntityModule
     /** EIN sauberer Sendeweg mit ausgewertetem Rueckgabecode. */
     private function push(string $text, int $prio, array $cfg): void
     {
-        $token = trim((string) ($cfg['pushToken'] ?? ''));
-        $user  = trim((string) ($cfg['pushUser'] ?? ''));
+        // Die Schluessel stehen im Objektbaum und bleiben dort. Der Store haelt nur
+        // den VERWEIS: ein Geheimnis, das an zwei Stellen liegt, wird an einer
+        // davon irgendwann alt — und ein Store landet in Sicherungen und Spiegeln.
+        $token = $this->wertOderVar($cfg, 'pushToken', 'pushTokenVid');
+        $user  = $this->wertOderVar($cfg, 'pushUser',  'pushUserVid');
         if ($token === '' || $user === '') {
             $this->chronik('Push nicht konfiguriert', []);
             return;
@@ -396,6 +402,17 @@ class HomeSuiteWaechter extends EntityModule
             return;
         }
         $this->chronik('Push zugestellt', ['prio' => $prio]);
+    }
+
+    /** Wert entweder direkt aus der Konfiguration oder aus der verwiesenen Variablen. */
+    private function wertOderVar(array $cfg, string $direkt, string $verweis): string
+    {
+        $v = trim((string) ($cfg[$direkt] ?? ''));
+        if ($v !== '') {
+            return $v;
+        }
+        $vid = (int) ($cfg[$verweis] ?? 0);
+        return ($vid > 0 && @IPS_VariableExists($vid)) ? trim((string) @GetValue($vid)) : '';
     }
 
     private function allesStill(): void
@@ -517,6 +534,11 @@ class HomeSuiteWaechter extends EntityModule
             case 'setReactions':
                 $this->store()->set('reaktionen', (array) ($args['reaktionen'] ?? []));
                 $this->chronik('Reaktionen geaendert', []);
+                return ['ok' => true];
+
+            case 'setChannels':
+                $this->store()->set('wege', (array) ($args['wege'] ?? []));
+                $this->chronik('Meldewege geaendert', ['schluessel' => array_keys((array) ($args['wege'] ?? []))]);
                 return ['ok' => true];
 
             case 'setRegister':
@@ -683,6 +705,22 @@ class HomeSuiteWaechter extends EntityModule
 
     private function chronik(string $was, array $daten = []): void
     {
+        // RIEGEL GEGEN AMOKLAUF. Am 27.08.2026 hat eine Rekursion in drei Minuten
+        // 79.747 gleichlautende Zeilen und 10 MB geschrieben. Die Rekursion ist
+        // behoben — aber eine Chronik, die eine Platte fuellen kann, ist eine
+        // Gefahr fuer sich. Zwei gleiche Eintraege binnen zwei Sekunden sind
+        // niemals eine echte Beobachtung.
+        $stempel = $was . '|' . json_encode($daten, JSON_UNESCAPED_UNICODE);
+        $letzt   = (string) $this->GetBuffer('ChronikLetzt');
+        $jetzt   = microtime(true);
+        if ($letzt !== '') {
+            [$hash, $ts] = array_pad(explode('#', $letzt, 2), 2, '0');
+            if ($hash === md5($stempel) && ($jetzt - (float) $ts) < 2.0) {
+                return;
+            }
+        }
+        $this->SetBuffer('ChronikLetzt', md5($stempel) . '#' . $jetzt);
+
         $st = $this->rt();
         $z  = [
             'ts'    => time(),
@@ -702,6 +740,20 @@ class HomeSuiteWaechter extends EntityModule
         $ring[] = $z;
         if (count($ring) > 200) { $ring = array_slice($ring, -200); }
         $this->WriteAttributeString(self::ATTR_CHRONIK, json_encode($ring, JSON_UNESCAPED_UNICODE));
+
+        // Spiegel fuer das Tabellen-Widget: [Zeile][Spalte], juengste zuerst.
+        // Zeile 0 ist die Kopfzeile: das Tabellen-Widget nimmt sie als solche.
+        $zeilen = [['Zeit', 'Was', 'Einzelheiten']];
+        foreach (array_reverse(array_slice($ring, -60)) as $e) {
+            $d = (array) ($e['daten'] ?? []);
+            $txt = [];
+            foreach ($d as $k => $v) {
+                $txt[] = $k . ': ' . (is_scalar($v) ? (string) $v : json_encode($v, JSON_UNESCAPED_UNICODE));
+            }
+            $zeilen[] = [date('d.m. H:i:s', (int) ($e['ts'] ?? 0)), (string) ($e['was'] ?? ''),
+                         implode(' · ', $txt)];
+        }
+        $this->anzeige('ChronikTable', json_encode($zeilen, JSON_UNESCAPED_UNICODE));
     }
 
     private function chronikLesen(int $n): array
