@@ -144,6 +144,13 @@ class HomeSuiteWaechter extends EntityModule
                  'label' => 'Offener Vorfall', 'varType' => 0, 'profile' => '~Alert', 'actionable' => false],
                 ['ident' => 'ChronikTable', 'type' => ControlContract::T_REFLECT, 'role' => 'security:chronik',
                  'label' => 'Chronik (Tabelle)', 'varType' => 3, 'actionable' => false],
+                // Zahl statt Text, damit das vorhandene assoc-Widget den Zustand FARBIG
+                // zeigen kann. Ein Textzustand laesst sich nicht ueber Profil-Zuordnungen
+                // einfaerben — und die Farbe ist beim Waechter die halbe Aussage.
+                ['ident' => 'StateCode', 'type' => ControlContract::T_REFLECT, 'role' => 'security:statecode',
+                 'label' => 'Zustand (Code)', 'varType' => 1, 'profile' => 'HSSC.State', 'actionable' => false],
+                ['ident' => 'GapsTable', 'type' => ControlContract::T_REFLECT, 'role' => 'security:gaps',
+                 'label' => 'Lücken (Tabelle)', 'varType' => 3, 'actionable' => false],
             ],
 
             'managementActions' => [
@@ -153,6 +160,10 @@ class HomeSuiteWaechter extends EntityModule
                 ['op' => 'setReactions',   'label' => 'Was passiert — Anlass mal Ring'],
                 ['op' => 'setRegister',    'label' => 'Melderregister setzen'],
                 ['op' => 'setChannels',    'label' => 'Meldewege — Push, Licht'],
+                ['op' => 'setNightZone',   'label' => 'Nachtzone — wo Bewegung nachts nie auslöst'],
+                ['op' => 'groupProposal',  'label' => 'Nachbarschaftsgruppen: Vorschlag lesen'],
+                ['op' => 'applyGroups',    'label' => 'Vorschlag übernehmen (ausdrücklich)'],
+                ['op' => 'chainStatus',    'label' => 'Funkstrecken prüfen (Diagnose)'],
                 ['op' => 'scanRegister',   'label' => 'Melder suchen (Vorschlag, wirkt nicht)'],
                 ['op' => 'arm',            'label' => 'Scharf schalten (Profil)'],
                 ['op' => 'disarm',         'label' => 'Ausschalten'],
@@ -199,15 +210,29 @@ class HomeSuiteWaechter extends EntityModule
         }
     }
 
-    /** Timer-Rueckruf. */
+    /**
+     * Timer-Rueckruf.
+     *
+     * MIT NETZ: eine Wache, die stillschweigend abbricht, ist genau das Versagen,
+     * vor dem dieses Modul schuetzen soll — und der TimerPool meldet nur
+     * "Waechter (Wache):" ohne einen Hinweis, was schiefging (nachgemessen
+     * 27.08.2026, zwei Durchgaenge waehrend die neuen Variablen noch fehlten).
+     * Also selbst fangen, selbst benennen, und weiterlaufen.
+     */
     public function RunTimer(string $job): void
     {
-        if ($job === 'wache') {
-            $this->wache();
-            return;
-        }
-        if ($job === 'frist') {
-            $this->ereignis(['art' => 'tick'], null);
+        try {
+            if ($job === 'wache') {
+                $this->wache();
+                return;
+            }
+            if ($job === 'frist') {
+                $this->ereignis(['art' => 'tick'], null);
+            }
+        } catch (\Throwable $e) {
+            $this->LogMessage(sprintf('HSSC: %s abgebrochen — %s (%s:%d)',
+                $job, $e->getMessage(), basename($e->getFile()), $e->getLine()), KL_ERROR);
+            $this->chronik('Wache abgebrochen', ['job' => $job, 'grund' => $e->getMessage()]);
         }
     }
 
@@ -260,6 +285,10 @@ class HomeSuiteWaechter extends EntityModule
         $abd  = SA::abdeckung($this->register(), SA::alle($this->register(), $snap, time(), $zeitOk, $this->karenzBis()));
         $zone = (string) ($m['zone'] ?? '');
 
+        if ($offen && in_array((string) ($m['role'] ?? ''), ['innen', 'durchgang'], true)) {
+            $this->beobachteNachbarn($vid, time());
+        }
+
         $this->ereignis([
             'art'   => 'melder',
             'vid'   => $vid,
@@ -310,6 +339,19 @@ class HomeSuiteWaechter extends EntityModule
 
                 case 'stilleVorstufe':
                     $this->chronik('stille Vorstufe', ['sek' => (int) ($a['sek'] ?? 0)]);
+                    break;
+
+                case 'wake':
+                    // Weckregel: dieselbe Szene wie ein Zeitplan, nur mit Rampe.
+                    $wr = (array) ($a['rule'] ?? []);
+                    $this->chronik('Wecken', ['regel' => (string) ($wr['name'] ?? '')]);
+                    if ($scharf && ($wr['sceneId'] ?? '') !== '' && function_exists('HSH_Manage')) {
+                        $hub = $this->hubInstanceId();
+                        if ($hub > 0) {
+                            @\HSH_Manage($hub, json_encode(['op' => 'lightSceneApply',
+                                'args' => ['id' => (string) $wr['sceneId']]]));
+                        }
+                    }
                     break;
 
                 case 'stillAlles':
@@ -437,8 +479,27 @@ class HomeSuiteWaechter extends EntityModule
         $st   = $this->rt();
         $v    = SA::verlaesslichkeit($abd, (array) ($st['zonen'] ?? []));
 
-        $this->setReflect('Coverage', (int) $v['anteil']);
-        $this->setReflect('Gaps', max(0, (int) $v['gesamt'] - (int) $v['belastbar']));
+        @$this->setReflect('Coverage', (int) $v['anteil']);
+        @$this->setReflect('Gaps', max(0, (int) $v['gesamt'] - (int) $v['belastbar']));
+
+        // Was NICHT ueberwacht ist, gehoert genauso sichtbar auf die Seite wie das,
+        // was ueberwacht ist. Als Tabelle, damit das vorhandene table-Widget genuegt.
+        $zeilen = [['Bereich', 'Melder', 'Befund', 'Grund']];
+        $bez = ['Z1' => 'Erdgeschoss', 'Z2' => 'Obergeschoss', 'Z3' => 'Dachgeschoss', 'Z4' => 'Nebenräume'];
+        foreach ($abd as $zone => $a) {
+            foreach ((array) ($a['gruende'] ?? []) as $g) {
+                $zeilen[] = [$bez[$zone] ?? $zone, (string) ($g['name'] ?? ''),
+                             (string) ($g['befund'] ?? ''), (string) ($g['grund'] ?? '')];
+            }
+        }
+        if (count($zeilen) === 1) {
+            $zeilen[] = ['—', 'alle Melder belastbar', '', ''];
+        }
+        $this->anzeige('GapsTable', json_encode($zeilen, JSON_UNESCAPED_UNICODE));
+
+        // Funkstrecken pruefen: schweigt eine ganze Kette, ist das KEIN Alarm,
+        // sondern ein Befund mit Namen.
+        $st = $this->ketten($st, $snap, $now);
 
         // Faellige Zeiteintraege — NUR was der Bewohner angelegt hat.
         $nowMin  = (int) date('G', $now) * 60 + (int) date('i', $now);
@@ -469,6 +530,128 @@ class HomeSuiteWaechter extends EntityModule
         try { $this->SetValue($ident, $wert); } catch (\Throwable $e) { /* Anzeige ist nie kritisch */ }
     }
 
+    /**
+     * KETTENAUSFALL — je Funktechnik getrennt, am TELEGRAMMSTROM.
+     *
+     * Nicht per Ping auf ein Gateway: in der Messnacht 24./25.08.2026 lag die CCU
+     * konstant bei 0,1-0,4 ms erreichbar, waehrend der Z-Wave-Rechner bis zu 70 %
+     * Pakete verlor. Wer das Gateway anpingt, misst das LAN und faende den realen
+     * Ausfall nicht — und wuerde im bekannten Stoerfenster 02:30-04:45 jede Nacht
+     * falschen Alarm schlagen.
+     *
+     * Also: schweigt die JUENGSTE Meldung aller Melder einer Kette laenger als die
+     * konfigurierte Stille, gilt die Kette als weg. Ein einzelner stummer Melder
+     * ist ein Melderbefund, erst das gemeinsame Schweigen ist ein Kettenausfall.
+     */
+    private function ketten(array $st, array $snap, int $now): array
+    {
+        $stille = max(300, $this->ReadPropertyInteger('KetteStilleSek'));
+        $karenz = $this->karenzBis();
+        if ($karenz > 0 && $now < $karenz) {
+            return $st;                       // nach einem Neustart erst ankommen lassen
+        }
+
+        $juengste = [];
+        foreach ($this->register() as $m) {
+            $k = (string) ($m['kette'] ?? '');
+            if ($k === '') {
+                continue;                     // ohne Zuordnung nicht bewertbar
+            }
+            $vid = (int) ($m['id'] ?? 0);
+            $u   = (int) ($snap[$vid]['updated'] ?? 0);
+            if ($u > ($juengste[$k] ?? 0)) {
+                $juengste[$k] = $u;
+            }
+        }
+
+        $warn = is_array($st['ketten'] ?? null) ? $st['ketten'] : [];
+        foreach ($juengste as $k => $u) {
+            $weg = ($now - $u) > $stille;
+            $vorher = (bool) ($warn[$k] ?? false);
+            if ($weg !== $vorher) {
+                $warn[$k] = $weg;
+                $this->ereignis(['art' => 'kette', 'name' => $k, 'weg' => $weg], null);
+                $st = $this->rt();            // ereignis() hat den Zustand geschrieben
+                $st['ketten'] = $warn;
+                $this->rtSet($st);
+            }
+        }
+        $st['ketten'] = $warn;
+        return $st;
+    }
+
+    /**
+     * NACHBARSCHAFTSGRUPPEN LERNEN — beobachten, NICHT anwenden.
+     *
+     * Zwei Melder, die wiederholt binnen weniger Sekunden feuern, sehen dasselbe
+     * Ereignis: die Multisensoren blicken durch offene Tueren in den Nachbarraum
+     * (gemessen am 26.08.2026: Gang OG, Esszimmer und Bad Eltern binnen zwei
+     * Sekunden). Ohne dieses Wissen ist die Zwei-Melder-Regel keine
+     * Fehlalarmbremse, sondern ein Beschleuniger.
+     *
+     * KEINE AUTOMATISMEN: das Ergebnis ist ein VORSCHLAG. Uebernommen wird er nur,
+     * wenn der Bewohner ihn uebernimmt.
+     */
+    private function beobachteNachbarn(int $vid, int $now): void
+    {
+        $fenster = 5;                          // Sekunden
+        $rt = $this->rt();
+        $letzt = is_array($rt['nachbarRoh'] ?? null) ? $rt['nachbarRoh'] : [];
+        foreach ($letzt as $anderer => $ts) {
+            if ((int) $anderer !== $vid && ($now - (int) $ts) <= $fenster) {
+                $paar = min($vid, (int) $anderer) . '-' . max($vid, (int) $anderer);
+                $z = $this->store()->get('nachbarn', []);
+                $z = is_array($z) ? $z : [];
+                $z[$paar] = (int) ($z[$paar] ?? 0) + 1;
+                $this->store()->set('nachbarn', $z);
+            }
+        }
+        $letzt[$vid] = $now;
+        // Nur die juengsten 40 behalten - der Rest kann nichts mehr treffen.
+        if (count($letzt) > 40) {
+            arsort($letzt);
+            $letzt = array_slice($letzt, 0, 40, true);
+        }
+        $rt['nachbarRoh'] = $letzt;
+        $this->rtSet($rt);
+    }
+
+    /**
+     * Aus den beobachteten Paaren Gruppen bilden — zusammenhaengende Komponenten.
+     * Wer mit A und A mit B haeufig zugleich feuert, gehoert mit B in eine Gruppe.
+     */
+    private function gruppenVorschlag(int $minTreffer): array
+    {
+        $roh = $this->store()->get('nachbarn', []);
+        $roh = is_array($roh) ? $roh : [];
+        $kante = [];
+        foreach ($roh as $paar => $n) {
+            if ((int) $n < max(2, $minTreffer)) { continue; }
+            [$a, $b] = array_map('intval', explode('-', (string) $paar));
+            $kante[$a][] = $b; $kante[$b][] = $a;
+        }
+        $namen = [];
+        foreach ($this->register() as $m) { $namen[(int) $m['id']] = (string) ($m['name'] ?? ''); }
+
+        $gesehen = []; $gruppen = []; $zuo = [];
+        foreach (array_keys($kante) as $start) {
+            if (isset($gesehen[$start])) { continue; }
+            $stapel = [$start]; $komp = [];
+            while ($stapel) {
+                $v = array_pop($stapel);
+                if (isset($gesehen[$v])) { continue; }
+                $gesehen[$v] = true; $komp[] = $v;
+                foreach ($kante[$v] ?? [] as $w) { if (!isset($gesehen[$w])) { $stapel[] = $w; } }
+            }
+            sort($komp);
+            $gid = 'g' . $komp[0];
+            $gruppen[$gid] = array_map(fn($v) => ['id' => $v, 'name' => $namen[$v] ?? ('#' . $v)], $komp);
+            foreach ($komp as $v) { $zuo[$v] = $gid; }
+        }
+        return ['gruppen' => $gruppen, 'zuordnung' => $zuo,
+                'beobachtungen' => count($roh), 'minTreffer' => max(2, $minTreffer)];
+    }
+
     private function spiegeln(): void
     {
         $st = $this->rt();
@@ -480,6 +663,7 @@ class HomeSuiteWaechter extends EntityModule
             $this->anzeige($ident, in_array($k, (array) ($st['zonen'] ?? []), true));
         }
         $this->anzeige('State', $namen[$z] ?? '?');
+        $this->anzeige('StateCode', $z);
     }
 
     private function zonenAusControls(): void
@@ -535,6 +719,50 @@ class HomeSuiteWaechter extends EntityModule
                 $this->store()->set('reaktionen', (array) ($args['reaktionen'] ?? []));
                 $this->chronik('Reaktionen geaendert', []);
                 return ['ok' => true];
+
+            case 'setNightZone':
+                $this->store()->set('nachtzone', array_values(array_map('intval', (array) ($args['melder'] ?? []))));
+                $this->chronik('Nachtzone geaendert', ['anzahl' => count((array) ($args['melder'] ?? []))]);
+                return ['ok' => true];
+
+            case 'groupProposal':
+                return ['ok' => true] + $this->gruppenVorschlag((int) ($args['minTreffer'] ?? 5));
+
+            case 'applyGroups':
+                // AUSDRUECKLICH: erst auf Befehl wird aus Beobachtung Konfiguration.
+                $v = $this->gruppenVorschlag((int) ($args['minTreffer'] ?? 5));
+                $reg = $this->register();
+                $zuo = $v['zuordnung'] ?? [];
+                $n = 0;
+                foreach ($reg as &$m) {
+                    $vid = (int) ($m['id'] ?? 0);
+                    if (isset($zuo[$vid]) && (string) ($m['gruppe'] ?? '') !== $zuo[$vid]) {
+                        $m['gruppe'] = $zuo[$vid]; $n++;
+                    }
+                }
+                unset($m);
+                $this->store()->set('register', array_values($reg));
+                $this->chronik('Nachbarschaftsgruppen uebernommen', ['geaendert' => $n]);
+                return ['ok' => true, 'geaendert' => $n, 'gruppen' => $v['gruppen']];
+
+            case 'chainStatus':
+                $snap = $this->momentaufnahme();
+                $now = time(); $out = [];
+                foreach ($this->register() as $m) {
+                    $k = (string) ($m['kette'] ?? '');
+                    if ($k === '') { continue; }
+                    $u = (int) ($snap[(int) $m['id']]['updated'] ?? 0);
+                    $out[$k]['melder'] = (int) ($out[$k]['melder'] ?? 0) + 1;
+                    $out[$k]['juengste'] = max((int) ($out[$k]['juengste'] ?? 0), $u);
+                }
+                foreach ($out as $k => &$e) {
+                    $e['stillSek'] = $e['juengste'] ? $now - $e['juengste'] : null;
+                    $e['juengste'] = $e['juengste'] ? date('c', $e['juengste']) : null;
+                }
+                unset($e);
+                return ['ok' => true, 'ketten' => $out,
+                        'schwelleSek' => max(300, $this->ReadPropertyInteger('KetteStilleSek')),
+                        'gemeldet' => (array) ($this->rt()['ketten'] ?? [])];
 
             case 'setChannels':
                 $this->store()->set('wege', (array) ($args['wege'] ?? []));
@@ -652,6 +880,7 @@ class HomeSuiteWaechter extends EntityModule
             'eingangSek'      => max(5, $this->ReadPropertyInteger('EingangSek')),
             'eingangSekKrank' => max(5, $this->ReadPropertyInteger('EingangKrankSek')),
             'verdachtSek'     => max(10, $this->ReadPropertyInteger('VerdachtSek')),
+            'nachtzone'       => (array) $this->store()->get('nachtzone', []),
         ];
     }
 

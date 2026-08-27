@@ -294,6 +294,22 @@ final class WatchStateMachine
             $a[] = self::chronik('Huelle unvollstaendig — Innenbewachung erhoeht', ['melder' => $name]);
         }
 
+        // NACHTZONE — und zwar ZULETZT, sie schlaegt auch die erhoehte Innenbewachung.
+        //
+        // In den Schlafraeumen und ihren gelernten Nachbarn darf Innenbewegung nachts
+        // NIE zum Alarm werden. Das ist die wirksamste Fehlalarmbremse der ganzen
+        // Anlage: ein Alarm um 02:40, ausgeloest vom Gang aufs Klo, schaltet sie
+        // dauerhaft ab. Der Preis ist benannt und bewusst bezahlt — wer sich vor dem
+        // Scharfschalten versteckt hat, erzeugt nachts nur Chronik.
+        if ((int) $st['modus'] === self::M_NACHT
+            && in_array($role, ['innen', 'durchgang'], true)
+            && in_array($vid, array_map('intval', (array) ($cfg['nachtzone'] ?? [])), true)) {
+            if ($wirkung !== self::A_MELDEN) {
+                $a[] = self::chronik('Nachtzone — nur Chronik', ['melder' => $name]);
+            }
+            $wirkung = self::A_MELDEN;
+        }
+
         if ($wirkung === self::A_ALARM) {
             [$st, $b] = self::ausloesen($st, $cfg, $name, in_array($role, ['huelle', 'eingang'], true) ? 'huellenbruch' : 'innen', $nowTs);
             return [$st, array_merge($a, $b)];
