@@ -1,0 +1,12 @@
+{
+    "id": "{81B7257F-4B34-4024-89B3-98BC43E00E54}",
+    "name": "ClimateZone",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["ClimateZone", "HSAC", "HomeSuite Klima"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSAC",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": []
+}

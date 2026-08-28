@@ -367,7 +367,8 @@ class HomeSuiteHub extends EntityModule
         // Scharf-Schaltungen je Domaene (Master): Zustand + Buttons. Schaltet die Baum-
         // Variablen (ArmLight etc.), die alle Instanzen der Domaene live lesen.
         $armDefs = [['ArmLight', 'Licht'], ['ArmHeating', 'Heizung'], ['ArmShading', 'Beschattung'],
-                    ['ArmIrrigation', 'Bewässerung'], ['ArmAudio', 'Audio'], ['ArmPool', 'Pool'], ['ArmMower', 'Mäher']];
+                    ['ArmIrrigation', 'Bewässerung'], ['ArmAudio', 'Audio'], ['ArmPool', 'Pool'], ['ArmMower', 'Mäher'],
+                    ['ArmClimate', 'Klima']];
         $armItems = [['type' => 'Label', 'caption' => 'Aus = ganze Domäne Schatten (nur Anzeige/Log). Auto = jede Zone entscheidet selbst (Property „Armed"). Scharf = ganze Domäne schaltet REAL. Wirkt sofort; Zustand nach Klick durch Neu-Öffnen des Formulars aktualisieren.']];
         $armLbl = [0 => '○ Aus', 1 => '◐ Auto', 2 => '● Scharf'];
         foreach ($armDefs as $ad) {
@@ -556,7 +557,8 @@ class HomeSuiteHub extends EntityModule
         // Scharf-Master je Domaene: jede Entitaet liest ihren Gate live ueber
         // EntityModule::armed() (Hub-Vorrang). ON = ganze Domaene schaltet real.
         foreach ([['ArmLight','Licht scharf'],['ArmHeating','Heizung scharf'],['ArmShading','Beschattung scharf'],
-                  ['ArmIrrigation','Bewässerung scharf'],['ArmAudio','Audio scharf'],['ArmPool','Pool scharf'],['ArmMower','Mäher scharf']] as $ag) {
+                  ['ArmIrrigation','Bewässerung scharf'],['ArmAudio','Audio scharf'],['ArmPool','Pool scharf'],['ArmMower','Mäher scharf'],
+                  ['ArmClimate','Klima scharf']] as $ag) {
             $m->addControl([
                 'ident' => $ag[0], 'type' => \Hoep\HomeSuite\ControlContract::T_SWITCH,
                 'role' => 'hub:arm', 'label' => $ag[1], 'varType' => 0,
@@ -596,6 +598,7 @@ class HomeSuiteHub extends EntityModule
                 'ArmAudio'      => '{C4F2639D-2A87-453D-8175-B586BF605A38}',
                 'ArmPool'       => '{878CA345-86D1-84FC-B196-5B3224C067CF}',
                 'ArmMower'      => '{D1FB2D11-21F3-4B22-8341-E88D512A9B61}',
+                'ArmClimate'    => '{81B7257F-4B34-4024-89B3-98BC43E00E54}',
             ];
             foreach ($doms as $ident => $guid) {
                 $on = false;
@@ -633,7 +636,7 @@ class HomeSuiteHub extends EntityModule
     }
 
     /** Idents der Scharf-Master je Domaene (Bool-Master + Integer-Mode-Var <ident>Mode). */
-    private const ARM_IDENTS = ['ArmLight', 'ArmHeating', 'ArmShading', 'ArmIrrigation', 'ArmAudio', 'ArmPool', 'ArmMower'];
+    private const ARM_IDENTS = ['ArmLight', 'ArmHeating', 'ArmShading', 'ArmIrrigation', 'ArmAudio', 'ArmPool', 'ArmMower', 'ArmClimate'];
 
     /**
      * 3-Zustand-Master (Aus/Auto/Scharf): Profil + je Domaene eine Integer-Mode-Variable <ident>Mode
@@ -1006,6 +1009,29 @@ class HomeSuiteHub extends EntityModule
         return array_map('intval', @\IPS_GetInstanceListByModuleID(self::GUID_HSLT) ?: []);
     }
 
+    /**
+     * Naechstgelegener Standort ueber dem Objekt (HSSP mit Kind = Haus).
+     *
+     * Seit dem 28.08.2026 gibt es vier: Standort, Standort B, Standort C
+     * und Standort D. Raum- und Geschossnamen wiederholen sich zwischen ihnen,
+     * die Standort-ID nicht. 0 = kein Standort gefunden (Geraet haengt neben
+     * der Struktur).
+     */
+    private function standortVon(int $id): int
+    {
+        $x = $id;
+        for ($n = 0; $x > 0 && $n < 16; $n++) {
+            if ((string) (@\IPS_GetInstance($x)['ModuleInfo']['ModuleID'] ?? '') === self::GUID_HSSP) {
+                $cfg = json_decode((string) @\IPS_GetConfiguration($x), true);
+                if (is_array($cfg) && (string) ($cfg['Kind'] ?? '') === 'Haus') {
+                    return $x;
+                }
+            }
+            $x = (int) @\IPS_GetParent($x);
+        }
+        return 0;
+    }
+
     /** Ist-Zustand + Kontext eines Geraets. */
     private function hsltState(int $iid): array
     {
@@ -1027,15 +1053,43 @@ class HomeSuiteHub extends EntityModule
             $rcfg = json_decode((string) @\IPS_GetConfiguration($parent), true);
             $praesenz = is_array($rcfg) ? (int) ($rcfg['PresenceVid'] ?? 0) : 0;
         }
+        // Geschoss und Standort zusaetzlich als ID. Namen sind nicht eindeutig,
+        // sobald es mehrere Standorte gibt: "Erdgeschoss" oder "Wohnzimmer" kann
+        // es in jedem Haus geben. Die Namen bleiben fuer Anzeige und Altbestand
+        // erhalten, entschieden wird kuenftig ueber die ID.
+        $floorId = ($room !== '' && $parent > 0) ? (int) @\IPS_GetParent($parent) : $parent;
+        $ortId   = $this->standortVon($iid);
         return ['id' => $iid, 'name' => (string) @\IPS_GetName($iid),
             'room' => $room, 'roomId' => $room !== '' ? $parent : 0, 'floor' => $floor,
+            'floorId' => $floorId, 'locationId' => $ortId,
+            'locationName' => $ortId > 0 ? (string) @\IPS_GetName($ortId) : '',
             'presenceVid' => $praesenz,
             'on' => (bool) ($st['on'] ?? false), 'level' => (int) ($st['level'] ?? -1),
             'color' => (int) ($st['color'] ?? -1), 'cct' => (int) ($st['cct'] ?? 0),
             'caps' => is_array($rs['caps'] ?? null) ? $rs['caps'] : []];
     }
 
-    /** Geraete-IDs im Geltungsbereich einer Szene. */
+    /**
+     * Geraete-IDs im Geltungsbereich einer Szene.
+     *
+     * Vier Formen, von weit nach eng:
+     *   house    ohne ref  -> ALLE Geraete, standortuebergreifend (Altbestand)
+     *   house    mit  ref  -> nur dieser Standort (ref = ID des Hauses)
+     *   location mit  ref  -> gleichbedeutend, sprechender Name
+     *   floor    mit  ref  -> ein Geschoss; ID bevorzugt, Name als Rueckfall
+     *   room     mit  ref  -> ein Raum ueber die ID
+     *
+     * Warum die ID: bis zum 28.08.2026 gab es einen Standort, da war
+     * "Erdgeschoss" eindeutig. Bei vier Standorten ist es das nicht mehr - eine
+     * Szene auf den NAMEN eines Geschosses wuerde in jedem Haus zugreifen.
+     * Bestehende Szenen speichern den Namen; die werden weiter verstanden,
+     * neue sollten die ID setzen.
+     *
+     * `house` ohne ref bleibt bewusst "alles": die vier vorhandenen Szenen sind
+     * so gespeichert, und sie meinen heute tatsaechlich das ganze Haus, weil es
+     * ausserhalb von Standort keine Lampen gibt. Sie stillschweigend
+     * einzuengen waere eine Verhaltensaenderung ohne Anlass.
+     */
     private function scopeDevices(array $scope): array
     {
         $type = (string) ($scope['type'] ?? 'house');
@@ -1043,9 +1097,25 @@ class HomeSuiteHub extends EntityModule
         $ids  = [];
         foreach ($this->hsltList() as $iid) {
             $s = $this->hsltState($iid);
-            if ($type === 'house'
-                || ($type === 'floor' && $s['floor'] === $ref)
-                || ($type === 'room' && (string) $s['roomId'] === $ref)) {
+            $treffer = false;
+            switch ($type) {
+                case 'house':
+                    $treffer = ($ref === '') || ((string) $s['locationId'] === $ref);
+                    break;
+                case 'location':
+                    $treffer = ((string) $s['locationId'] === $ref);
+                    break;
+                case 'floor':
+                    // Zahl = ID, sonst Name (Altbestand).
+                    $treffer = ctype_digit($ref)
+                        ? ((string) $s['floorId'] === $ref)
+                        : ($s['floor'] === $ref);
+                    break;
+                case 'room':
+                    $treffer = ((string) $s['roomId'] === $ref);
+                    break;
+            }
+            if ($treffer) {
                 $ids[] = $iid;
             }
         }
@@ -1270,8 +1340,9 @@ class HomeSuiteHub extends EntityModule
      */
     public function organizeTree(): array
     {
-        $root  = $this->homeRoot();
-        $moved = [];
+        $root   = $this->homeRoot();
+        $moved  = [];
+        $unklar = [];
         if ((int) @\IPS_GetParent($this->InstanceID) !== $root) {
             @\IPS_SetParent($this->InstanceID, $root);
             $moved[] = 'Hub';
@@ -1291,11 +1362,33 @@ class HomeSuiteHub extends EntityModule
             }
         }
         // Räume (HSSP) + Domänen-Instanzen
+        //
+        // STANDORTFEST seit 28.08.2026: Frueher war $rooms ein Woerterbuch
+        // Name -> ID, bei dem der zuletzt gefundene Raum gewann. Mit einem Haus
+        // ging das gut. Seit es vier Standorte gibt (Standort, Standort B,
+        // Standort C, Standort D) kommen "Wohnzimmer" und "Schlafzimmer"
+        // mehrfach vor - und das Aufraeumen haette Geraete in den falschen
+        // Standort geschoben. Jetzt: Name -> LISTE, und verschoben wird nur,
+        // wenn die Zuordnung eindeutig ist.
         $HSSP  = '{5598F752-886D-475F-91CE-5813A3C581E5}';
         $rooms = [];
         foreach (@\IPS_GetInstanceListByModuleID($HSSP) ?: [] as $r) {
-            $rooms[(string) @\IPS_GetName($r)] = $r;
+            $rooms[(string) @\IPS_GetName($r)][] = $r;
         }
+        /** Naechstgelegenes Haus ueber dem Objekt (0 = keines gefunden). */
+        $hausVon = function (int $id) use ($HSSP): int {
+            $x = $id;
+            for ($n = 0; $x > 0 && $n < 16; $n++) {
+                if ((string) (@\IPS_GetInstance($x)['ModuleInfo']['ModuleID'] ?? '') === $HSSP) {
+                    $cfg = json_decode((string) @\IPS_GetConfiguration($x), true);
+                    if (is_array($cfg) && (string) ($cfg['Kind'] ?? '') === 'Haus') {
+                        return $x;
+                    }
+                }
+                $x = (int) @\IPS_GetParent($x);
+            }
+            return 0;
+        };
         $domains = [
             '{C4F2639D-2A87-453D-8175-B586BF605A38}', // Audio
             '{053E7017-584E-4F62-A246-EBA6CE3DE034}', // AudioBridged
@@ -1304,6 +1397,7 @@ class HomeSuiteHub extends EntityModule
             '{A9645ED8-CB55-43B8-869B-BFF6ACFC8DC1}', // Shading
             '{AC059357-088A-4DF8-ABBC-F8724BC78769}', // Heating
             '{D1FB2D11-21F3-4B22-8341-E88D512A9B61}', // Mower
+            '{81B7257F-4B34-4024-89B3-98BC43E00E54}', // Climate (HSAC)
         ];
         foreach ($domains as $g) {
             foreach (@\IPS_GetInstanceListByModuleID($g) ?: [] as $iid) {
@@ -1317,13 +1411,36 @@ class HomeSuiteHub extends EntityModule
                     continue; // haengt bereits in einem Raum
                 }
                 $nm = (string) @\IPS_GetName($iid);
-                if (isset($rooms[$nm]) && $rooms[$nm] !== $p) {   // exakter Raum-Namenstreffer
-                    @\IPS_SetParent($iid, $rooms[$nm]);
+                $kandidaten = $rooms[$nm] ?? [];
+                if ($kandidaten === []) {
+                    continue;
+                }
+                if (count($kandidaten) > 1) {
+                    // Mehrere Raeume dieses Namens: den im SELBEN Standort nehmen,
+                    // in dem das Geraet heute schon liegt.
+                    $hausGeraet = $hausVon($iid);
+                    $passend = [];
+                    foreach ($kandidaten as $r) {
+                        if ($hausGeraet > 0 && $hausVon($r) === $hausGeraet) {
+                            $passend[] = $r;
+                        }
+                    }
+                    $kandidaten = $passend;
+                }
+                if (count($kandidaten) !== 1) {
+                    // Nicht entscheidbar - lieber liegen lassen als falsch einordnen.
+                    $unklar[] = $nm;
+                    continue;
+                }
+                $ziel = (int) $kandidaten[0];
+                if ($ziel !== $p) {
+                    @\IPS_SetParent($iid, $ziel);
                     $moved[] = $nm . ' → Raum ' . $nm;
                 }
             }
         }
-        return ['ok' => true, 'root' => $root, 'moved' => count($moved), 'items' => $moved];
+        return ['ok' => true, 'root' => $root, 'moved' => count($moved), 'items' => $moved,
+                'mehrdeutig' => array_values(array_unique($unklar))];
     }
 
     // ==================================================================

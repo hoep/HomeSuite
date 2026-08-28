@@ -45,6 +45,7 @@ $__hs_files = [
     // --- Value Objects: Audio-HAL (reine Datenhalter, vor den Interfaces/Treibern) ---
     'Drivers/Audio/types.php',         // AudioState, AudioCapabilities, AudioSourceRef, AudioBrowseResult, ContentRef
     'Drivers/Light/types.php',         // LightState, LightCapabilities (Licht-HAL Value Objects)
+    'Drivers/Climate/types.php',       // ClimateState, ClimateCapabilities (Klima-HAL Value Objects)
     'Contracts/IMediaProvider.php',    // Quellen-Abstraktion (renderer-unabhaengig)
     'Contracts/IMediaWritable.php',    // Zusatzvertrag: Playlists im Anbieter anlegen (optional)
 
@@ -55,6 +56,7 @@ $__hs_files = [
     'HAL/IValve.php',                  // Bewaesserungs-HAL
     'HAL/ILight.php',                  // Beleuchtungs-HAL (switch/dim/color/cct)
     'HAL/IMower.php',                  // Maeher-HAL (start/park/pause/resume/schedule/status)
+    'HAL/IClimate.php',                // Klima-HAL (Kuehlen/Heizen/Entfeuchten)
     'HAL/IAudioRenderer.php',          // Audio-HAL (Codec, Vertrag 3)
 
     // --- HAL: selbst-enthaltener CCU-Transport (kein ext-xmlrpc/Legacy) ---
@@ -66,6 +68,8 @@ $__hs_files = [
     'HAL/GenericVariableShutter.php',
     'HAL/GenericVariableValve.php',
     'Drivers/Light/GenericBoundLight.php', // generischer Licht-Treiber (self-registriert 'generic-light' via Factory)
+    'Drivers/Climate/GenericBoundClimate.php', // Klima ueber Fremdmodul-Variablen (self-registriert 'generic-climate')
+    'Drivers/Climate/ToshibaCloud.php',    // Toshiba-Cloud: REST lesen, MQTT schalten (self-registriert 'toshiba-cloud')
 
     // --- Pool-Controller (ProCon.IP) Client (selbst-enthalten, kein HAL-Interface noetig) ---
     'Drivers/Pool/PoolClient.php',     // HTTP-Client GetState.csv/GetDos.csv (P0/P1 Lesepfad)
