@@ -119,7 +119,7 @@ final class ToshibaCloud implements IClimate
     }
 
     /** Roher Zustands-Hexstring oder null. */
-    private function zustandHex(): ?string
+    private function zustandHex(bool $erneut = false): ?string
     {
         $acId  = (string) ($this->cfg['acId'] ?? '');
         $token = $this->token();
@@ -140,6 +140,13 @@ final class ToshibaCloud implements IClimate
         $antwort = curl_exec($ch);
         $code    = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
+        if ($code === 401 || $code === 403) {
+            // Token abgelehnt: einmal neu anmelden, dann genau einen weiteren
+            // Versuch. Klappt auch der nicht, ist es kein Tokenproblem.
+            if ($this->anmelden() && !$erneut) {
+                return $this->zustandHex(true);
+            }
+        }
         if ($code !== 200 || !is_string($antwort)) {
             $this->log('Zustand nicht lesbar (HTTP ' . $code . ')');
             return null;
@@ -156,6 +163,85 @@ final class ToshibaCloud implements IClimate
             return (string) @\GetValue($vid);
         }
         return '';
+    }
+
+    /**
+     * Neu anmelden und den Token ablegen.
+     *
+     * Bis zum 28.08.2026 hat das Altskript 33691 diesen Token im Minutentakt
+     * erneuert - genauer: es meldete sich bei JEDEM Lauf neu an, was Toshiba
+     * prompt mit HTTP 429 quittierte. Seit das Skript stillgelegt ist, ist
+     * dieser Treiber der einzige Weg, und er muss sich selbst darum kuemmern.
+     *
+     * Angemeldet wird NUR, wenn die Cloud den Token ablehnt - nicht auf Vorrat.
+     * Der Toshiba-Token haelt lange; ein Anmeldesturm ist hier das groessere
+     * Risiko als ein abgelaufener Token.
+     */
+    private function anmelden(): bool
+    {
+        /* SPERRE gegen den Anmeldesturm.
+         *
+         * Ohne sie versucht JEDER fehlgeschlagene Lesevorgang eine Anmeldung -
+         * bei zwei Instanzen im Minutentakt sind das 120 Anmeldungen je Stunde.
+         * Toshiba drosselt daraufhin auch die Anmeldung, das Lesen scheitert
+         * weiter, und die Sache schaukelt sich auf. Genau das ist am 28.08.2026
+         * passiert: sieben fehlgeschlagene Anmeldungen in Folge.
+         *
+         * Als Gedaechtnis dient der Zeitstempel der Token-Variablen selbst -
+         * keine zusaetzliche Variable noetig. Wurde der Token in den letzten
+         * zehn Minuten geschrieben und es klemmt trotzdem, ist es kein
+         * Tokenproblem, sondern die Drosselung; dann hilft nur warten.
+         */
+        $vid = (int) ($this->cfg['tokenVid'] ?? 0);
+        if ($vid > 0 && function_exists('IPS_GetVariable')) {
+            $v = @\IPS_GetVariable($vid);
+            $alter = is_array($v) ? (time() - (int) ($v['VariableChanged'] ?? 0)) : 99999;
+            if ($alter < 600) {
+                $this->log('Anmeldung uebersprungen - Token ist erst ' . $alter . ' s alt');
+                return false;
+            }
+        }
+        $u = (string) $this->varWert('userVid');
+        $p = (string) $this->varWert('passVid');
+        if ($u === '' || $p === '') {
+            $this->log('keine Zugangsdaten hinterlegt (userVid/passVid)');
+            return false;
+        }
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => self::BASIS . '/api/Consumer/Login',
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => json_encode(['Username' => $u, 'Password' => $p]),
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+            CURLOPT_USERAGENT      => 'curl/8.5.0',
+            CURLOPT_TIMEOUT        => 25,
+        ]);
+        $antwort = curl_exec($ch);
+        $code    = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        $d = json_decode((string) $antwort, true);
+        $neu = $d['ResObj']['access_token'] ?? '';
+        if ($code !== 200 || $neu === '') {
+            $this->log('Anmeldung fehlgeschlagen (HTTP ' . $code . ')');
+            return false;
+        }
+        $vid = (int) ($this->cfg['tokenVid'] ?? 0);
+        if ($vid > 0) {
+            @\SetValue($vid, (string) $neu);
+        }
+        $cid = (int) ($this->cfg['consumerVid'] ?? 0);
+        if ($cid > 0 && isset($d['ResObj']['consumerId'])) {
+            @\SetValue($cid, (string) $d['ResObj']['consumerId']);
+        }
+        $this->log('Token erneuert');
+        return true;
+    }
+
+    private function varWert(string $schluessel)
+    {
+        $vid = (int) ($this->cfg[$schluessel] ?? 0);
+        return ($vid > 0 && @\IPS_VariableExists($vid)) ? @\GetValue($vid) : '';
     }
 
     // --------------------------------------------------------------- schreiben

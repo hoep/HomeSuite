@@ -34,14 +34,15 @@ class ClimateZone extends EntityModule
 {
     private const TIMER_REFRESH = 'Refresh';
     /**
-     * Abfragetakt. Zwei Minuten, bewusst traeger als der Minutentakt der
-     * Anzeige: ein Raumklima aendert sich nicht in Sekunden, beide Hersteller
-     * drosseln aber bei zu vielen Abfragen. Bei Toshiba laeuft daneben noch das
-     * Altskript 33691 im Minutentakt - drei Abfragewege auf dieselbe Cloud
-     * haben am 28.08.2026 prompt HTTP 429 ausgeloest. Wird das Altskript
-     * abgeloest, kann der Takt wieder herunter.
+     * Abfragetakt eine Minute.
+     *
+     * Kurz zwischenzeitlich auf zwei Minuten gesetzt: neben den Modulinstanzen
+     * lief bei Toshiba noch das Altskript 33691 im Minutentakt, und drei
+     * Abfragewege auf dieselbe Cloud loesten am 28.08.2026 HTTP 429 aus. Seit
+     * das Altskript stillgelegt ist, ist dieses Modul der einzige Weg - der
+     * Takt kann wieder herunter.
      */
-    private const REFRESH_MS    = 120000;
+    private const REFRESH_MS    = 60000;
 
     private ?IDriver $driverInstance = null;
     private bool $driverResolved = false;
