@@ -269,7 +269,10 @@ class ClimateZone extends EntityModule
     // Treiber
     // ==================================================================
 
-    private function driver(): ?IDriver
+    // protected, nicht private: EntityModule deklariert driver() bereits
+    // protected. Eine engere Sichtbarkeit ist in PHP ein Ladefehler - und
+    // Symcon ueberspringt ein Modul, dessen Datei nicht laedt, wortlos.
+    protected function driver(): ?IDriver
     {
         if ($this->driverResolved) {
             return $this->driverInstance;
