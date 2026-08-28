@@ -110,6 +110,10 @@ final class ToshibaCloud implements IClimate
             swing:    $wert(self::SWINGS, $b(4)),
             preset:   (string) (array_search((string) $merit, self::PRESETS, true) ?: 'off'),
             ion:      strtolower($b(7)) === '18',
+            humidity: -1.0,        // misst das Geraet nicht
+            swingH:   '',
+            light:    null,
+            scheduled: null,
             reachable: true
         );
     }
@@ -158,6 +162,13 @@ final class ToshibaCloud implements IClimate
 
     public function setPower(bool $on): bool    { return $this->byte(0, $on ? '30' : '31'); }
     public function setIon(bool $on): bool      { return $this->byte(7, $on ? '18' : '10'); }
+
+    // Die Toshiba-Cloud kennt weder waagrechtes Schwenken noch Displaylicht,
+    // und einen Zeitplan fuehrt sie ueberhaupt nicht - dort gibt es nur den
+    // Handbetrieb. False heisst hier "kann das Geraet nicht", nicht "misslungen".
+    public function setSwingH(string $swing): bool   { return false; }
+    public function setLight(bool $on): bool         { return false; }
+    public function setScheduled(bool $folgen): bool { return false; }
 
     public function setMode(string $mode): bool
     {

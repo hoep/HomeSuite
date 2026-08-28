@@ -26,6 +26,11 @@ final class ClimateState
         public string $swing = '',          // off|vertical|horizontal|both|fix1..fix5
         public string $preset = '',         // off|eco|highpower|silent|comfort|sleep|floor|frost
         public bool $ion = false,           // Ionisierung/Luftreinigung
+        public float $humidity = -1.0,      // relative Luftfeuchte in %, -1 = unbekannt
+        public string $swingH = '',         // waagrechtes Schwenken: off|on ('' = kann das Geraet nicht)
+        public ?bool $light = null,         // Displaybeleuchtung, null = kein solches Feld
+        public ?bool $scheduled = null,     // true = folgt dem Zeitplan, false = Handbetrieb
+        public ?bool $openWindow = null,    // offenes Fenster erkannt, null = kein solches Feld
         public bool $reachable = true
     ) {
     }
@@ -35,7 +40,10 @@ final class ClimateState
         return ['on' => $this->on, 'mode' => $this->mode, 'target' => $this->target,
                 'indoor' => $this->indoor, 'outdoor' => $this->outdoor,
                 'fan' => $this->fan, 'swing' => $this->swing, 'preset' => $this->preset,
-                'ion' => $this->ion, 'reachable' => $this->reachable];
+                'ion' => $this->ion, 'humidity' => $this->humidity, 'swingH' => $this->swingH,
+                'light' => $this->light, 'scheduled' => $this->scheduled,
+                'openWindow' => $this->openWindow,
+                'reachable' => $this->reachable];
     }
 }
 
@@ -59,7 +67,11 @@ final class ClimateCapabilities
         public array $presets = [],
         public bool $ion = false,
         public bool $indoor = false,
-        public bool $outdoor = false
+        public bool $outdoor = false,
+        public bool $humidity = false,      // misst relative Luftfeuchte
+        public array $swingsH = [],         // waagrechtes Schwenken, leer = kann es nicht
+        public bool $light = false,         // Displaybeleuchtung schaltbar
+        public bool $schedule = false       // kennt Zeitplan vs. Handbetrieb
     ) {
     }
 
@@ -70,6 +82,8 @@ final class ClimateCapabilities
                 'targetStep' => $this->targetStep, 'modes' => $this->modes,
                 'fans' => $this->fans, 'swings' => $this->swings,
                 'presets' => $this->presets, 'ion' => $this->ion,
-                'indoor' => $this->indoor, 'outdoor' => $this->outdoor];
+                'indoor' => $this->indoor, 'outdoor' => $this->outdoor,
+                'humidity' => $this->humidity, 'swingsH' => $this->swingsH,
+                'light' => $this->light, 'schedule' => $this->schedule];
     }
 }

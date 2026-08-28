@@ -46,6 +46,20 @@ interface IClimate extends IDriver
     /** Ionisierung/Luftreinigung schalten. */
     public function setIon(bool $on): bool;
 
+    /** Waagrechtes Schwenken: off|on. Geraete ohne dieses Feld geben false zurueck. */
+    public function setSwingH(string $swing): bool;
+
+    /** Displaybeleuchtung am Innengeraet. */
+    public function setLight(bool $on): bool;
+
+    /**
+     * Zurueck auf den Zeitplan des Herstellers (true) oder Handbetrieb halten (false).
+     *
+     * Bei tado hebt das den Overlay auf; Toshiba kennt keinen Zeitplan in der
+     * Cloud und meldet hier false.
+     */
+    public function setScheduled(bool $folgen): bool;
+
     /** Aggregierter Ist-Zustand. */
     public function readState(): ClimateState;
 }

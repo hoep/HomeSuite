@@ -81,6 +81,10 @@ final class GenericBoundClimate implements IClimate
             swing:   $this->zurueck('swing', (string) $this->lies('swingVid', '')),
             preset:  '',
             ion:     (bool) $this->lies('ionVid', false),
+            humidity: (float) $this->lies('humidityVid', -1.0),
+            swingH:  $this->zurueck('swingH', (string) $this->lies('swingHVid', '')),
+            light:   $this->vid('lightVid')    > 0 ? (bool) $this->lies('lightVid', false) : null,
+            scheduled: $this->vid('scheduleVid') > 0 ? (bool) $this->lies('scheduleVid', false) : null,
             reachable: $online > 0 ? (bool) @\GetValue($online) : true
         );
     }
@@ -89,6 +93,9 @@ final class GenericBoundClimate implements IClimate
     public function setIon(bool $on): bool            { return $this->schreib('ionVid', $on); }
     public function setTarget(float $celsius): bool   { return $this->schreib('targetVid', $celsius); }
     public function setPreset(string $preset): bool   { return false; }   // kennt dieser Weg nicht
+    public function setSwingH(string $swing): bool   { return $this->schreib('swingHVid', $this->hin('swingH', $swing) ?? $swing); }
+    public function setLight(bool $on): bool         { return $this->schreib('lightVid', $on); }
+    public function setScheduled(bool $folgen): bool { return $this->schreib('scheduleVid', $folgen); }
 
     public function setMode(string $mode): bool
     {

@@ -33,7 +33,15 @@ use Hoep\HomeSuite\HAL\IClimate;
 class ClimateZone extends EntityModule
 {
     private const TIMER_REFRESH = 'Refresh';
-    private const REFRESH_MS    = 60000;   // Toshiba liefert ohnehin im Minutentakt
+    /**
+     * Abfragetakt. Zwei Minuten, bewusst traeger als der Minutentakt der
+     * Anzeige: ein Raumklima aendert sich nicht in Sekunden, beide Hersteller
+     * drosseln aber bei zu vielen Abfragen. Bei Toshiba laeuft daneben noch das
+     * Altskript 33691 im Minutentakt - drei Abfragewege auf dieselbe Cloud
+     * haben am 28.08.2026 prompt HTTP 429 ausgeloest. Wird das Altskript
+     * abgeloest, kann der Takt wieder herunter.
+     */
+    private const REFRESH_MS    = 120000;
 
     private ?IDriver $driverInstance = null;
     private bool $driverResolved = false;
@@ -105,6 +113,19 @@ class ClimateZone extends EntityModule
                 ['ident' => 'Ion', 'type' => ControlContract::T_SWITCH, 'role' => 'climate:ion',
                  'label' => 'Ionisierung', 'varType' => 0, 'profile' => '~Switch',
                  'actionable' => true],
+                ['ident' => 'SwingH', 'type' => ControlContract::T_SELECT, 'role' => 'climate:swingh',
+                 'label' => 'Schwenken waagrecht', 'varType' => 1, 'actionable' => true,
+                 'profile' => 'HSAC.SwingH',
+                 'options' => [['value' => 0, 'label' => 'Aus'], ['value' => 1, 'label' => 'An']]],
+                ['ident' => 'Light', 'type' => ControlContract::T_SWITCH, 'role' => 'climate:light',
+                 'label' => 'Displaybeleuchtung', 'varType' => 0, 'profile' => '~Switch',
+                 'actionable' => true],
+                ['ident' => 'Scheduled', 'type' => ControlContract::T_SWITCH, 'role' => 'climate:schedule',
+                 'label' => 'Folgt Zeitplan', 'varType' => 0, 'profile' => '~Switch',
+                 'actionable' => true],
+                ['ident' => 'Humidity', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:humidity',
+                 'label' => 'Luftfeuchte', 'varType' => 2, 'unit' => '%',
+                 'profile' => '~Humidity.F', 'actionable' => false],
                 ['ident' => 'Indoor', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:indoor',
                  'label' => 'Temperatur innen', 'varType' => 2, 'unit' => '°C',
                  'profile' => '~Temperature', 'actionable' => false],
@@ -191,6 +212,9 @@ class ClimateZone extends EntityModule
             case 'Fan':    $drv->setFan(self::LUEFTER[(int) $value] ?? ''); break;
             case 'Swing':  $drv->setSwing(self::SCHWENK[(int) $value] ?? ''); break;
             case 'Preset': $drv->setPreset(self::SONDER[(int) $value] ?? ''); break;
+            case 'SwingH':    $drv->setSwingH(((int) $value) === 1 ? 'on' : 'off'); break;
+            case 'Light':     $drv->setLight((bool) $value); break;
+            case 'Scheduled': $drv->setScheduled((bool) $value); break;
             default:
                 $this->SendDebug('HSAC.apply', $c->ident . ' unbehandelt', 0);
                 break;
@@ -230,6 +254,10 @@ class ClimateZone extends EntityModule
         if ($s->indoor > -100)  { $this->anzeige('Indoor', $s->indoor); }
         if ($s->outdoor > -100) { $this->anzeige('Outdoor', $s->outdoor); }
         $this->anzeige('Ion', $s->ion);
+        if ($s->humidity >= 0)      { $this->anzeige('Humidity', $s->humidity); }
+        if ($s->swingH !== '')      { $this->anzeige('SwingH', $s->swingH === 'on' ? 1 : 0); }
+        if ($s->light !== null)     { $this->anzeige('Light', $s->light); }
+        if ($s->scheduled !== null) { $this->anzeige('Scheduled', $s->scheduled); }
         $k = static fn(array $tab, string $w) => array_search($w, $tab, true);
         if ($s->mode   !== '' && ($i = $k(self::MODI, $s->mode))    !== false) { $this->anzeige('Mode', $i); }
         if ($s->fan    !== '' && ($i = $k(self::LUEFTER, $s->fan))  !== false) { $this->anzeige('Fan', $i); }
@@ -376,7 +404,7 @@ class ClimateZone extends EntityModule
     private function mgmtConfigureDriver(array $args, array $ctx): array
     {
         $treiber = (string) ($args['driver'] ?? '');
-        if (!in_array($treiber, ['toshiba-cloud', 'generic-climate'], true)) {
+        if (!in_array($treiber, ['toshiba-cloud', 'tado-cloud', 'generic-climate'], true)) {
             throw new ContractException('unbekannter Treiber: ' . $treiber);
         }
         if ($treiber === 'toshiba-cloud') {
@@ -417,6 +445,7 @@ class ClimateZone extends EntityModule
         $mk('HSAC.Fan',    [0 => 'Auto', 1 => 'Leise', 2 => 'Sehr niedrig', 3 => 'Niedrig',
                             4 => 'Mittel', 5 => 'Hoch', 6 => 'Sehr hoch']);
         $mk('HSAC.Swing',  [0 => 'Aus', 1 => 'Vertikal', 2 => 'Horizontal', 3 => 'Beides']);
+        $mk('HSAC.SwingH', [0 => 'Aus', 1 => 'An']);
         $mk('HSAC.Preset', [0 => 'Aus', 1 => 'High Power', 2 => 'Silent', 3 => 'ECO',
                             4 => 'Frostschutz', 5 => 'Sleep', 6 => 'Floor', 7 => 'Comfort']);
     }

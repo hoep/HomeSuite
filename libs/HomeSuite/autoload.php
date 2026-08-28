@@ -70,6 +70,7 @@ $__hs_files = [
     'Drivers/Light/GenericBoundLight.php', // generischer Licht-Treiber (self-registriert 'generic-light' via Factory)
     'Drivers/Climate/GenericBoundClimate.php', // Klima ueber Fremdmodul-Variablen (self-registriert 'generic-climate')
     'Drivers/Climate/ToshibaCloud.php',    // Toshiba-Cloud: REST lesen, MQTT schalten (self-registriert 'toshiba-cloud')
+    'Drivers/Climate/TadoCloud.php',       // tado nativ: my.tado.com/api/v2, vorsorgliche Token-Erneuerung ('tado-cloud')
 
     // --- Pool-Controller (ProCon.IP) Client (selbst-enthalten, kein HAL-Interface noetig) ---
     'Drivers/Pool/PoolClient.php',     // HTTP-Client GetState.csv/GetDos.csv (P0/P1 Lesepfad)
