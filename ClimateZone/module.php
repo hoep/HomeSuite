@@ -124,6 +124,26 @@ class ClimateZone extends EntityModule
                 ['ident' => 'Scheduled', 'type' => ControlContract::T_SWITCH, 'role' => 'climate:schedule',
                  'label' => 'Folgt Zeitplan', 'varType' => 0, 'profile' => '~Switch',
                  'actionable' => true],
+                ['ident' => 'PowerLevel', 'type' => ControlContract::T_SELECT, 'role' => 'climate:powerlevel',
+                 'label' => 'Leistungsstufe', 'varType' => 1, 'actionable' => true,
+                 'profile' => 'HSAC.PowerLevel',
+                 'options' => [['value' => 50, 'label' => '50 %'],
+                               ['value' => 75, 'label' => '75 %'],
+                               ['value' => 100, 'label' => '100 %']]],
+                ['ident' => 'Running', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:running',
+                 'label' => 'Laeuft gerade', 'varType' => 0, 'profile' => '~Switch', 'actionable' => false],
+                ['ident' => 'Presence', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:presence',
+                 'label' => 'Anwesenheit', 'varType' => 3, 'actionable' => false],
+                ['ident' => 'OverrideUntil', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:override',
+                 'label' => 'Handbetrieb bis', 'varType' => 1, 'profile' => '~UnixTimestamp',
+                 'actionable' => false],
+                ['ident' => 'NextChange', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:nextchange',
+                 'label' => 'Naechste Aenderung', 'varType' => 1, 'profile' => '~UnixTimestamp',
+                 'actionable' => false],
+                ['ident' => 'SelfClean', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:selfclean',
+                 'label' => 'Selbstreinigung', 'varType' => 0, 'profile' => '~Switch', 'actionable' => false],
+                ['ident' => 'OpenWindow', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:window',
+                 'label' => 'Fenster offen', 'varType' => 0, 'profile' => '~Window', 'actionable' => false],
                 ['ident' => 'Humidity', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:humidity',
                  'label' => 'Luftfeuchte', 'varType' => 2, 'unit' => '%',
                  'profile' => '~Humidity.F', 'actionable' => false],
@@ -180,6 +200,7 @@ class ClimateZone extends EntityModule
         $this->driverInstance = null;
         $this->driverResolved = false;
         $this->profileAnlegen();
+        $this->sichtbarkeitPflegen();
         $this->SetTimerInterval(self::TIMER_REFRESH, $this->cfgVal('driver', '') === '' ? 0 : self::REFRESH_MS);
     }
 
@@ -216,6 +237,7 @@ class ClimateZone extends EntityModule
             case 'SwingH':    $drv->setSwingH(((int) $value) === 1 ? 'on' : 'off'); break;
             case 'Light':     $drv->setLight((bool) $value); break;
             case 'Scheduled': $drv->setScheduled((bool) $value); break;
+            case 'PowerLevel': $drv->setPowerLevel((int) $value); break;
             default:
                 $this->SendDebug('HSAC.apply', $c->ident . ' unbehandelt', 0);
                 break;
@@ -259,6 +281,13 @@ class ClimateZone extends EntityModule
         if ($s->swingH !== '')      { $this->anzeige('SwingH', $s->swingH === 'on' ? 1 : 0); }
         if ($s->light !== null)     { $this->anzeige('Light', $s->light); }
         if ($s->scheduled !== null) { $this->anzeige('Scheduled', $s->scheduled); }
+        if ($s->powerLevel > 0)     { $this->anzeige('PowerLevel', $s->powerLevel); }
+        if ($s->running !== null)   { $this->anzeige('Running', $s->running); }
+        if ($s->presence !== '')    { $this->anzeige('Presence', $s->presence === 'home' ? 'Anwesend' : 'Abwesend'); }
+        if ($s->selfClean !== null) { $this->anzeige('SelfClean', $s->selfClean); }
+        if ($s->openWindow !== null){ $this->anzeige('OpenWindow', $s->openWindow); }
+        $this->anzeige('OverrideUntil', $s->overrideUntil);
+        $this->anzeige('NextChange', $s->nextChange);
         $k = static fn(array $tab, string $w) => array_search($w, $tab, true);
         if ($s->mode   !== '' && ($i = $k(self::MODI, $s->mode))    !== false) { $this->anzeige('Mode', $i); }
         if ($s->fan    !== '' && ($i = $k(self::LUEFTER, $s->fan))  !== false) { $this->anzeige('Fan', $i); }
@@ -426,9 +455,58 @@ class ClimateZone extends EntityModule
             @\IPS_SetProperty($this->InstanceID, 'Bound', json_encode($args['bound']));
         }
         @\IPS_ApplyChanges($this->InstanceID);
+        $this->driverInstance = null;
+        $this->driverResolved = false;
+        $this->sichtbarkeitPflegen();
         $d = $this->driver();
         return ['ok' => true, 'driver' => $treiber, 'driverActive' => $d instanceof IClimate,
                 'caps' => $this->driverCaps(), 'armed' => $this->ReadPropertyBoolean('Armed')];
+    }
+
+    /**
+     * Nur zeigen, was das Geraet kann.
+     *
+     * Das Manifest legt alle Bedienelemente an, damit ein Treiberwechsel keine
+     * Variable und keine Archivreihe verliert. Ein Toshiba misst aber keine
+     * Luftfeuchte und tado kennt keine Leistungsstufe - stehen diese Felder
+     * sichtbar da, zeigen sie 0,0 % oder eine leere Auswahl, und das liest sich
+     * wie ein Messwert. Was capabilities() ausschliesst, wird deshalb
+     * ausgeblendet: die Variable bleibt samt Historie bestehen, sie taucht nur
+     * nicht mehr in der Anzeige auf. Wechselt der Treiber, erscheint sie wieder.
+     */
+    private function sichtbarkeitPflegen(): void
+    {
+        $c = $this->driverCaps();
+        if ($c === []) {
+            return;   // ohne Treiber nichts verstecken
+        }
+        $leer = static fn($x): bool => !is_array($x) || $x === [];
+        $verbergen = [
+            'Humidity'      => empty($c['humidity']),
+            'Indoor'        => empty($c['indoor']),
+            'Outdoor'       => empty($c['outdoor']),
+            'Ion'           => empty($c['ion']),
+            'Light'         => empty($c['light']),
+            'Running'       => empty($c['running']),
+            'Presence'      => empty($c['presence']),
+            'SelfClean'     => empty($c['selfClean']),
+            'PowerLevel'    => $leer($c['powerLevels'] ?? []),
+            'SwingH'        => $leer($c['swingsH'] ?? []),
+            'Swing'         => $leer($c['swings'] ?? []),
+            'Fan'           => $leer($c['fans'] ?? []),
+            'Preset'        => $leer($c['presets'] ?? []),
+            'Scheduled'     => empty($c['schedule']),
+            'OverrideUntil' => empty($c['schedule']),
+            'NextChange'    => empty($c['schedule']),
+            'OpenWindow'    => empty($c['schedule']),   // nur tado meldet Fenster
+        ];
+        foreach ($verbergen as $ident => $weg) {
+            $vid = @$this->GetIDForIdent($ident);
+            if ($vid === false || $vid <= 0) {
+                continue;
+            }
+            @\IPS_SetHidden($vid, (bool) $weg);
+        }
     }
 
     /** Profile mit Beschriftungen - sonst zeigt das Frontend nackte Zahlen. */
@@ -447,6 +525,7 @@ class ClimateZone extends EntityModule
                             4 => 'Mittel', 5 => 'Hoch', 6 => 'Sehr hoch']);
         $mk('HSAC.Swing',  [0 => 'Aus', 1 => 'Vertikal', 2 => 'Horizontal', 3 => 'Beides']);
         $mk('HSAC.SwingH', [0 => 'Aus', 1 => 'An']);
+        $mk('HSAC.PowerLevel', [50 => '50 %', 75 => '75 %', 100 => '100 %']);
         $mk('HSAC.Preset', [0 => 'Aus', 1 => 'High Power', 2 => 'Silent', 3 => 'ECO',
                             4 => 'Frostschutz', 5 => 'Sleep', 6 => 'Floor', 7 => 'Comfort']);
     }

@@ -52,6 +52,9 @@ interface IClimate extends IDriver
     /** Displaybeleuchtung am Innengeraet. */
     public function setLight(bool $on): bool;
 
+    /** Leistungsstufe in Prozent (siehe capabilities.powerLevels). */
+    public function setPowerLevel(int $prozent): bool;
+
     /**
      * Zurueck auf den Zeitplan des Herstellers (true) oder Handbetrieb halten (false).
      *

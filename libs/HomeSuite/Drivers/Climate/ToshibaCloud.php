@@ -50,6 +50,8 @@ final class ToshibaCloud implements IClimate
     private const SWINGS  = ['off' => '31', 'vertical' => '41', 'horizontal' => '42',
                              'both' => '43', 'fix1' => '50', 'fix2' => '51',
                              'fix3' => '52', 'fix4' => '53', 'fix5' => '54'];
+    /** Leistungsstufe: Byte 5. Die Cloud fuehrt sie als Hexpaar, nicht als Prozentwert. */
+    private const STUFEN  = [50 => '32', 75 => '48', 100 => '64'];
     private const PRESETS = ['off' => '0', 'highpower' => '1', 'silent' => '2',
                              'eco' => '3', 'frost' => '4', 'sleep' => '5',
                              'floor' => '6', 'comfort' => '7'];
@@ -67,7 +69,9 @@ final class ToshibaCloud implements IClimate
             power: true, target: true, targetMin: 17.0, targetMax: 30.0, targetStep: 1.0,
             modes: array_keys(self::MODI), fans: array_keys(self::FANS),
             swings: array_keys(self::SWINGS), presets: array_keys(self::PRESETS),
-            ion: true, indoor: true, outdoor: true
+            ion: true, indoor: true, outdoor: true,
+            powerLevels: array_keys(self::STUFEN), running: false, presence: false,
+            selfClean: true
         ))->toArray();
     }
 
@@ -111,6 +115,11 @@ final class ToshibaCloud implements IClimate
             preset:   (string) (array_search((string) $merit, self::PRESETS, true) ?: 'off'),
             ion:      strtolower($b(7)) === '18',
             humidity: -1.0,        // misst das Geraet nicht
+            powerLevel: (int) (array_search(strtolower($b(5)), self::STUFEN, true) ?: -1),
+            // Byte 15 traegt die Selbstreinigung; ff heisst "nicht gesetzt".
+            // Die Bytes 10 bis 14 und 16 bis 18 sind unbelegt oder ihre
+            // Bedeutung ist nicht bekannt - hier wird nichts hineingedeutet.
+            selfClean: strtolower($b(15)) === 'ff' ? null : (strtolower($b(15)) !== '00'),
             swingH:   '',
             light:    null,
             scheduled: null,
@@ -253,6 +262,12 @@ final class ToshibaCloud implements IClimate
     // und einen Zeitplan fuehrt sie ueberhaupt nicht - dort gibt es nur den
     // Handbetrieb. False heisst hier "kann das Geraet nicht", nicht "misslungen".
     public function setSwingH(string $swing): bool   { return false; }
+
+    public function setPowerLevel(int $prozent): bool
+    {
+        $h = self::STUFEN[$prozent] ?? null;
+        return $h === null ? false : $this->byte(5, $h);
+    }
     public function setLight(bool $on): bool         { return false; }
     public function setScheduled(bool $folgen): bool { return false; }
 

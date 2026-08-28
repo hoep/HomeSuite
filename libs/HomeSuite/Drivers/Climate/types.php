@@ -31,6 +31,12 @@ final class ClimateState
         public ?bool $light = null,         // Displaybeleuchtung, null = kein solches Feld
         public ?bool $scheduled = null,     // true = folgt dem Zeitplan, false = Handbetrieb
         public ?bool $openWindow = null,    // offenes Fenster erkannt, null = kein solches Feld
+        public int $powerLevel = -1,        // Leistungsstufe in % (50/75/100), -1 = unbekannt
+        public ?bool $running = null,       // laeuft der Verdichter WIRKLICH (nicht nur "eingeschaltet")
+        public string $presence = '',       // home|away - Geofencing des Anbieters
+        public int $overrideUntil = 0,      // Handbetrieb laeuft bis (Unixzeit), 0 = unbefristet/keiner
+        public int $nextChange = 0,         // naechste planmaessige Aenderung (Unixzeit), 0 = keine
+        public ?bool $selfClean = null,     // Selbstreinigung aktiv
         public bool $reachable = true
     ) {
     }
@@ -42,7 +48,10 @@ final class ClimateState
                 'fan' => $this->fan, 'swing' => $this->swing, 'preset' => $this->preset,
                 'ion' => $this->ion, 'humidity' => $this->humidity, 'swingH' => $this->swingH,
                 'light' => $this->light, 'scheduled' => $this->scheduled,
-                'openWindow' => $this->openWindow,
+                'openWindow' => $this->openWindow, 'powerLevel' => $this->powerLevel,
+                'running' => $this->running, 'presence' => $this->presence,
+                'overrideUntil' => $this->overrideUntil, 'nextChange' => $this->nextChange,
+                'selfClean' => $this->selfClean,
                 'reachable' => $this->reachable];
     }
 }
@@ -71,7 +80,11 @@ final class ClimateCapabilities
         public bool $humidity = false,      // misst relative Luftfeuchte
         public array $swingsH = [],         // waagrechtes Schwenken, leer = kann es nicht
         public bool $light = false,         // Displaybeleuchtung schaltbar
-        public bool $schedule = false       // kennt Zeitplan vs. Handbetrieb
+        public bool $schedule = false,      // kennt Zeitplan vs. Handbetrieb
+        public array $powerLevels = [],     // waehlbare Leistungsstufen in %, leer = kann es nicht
+        public bool $running = false,       // meldet den echten Laufzustand
+        public bool $presence = false,      // meldet Geofencing
+        public bool $selfClean = false      // meldet Selbstreinigung
     ) {
     }
 
@@ -84,6 +97,8 @@ final class ClimateCapabilities
                 'presets' => $this->presets, 'ion' => $this->ion,
                 'indoor' => $this->indoor, 'outdoor' => $this->outdoor,
                 'humidity' => $this->humidity, 'swingsH' => $this->swingsH,
-                'light' => $this->light, 'schedule' => $this->schedule];
+                'light' => $this->light, 'schedule' => $this->schedule,
+                'powerLevels' => $this->powerLevels, 'running' => $this->running,
+                'presence' => $this->presence, 'selfClean' => $this->selfClean];
     }
 }

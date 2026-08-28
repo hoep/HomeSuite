@@ -100,7 +100,8 @@ final class TadoCloud implements IClimate
             power: true, target: true, targetMin: $min, targetMax: $max, targetStep: $step,
             modes: $modi, fans: $fans, swings: $schwenkV, presets: [],
             ion: false, indoor: true, outdoor: false,
-            humidity: true, swingsH: $schwenkH, light: $licht, schedule: true
+            humidity: true, swingsH: $schwenkH, light: $licht, schedule: true,
+            powerLevels: [], running: true, presence: true, selfClean: false
         ))->toArray();
     }
 
@@ -144,6 +145,16 @@ final class TadoCloud implements IClimate
             light:   isset($s['light']) ? ((string) $s['light'] === 'ON') : null,
             // Kein Overlay = die Zone folgt ihrem Zeitplan.
             scheduled: !isset($d['overlay']) || $d['overlay'] === null,
+            // acPower sagt, ob der Verdichter LAEUFT - "power: ON" heisst nur,
+            // dass die Zone eingeschaltet ist. Bei erreichter Solltemperatur
+            // steht das Geraet trotzdem.
+            running:  isset($d['activityDataPoints']['acPower']['value'])
+                        ? ((string) $d['activityDataPoints']['acPower']['value'] === 'ON') : null,
+            presence: strtolower((string) ($d['tadoMode'] ?? '')),
+            overrideUntil: isset($d['overlay']['termination']['projectedExpiry'])
+                        ? (int) strtotime((string) $d['overlay']['termination']['projectedExpiry']) : 0,
+            nextChange: isset($d['nextTimeBlock']['start'])
+                        ? (int) strtotime((string) $d['nextTimeBlock']['start']) : 0,
             // link.state ist genauer als "die Abfrage kam durch": die Cloud
             // antwortet auch dann, wenn das Innengeraet selbst offline ist.
             openWindow: isset($d['openWindow']) ? ($d['openWindow'] !== null) : null,
@@ -189,6 +200,7 @@ final class TadoCloud implements IClimate
 
     public function setPreset(string $preset): bool { return false; }   // kennt tado nicht
     public function setIon(bool $on): bool          { return false; }
+    public function setPowerLevel(int $prozent): bool { return false; }   // kennt tado nicht
 
     public function setSwingH(string $swing): bool
     {
