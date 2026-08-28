@@ -138,7 +138,7 @@ class ShadingDevice extends EntityModule
                 [
                     'ident' => 'Mode', 'type' => ControlContract::T_SELECT,
                     'role' => 'shading:mode', 'label' => 'Modus',
-                    'varType' => 1, 'actionable' => true,
+                    'varType' => 1, 'actionable' => true, 'profile' => 'HSSH.Mode',
                     'options' => [
                         ['value' => 0, 'label' => 'Auto'],
                         ['value' => 1, 'label' => 'Manuell'],
@@ -148,7 +148,7 @@ class ShadingDevice extends EntityModule
                 [
                     'ident' => 'Plan', 'type' => ControlContract::T_SELECT,
                     'role' => 'shading:plan', 'label' => 'Plan',
-                    'varType' => 1, 'actionable' => true,
+                    'varType' => 1, 'actionable' => true, 'profile' => 'HSSH.Plan',
                     'options' => [
                         ['value' => 0, 'label' => 'Anwesend'],
                         ['value' => 1, 'label' => 'Abwesend'],
@@ -158,7 +158,7 @@ class ShadingDevice extends EntityModule
                 [
                     'ident' => 'Season', 'type' => ControlContract::T_SELECT,
                     'role' => 'shading:season', 'label' => 'Saison',
-                    'varType' => 1, 'actionable' => true,
+                    'varType' => 1, 'actionable' => true, 'profile' => 'HSSH.Season',
                     'options' => [
                         ['value' => 0, 'label' => 'Sommer'],
                         ['value' => 1, 'label' => 'Winter'],

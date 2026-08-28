@@ -702,6 +702,8 @@ class HomeSuiteWaechter extends EntityModule
                         'matrix'     => $this->store()->get('matrix', []),
                         'reaktionen' => $this->store()->get('reaktionen', []),
                         'wege'       => $this->store()->get('wege', []),
+                        'nachtzone'  => $this->store()->get('nachtzone', []),
+                        'nachbarn'   => $this->store()->get('nachbarn', []),
                         'register'   => $this->register(),
                         'zustand'    => $this->rt()];
 
