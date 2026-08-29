@@ -40,6 +40,7 @@ final class ToshibaCloud implements IClimate
 {
     private const BASIS  = 'https://mobileapi.toshibahomeaccontrols.com';
     private const SENDER = '/var/lib/symcon/scripts/toshiba/toshiba_send.py';
+    private const UA     = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15';
 
     /** Sprechender Wert -> Hexbyte. */
     private const MODI    = ['auto' => '41', 'cool' => '42', 'heat' => '43',
@@ -153,8 +154,15 @@ final class ToshibaCloud implements IClimate
             CURLOPT_URL            => $url,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT        => 20,
-            // Ohne User-Agent antwortet Toshibas Schutzschicht mit 403.
-            CURLOPT_USERAGENT      => 'curl/8.5.0',
+            /* Kennzeichner wie die App.
+             *
+             * Toshibas Schutzschicht (Azure Application Gateway) filtert danach,
+             * und die Regel hat sich geaendert: beim Bau war 'curl/8.5.0' noetig,
+             * weil python-urllib abgewiesen wurde. Am 29.08.2026 gemessen ist es
+             * umgekehrt - 'curl/8.5.0' bekommt eine 403-HTML-Seite vom Gateway,
+             * ohne Kennzeichner und mit dem Kennzeichner der App kommt sauber 200.
+             * Deshalb der Kennzeichner der App: er ist am wenigsten auffaellig. */
+            CURLOPT_USERAGENT      => self::UA,
             CURLOPT_HTTPHEADER     => ['Content-Type: application/json',
                                        'Authorization: Bearer ' . $token],
         ]);
@@ -253,7 +261,7 @@ final class ToshibaCloud implements IClimate
             CURLOPT_POST           => true,
             CURLOPT_POSTFIELDS     => json_encode(['Username' => $u, 'Password' => $p]),
             CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
-            CURLOPT_USERAGENT      => 'curl/8.5.0',
+            CURLOPT_USERAGENT      => self::UA,
             CURLOPT_TIMEOUT        => 25,
         ]);
         $antwort = curl_exec($ch);
