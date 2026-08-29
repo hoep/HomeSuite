@@ -47,6 +47,7 @@ final class TadoCloud implements IClimate
     private array $cfg = [];
     private int $rest = -1;              // Restanfragen laut Antwortkopf, -1 = unbekannt
     private int $ruecksetzung = 0;       // Zeitpunkt, ab dem das Kontingent wieder frei ist
+    private string $etag = '';           // ETag der letzten Antwort, fuer bedingte Anfragen
 
     public function bind(array $config, callable $send): void
     {
@@ -185,15 +186,42 @@ final class TadoCloud implements IClimate
             if ((time() - (int) ($p['v'] ?? 0)) < self::FRISCH) {
                 return null;
             }
-            $d    = $this->ruf('GET', '/homes/' . $home . '/zoneStates');
-            $gut  = is_array($d) && isset($d['zoneStates']);
+            /* Bedingte Anfrage, wie die tado-App sie stellt.
+             *
+             * Der Mitschnitt der iPhone-App vom 29.08.2026 zeigt zu jedem
+             * zoneStates-Aufruf ein "If-None-Match" mit dem zuletzt erhaltenen
+             * ETag. Hat sich nichts geaendert, antwortet tado mit 304 und ohne
+             * Rumpf - der Zustand bleibt gueltig, es fliessen keine Daten.
+             */
+            $marke = (string) ($p['e'] ?? '');
+            $tk = $this->token();
+            if ($tk === '') {
+                @file_put_contents($datei, json_encode(['v' => time()] + $p));
+                return null;
+            }
+            $roh  = $this->http('GET', self::API . '/homes/' . $home . '/zoneStates', null, $tk, $code,
+                                $marke !== '' ? ['If-None-Match: ' . $marke] : []);
             $neu  = ['v' => time()];                               // der Versuch zaehlt in jedem Fall
+            if ($code === 304 && isset($p['z'])) {
+                $neu['t'] = time();                                // unveraendert = weiterhin gueltig
+                $neu['z'] = $p['z'];
+                $neu['e'] = $marke;
+                @file_put_contents($datei, json_encode($neu));
+                return $p['z'];
+            }
+            $d   = json_decode((string) $roh, true);
+            $gut = ($code >= 200 && $code <= 299) && is_array($d) && isset($d['zoneStates']);
+            if (!$gut) {
+                $this->log('GET /homes/' . $home . '/zoneStates -> HTTP ' . $code);
+            }
             if ($gut) {
                 $neu['t'] = time();
                 $neu['z'] = $d['zoneStates'];
+                if ($this->etag !== '') { $neu['e'] = $this->etag; }
             } elseif (isset($p['t'], $p['z'])) {
                 $neu['t'] = (int) $p['t'];                         // letzten guten Stand nicht wegwerfen
                 $neu['z'] = $p['z'];
+                if (isset($p['e'])) { $neu['e'] = $p['e']; }
             }
             @file_put_contents($datei, json_encode($neu));
             return $gut ? $d['zoneStates'] : null;
@@ -434,9 +462,9 @@ final class TadoCloud implements IClimate
         return is_array($d) ? $d : [];
     }
 
-    private function http(string $verb, string $url, ?array $daten, ?string $token, ?int &$code)
+    private function http(string $verb, string $url, ?array $daten, ?string $token, ?int &$code, array $zusatz = [])
     {
-        $kopf = ['Content-Type: application/json'];
+        $kopf = array_merge(['Content-Type: application/json'], $zusatz);
         if ($token !== null && $token !== '') {
             $kopf[] = 'Authorization: Bearer ' . $token;
         }
@@ -456,8 +484,10 @@ final class TadoCloud implements IClimate
         // bis zur Ruecksetzung. Ohne ihn merkt man das Ende des Kontingents erst
         // am ersten 429 - mit ihm laesst es sich kommen sehen.
         $kopf = [];
+        $this->etag = '';
         curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($c, $z) use (&$kopf) {
             if (stripos($z, 'ratelimit:') === 0) { $kopf[] = trim($z); }
+            if (stripos($z, 'etag:') === 0)      { $this->etag = trim(substr(trim($z), 5)); }
             return strlen($z);
         });
         $antwort = curl_exec($ch);
