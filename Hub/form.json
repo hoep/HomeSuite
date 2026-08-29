@@ -3,6 +3,43 @@
         {
             "type": "Label",
             "caption": "HomeSuite Hub — zentrale Singleton-Instanz. Die eigentliche Verwaltung (Anlegen/Provisionieren/Migrieren) erfolgt im LiveViewBuilder ueber das Manifest. Dieser Dialog dient nur der Token-Verwaltung, der Status- und Diagnoseanzeige."
+        },
+        {
+            "type": "ExpansionPanel",
+            "caption": "Flugverkehr (OpenSky)",
+            "items": [
+                {
+                    "type": "Label",
+                    "caption": "Zeigt vorbeifliegende Maschinen in der Sonnenszene und auf der Flugseite. Ohne Zugangsdaten laeuft es anonym mit 400 statt 4000 Abfragen je Tag."
+                },
+                {
+                    "type": "CheckBox",
+                    "name": "FlightsOn",
+                    "caption": "Flugverkehr abrufen"
+                },
+                {
+                    "type": "NumberSpinner",
+                    "name": "FlightRadius",
+                    "caption": "Umkreis (km)",
+                    "minimum": 5,
+                    "maximum": 200,
+                    "suffix": " km"
+                },
+                {
+                    "type": "Label",
+                    "caption": "Zugang: im OpenSky-Konto unter Account einen API-Client anlegen (Benutzername und Kennwort werden seit Maerz 2026 nicht mehr angenommen)."
+                },
+                {
+                    "type": "ValidationTextBox",
+                    "name": "FlightClientId",
+                    "caption": "Client-ID"
+                },
+                {
+                    "type": "PasswordTextBox",
+                    "name": "FlightSecret",
+                    "caption": "Geheimnis"
+                }
+            ]
         }
     ],
     "actions": [

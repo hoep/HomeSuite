@@ -142,6 +142,19 @@ class HomeSuiteHub extends EntityModule
         $this->RegisterPropertyFloat('HeatFrostTemp', 8.0);
         // Bewaesserung — Regensensor (grundstuecksweit)
         $this->RegisterPropertyInteger('IrrRainSensorId', 0);
+
+        /* Flugverkehr (OpenSky).
+         *
+         * Der Zugang gehoert hierher und nicht auf fest verdrahtete Variablen-IDs
+         * im LiveViewBuilder - wie bei tado und Toshiba wird er in der Oberflaeche
+         * gepflegt. Seit Maerz 2026 nimmt OpenSky kein Benutzername/Kennwort mehr;
+         * im OpenSky-Konto unter "Account" einen API-Client anlegen, der liefert
+         * Client-ID und Geheimnis. Ohne Zugang laeuft es anonym mit 400 statt 4000
+         * Abfragen je Tag. */
+        $this->RegisterPropertyBoolean('FlightsOn', false);
+        $this->RegisterPropertyInteger('FlightRadius', 30);
+        $this->RegisterPropertyString('FlightClientId', '');
+        $this->RegisterPropertyString('FlightSecret', '');
     }
 
     /**
