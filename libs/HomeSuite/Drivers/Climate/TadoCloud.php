@@ -45,6 +45,8 @@ final class TadoCloud implements IClimate
     private const SWING = ['off' => 'OFF', 'vertical' => 'ON'];
 
     private array $cfg = [];
+    private int $rest = -1;              // Restanfragen laut Antwortkopf, -1 = unbekannt
+    private int $ruecksetzung = 0;       // Zeitpunkt, ab dem das Kontingent wieder frei ist
 
     public function bind(array $config, callable $send): void
     {
@@ -102,9 +104,10 @@ final class TadoCloud implements IClimate
             ion: false, indoor: true, outdoor: false,
             humidity: true, swingsH: $schwenkH, light: $licht, schedule: true,
             powerLevels: [], running: true, presence: true, selfClean: false,
-            // tado drosselt frueh. Fuenf Zonen im Minutentakt waren zu viel;
-            // zwei Minuten je Zone bleiben deutlich darunter.
-            pollSeconds: 120
+            // Kontingent 1000 Anfragen je Tag (gemessen 29.08.2026). Mit der
+            // Sammelabfrage ist EINE Anfrage je Takt noetig: 180 s ergeben 480
+            // Anfragen taeglich und lassen die Haelfte fuer Schaltbefehle frei.
+            pollSeconds: 180
         ))->toArray();
     }
 
@@ -120,9 +123,58 @@ final class TadoCloud implements IClimate
 
     // ------------------------------------------------------------------ lesen
 
+    /* Sammelabfrage: EINE Anfrage fuer alle Zonen statt einer je Zone.
+     *
+     * tado deckelt seit 27.01.2026 die REST-API pro Konto und Tag; gemessen am
+     * 29.08.2026 waren es 1000 Anfragen (Kopf "RateLimit-Policy: perday;q=1000").
+     * Fuenf Zonen im Zwei-Minuten-Takt sind 3600 Anfragen taeglich - das
+     * Kontingent war jeden Vormittag leer, und was wie ein taeglicher Verlust
+     * der Registrierung aussah, war in Wahrheit die Drosselung.
+     *
+     * /zoneStates liefert alle Zonen auf einmal. Die Antwort landet in einer
+     * gemeinsamen Ablage, aus der sich alle Zonen-Instanzen bedienen; nur wer
+     * das Semaphor bekommt, fragt wirklich nach. Ohne diesen Einzelflug haetten
+     * fuenf Instanzen weiterhin fuenf Anfragen ausgeloest, nur eben auf einen
+     * anderen Endpunkt.
+     */
+    private const ABLAGE = '/var/lib/symcon/scripts/data/tado-';
+    private const FRISCH = 150;      // Sekunden, die die Ablage als aktuell gilt
+
+    private function zonen(): ?array
+    {
+        $home  = $this->i('homeId');
+        $datei = self::ABLAGE . $home . '.json';
+        $p = @json_decode((string) @file_get_contents($datei), true);
+        if (is_array($p) && isset($p['z']) && (time() - (int) ($p['t'] ?? 0)) < self::FRISCH) {
+            return $p['z'];
+        }
+        $sem = 'tadoZonen' . $home;
+        if (!@\IPS_SemaphoreEnter($sem, 9000)) {
+            // Ein anderer holt gerade. Dann seine Ablage nehmen, statt selbst
+            // eine zweite Anfrage in dasselbe Kontingent zu schicken.
+            $p = @json_decode((string) @file_get_contents($datei), true);
+            return (is_array($p) && isset($p['z'])) ? $p['z'] : null;
+        }
+        try {
+            $p = @json_decode((string) @file_get_contents($datei), true);   // hinter dem Riegel erneut pruefen
+            if (is_array($p) && isset($p['z']) && (time() - (int) ($p['t'] ?? 0)) < self::FRISCH) {
+                return $p['z'];
+            }
+            $d = $this->ruf('GET', '/homes/' . $home . '/zoneStates');
+            if (!is_array($d) || !isset($d['zoneStates'])) {
+                return null;
+            }
+            @file_put_contents($datei, json_encode(['t' => time(), 'z' => $d['zoneStates']]));
+            return $d['zoneStates'];
+        } finally {
+            @\IPS_SemaphoreLeave($sem);
+        }
+    }
+
     public function readState(): ClimateState
     {
-        $d = $this->ruf('GET', '/homes/' . $this->i('homeId') . '/zones/' . $this->i('zoneId') . '/state');
+        $alle = $this->zonen();
+        $d = is_array($alle) ? ($alle[(string) $this->i('zoneId')] ?? null) : null;
         if (!is_array($d)) {
             return new ClimateState(reachable: false);
         }
@@ -286,6 +338,26 @@ final class TadoCloud implements IClimate
             $this->log('kein Refresh-Token - Registrierung noetig');
             return '';
         }
+        /* Einzelflug bei der Erneuerung.
+         *
+         * Die fuenf Zonen teilen sich EINEN Refresh-Token, und tado rotiert ihn
+         * bei jeder Einloesung. Liefen fuenf Erneuerungen gleichzeitig, gewann
+         * eine und die anderen vier legten einen bereits verbrauchten Token vor
+         * - genau das waren die HTTP 400 am 29.08.2026, die wie ein Verlust der
+         * Registrierung aussahen. Wer den Riegel nicht bekommt, wartet auf den
+         * Gewinner und nimmt dessen frischen Token.
+         */
+        $sem = 'tadoToken' . $this->i('homeId');
+        if (!@\IPS_SemaphoreEnter($sem, 12000)) {
+            return (string) $this->wert('accessVid', '');
+        }
+        try {
+        $ablauf  = (int) $this->wert('expiresVid', 0);          // hinter dem Riegel erneut pruefen
+        $zugriff = (string) $this->wert('accessVid', '');
+        if ($zugriff !== '' && $ablauf > time() + self::VORLAUF) {
+            return $zugriff;
+        }
+        $refresh = (string) $this->wert('refreshVid', '');
         $antwort = $this->http('POST', self::TOKEN_URL
             . '?client_id=' . self::CLIENT_ID . '&grant_type=refresh_token&refresh_token=' . urlencode($refresh),
             null, null, $code);
@@ -306,6 +378,9 @@ final class TadoCloud implements IClimate
         $this->setze('accessVid',  (string) $d['access_token']);
         $this->setze('expiresVid', time() + (int) ($d['expires_in'] ?? 600));
         return (string) $d['access_token'];
+        } finally {
+            @\IPS_SemaphoreLeave($sem);
+        }
     }
 
     // ------------------------------------------------------------------ intern
@@ -346,9 +421,25 @@ final class TadoCloud implements IClimate
         if ($daten !== null) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($daten));
         }
+        // Den Kontingent-Kopf mitlesen: er nennt Restanfragen und die Sekunden
+        // bis zur Ruecksetzung. Ohne ihn merkt man das Ende des Kontingents erst
+        // am ersten 429 - mit ihm laesst es sich kommen sehen.
+        $kopf = [];
+        curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($c, $z) use (&$kopf) {
+            if (stripos($z, 'ratelimit:') === 0) { $kopf[] = trim($z); }
+            return strlen($z);
+        });
         $antwort = curl_exec($ch);
         $code    = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
+        if ($kopf !== [] && preg_match('/r=(\\d+)(?:;t=(\\d+))?/', $kopf[0], $m)) {
+            $this->rest = (int) $m[1];
+            $this->ruecksetzung = isset($m[2]) ? (time() + (int) $m[2]) : 0;
+            if ($this->rest <= 50) {
+                $this->log('Kontingent knapp: noch ' . $this->rest . ' Anfragen'
+                    . ($this->ruecksetzung ? ', frei ab ' . date('H:i', $this->ruecksetzung) : ''));
+            }
+        }
         return $antwort;
     }
 
