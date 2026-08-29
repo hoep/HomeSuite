@@ -151,28 +151,52 @@ final class TadoCloud implements IClimate
     {
         $home  = $this->i('homeId');
         $datei = self::ABLAGE . $home . '.json';
-        $p = @json_decode((string) @file_get_contents($datei), true);
-        if (is_array($p) && isset($p['z']) && (time() - (int) ($p['t'] ?? 0)) < self::FRISCH) {
+        /* Vermerkt werden ZWEI Zeitpunkte:
+         *   t = letzte gelungene Antwort (dazu gehoert z)
+         *   v = letzter VERSUCH, gelungen oder nicht
+         * Nur t zu fuehren war zu wenig: schlug die Abfrage fehl, stand nichts
+         * Frisches in der Ablage, und die naechste Zone fragte selbst nach.
+         * Bei einer Stoerung wurde aus der einen Sammelabfrage wieder eine je
+         * Zone - gemessen am 29.08.2026 fuenf Anfragen in derselben Sekunde,
+         * ausgerechnet waehrend die Drosselung lief. Mit v geht pro Zeitfenster
+         * hoechstens eine Anfrage raus, egal wie sie ausgeht.
+         */
+        $lesen = static function (string $d) {
+            $x = @json_decode((string) @file_get_contents($d), true);
+            return is_array($x) ? $x : [];
+        };
+        $p = $lesen($datei);
+        if (isset($p['z']) && (time() - (int) ($p['t'] ?? 0)) < self::FRISCH) {
             return $p['z'];
+        }
+        if ((time() - (int) ($p['v'] ?? 0)) < self::FRISCH) {
+            return null;          // jemand hat es eben versucht und ist gescheitert
         }
         $sem = 'tadoZonen' . $home;
         if (!@\IPS_SemaphoreEnter($sem, 9000)) {
-            // Ein anderer holt gerade. Dann seine Ablage nehmen, statt selbst
-            // eine zweite Anfrage in dasselbe Kontingent zu schicken.
-            $p = @json_decode((string) @file_get_contents($datei), true);
-            return (is_array($p) && isset($p['z'])) ? $p['z'] : null;
+            $p = $lesen($datei);  // ein anderer holt gerade - dessen Ergebnis nehmen
+            return (isset($p['z']) && (time() - (int) ($p['t'] ?? 0)) < self::FRISCH) ? $p['z'] : null;
         }
         try {
-            $p = @json_decode((string) @file_get_contents($datei), true);   // hinter dem Riegel erneut pruefen
-            if (is_array($p) && isset($p['z']) && (time() - (int) ($p['t'] ?? 0)) < self::FRISCH) {
+            $p = $lesen($datei);                                   // hinter dem Riegel erneut pruefen
+            if (isset($p['z']) && (time() - (int) ($p['t'] ?? 0)) < self::FRISCH) {
                 return $p['z'];
             }
-            $d = $this->ruf('GET', '/homes/' . $home . '/zoneStates');
-            if (!is_array($d) || !isset($d['zoneStates'])) {
+            if ((time() - (int) ($p['v'] ?? 0)) < self::FRISCH) {
                 return null;
             }
-            @file_put_contents($datei, json_encode(['t' => time(), 'z' => $d['zoneStates']]));
-            return $d['zoneStates'];
+            $d    = $this->ruf('GET', '/homes/' . $home . '/zoneStates');
+            $gut  = is_array($d) && isset($d['zoneStates']);
+            $neu  = ['v' => time()];                               // der Versuch zaehlt in jedem Fall
+            if ($gut) {
+                $neu['t'] = time();
+                $neu['z'] = $d['zoneStates'];
+            } elseif (isset($p['t'], $p['z'])) {
+                $neu['t'] = (int) $p['t'];                         // letzten guten Stand nicht wegwerfen
+                $neu['z'] = $p['z'];
+            }
+            @file_put_contents($datei, json_encode($neu));
+            return $gut ? $d['zoneStates'] : null;
         } finally {
             @\IPS_SemaphoreLeave($sem);
         }
