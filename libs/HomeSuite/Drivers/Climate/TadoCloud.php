@@ -98,7 +98,7 @@ final class TadoCloud implements IClimate
         }
         if ($modi === []) { $modi = array_keys(self::MODI); }
         if ($fans === []) { $fans = array_keys(self::FANS); }
-        return (new ClimateCapabilities(
+        $a = (new ClimateCapabilities(
             power: true, target: true, targetMin: $min, targetMax: $max, targetStep: $step,
             modes: $modi, fans: $fans, swings: $schwenkV, presets: [],
             ion: false, indoor: true, outdoor: false,
@@ -109,6 +109,13 @@ final class TadoCloud implements IClimate
             // Anfragen taeglich und lassen die Haelfte fuer Schaltbefehle frei.
             pollSeconds: 180
         ))->toArray();
+        // Kam die Abfrage nicht durch (z. B. Kontingent leer), ist das hier nur
+        // der Notbehelf - ALLE Modi und Luefterstufen. Den 24 Stunden lang
+        // zwischenzuspeichern hiesse, dem Nutzer einen Tag lang Stufen
+        // anzubieten, die sein Geraet nicht kennt. Also kennzeichnen, damit der
+        // Aufrufer nur echte Antworten ablegt.
+        $a['_echt'] = is_array($c);
+        return $a;
     }
 
     public function poll(): array

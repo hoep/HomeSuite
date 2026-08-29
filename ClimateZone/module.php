@@ -419,7 +419,11 @@ class ClimateZone extends EntityModule
         }
         $d = $this->driver();
         $c = ($d instanceof IClimate) ? $d->capabilities() : [];
-        if ($c !== []) {
+        // Nur echte Antworten ablegen. Ein Treiber, dessen Abfrage nicht
+        // durchkam, liefert einen Notbehelf - der darf nicht 24 Stunden lang
+        // als Wahrheit gelten und dem Nutzer Stufen anbieten, die sein Geraet
+        // nicht kennt (siehe _echt in TadoCloud::capabilities).
+        if ($c !== [] && ($c['_echt'] ?? true)) {
             $this->SetBuffer('Caps', json_encode(['t' => time(), 'c' => $c]));
         }
         return $c;
