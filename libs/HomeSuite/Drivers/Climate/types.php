@@ -37,6 +37,7 @@ final class ClimateState
         public int $overrideUntil = 0,      // Handbetrieb laeuft bis (Unixzeit), 0 = unbefristet/keiner
         public int $nextChange = 0,         // naechste planmaessige Aenderung (Unixzeit), 0 = keine
         public ?bool $selfClean = null,     // Selbstreinigung aktiv
+        public string $fireplace = '',      // Kaminmodus: off|kamin1|kamin2
         public bool $reachable = true
     ) {
     }
@@ -51,7 +52,7 @@ final class ClimateState
                 'openWindow' => $this->openWindow, 'powerLevel' => $this->powerLevel,
                 'running' => $this->running, 'presence' => $this->presence,
                 'overrideUntil' => $this->overrideUntil, 'nextChange' => $this->nextChange,
-                'selfClean' => $this->selfClean,
+                'selfClean' => $this->selfClean, 'fireplace' => $this->fireplace,
                 'reachable' => $this->reachable];
     }
 }
@@ -84,7 +85,9 @@ final class ClimateCapabilities
         public array $powerLevels = [],     // waehlbare Leistungsstufen in %, leer = kann es nicht
         public bool $running = false,       // meldet den echten Laufzustand
         public bool $presence = false,      // meldet Geofencing
-        public bool $selfClean = false      // meldet Selbstreinigung
+        public bool $selfClean = false,     // meldet Selbstreinigung
+        public array $fireplaces = [],      // Kaminmodi, leer = kann es nicht
+        public int $pollSeconds = 60        // vertraeglicher Abfragetakt in Sekunden
     ) {
     }
 
@@ -99,6 +102,7 @@ final class ClimateCapabilities
                 'humidity' => $this->humidity, 'swingsH' => $this->swingsH,
                 'light' => $this->light, 'schedule' => $this->schedule,
                 'powerLevels' => $this->powerLevels, 'running' => $this->running,
-                'presence' => $this->presence, 'selfClean' => $this->selfClean];
+                'presence' => $this->presence, 'selfClean' => $this->selfClean,
+                'fireplaces' => $this->fireplaces, 'pollSeconds' => $this->pollSeconds];
     }
 }

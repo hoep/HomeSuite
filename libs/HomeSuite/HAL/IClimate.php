@@ -55,6 +55,9 @@ interface IClimate extends IDriver
     /** Leistungsstufe in Prozent (siehe capabilities.powerLevels). */
     public function setPowerLevel(int $prozent): bool;
 
+    /** Kaminmodus: off|kamin1|kamin2 (siehe capabilities.fireplaces). */
+    public function setFireplace(string $modus): bool;
+
     /**
      * Zurueck auf den Zeitplan des Herstellers (true) oder Handbetrieb halten (false).
      *

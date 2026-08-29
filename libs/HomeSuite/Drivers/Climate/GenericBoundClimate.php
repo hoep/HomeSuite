@@ -96,6 +96,8 @@ final class GenericBoundClimate implements IClimate
     public function setPreset(string $preset): bool   { return false; }   // kennt dieser Weg nicht
     public function setSwingH(string $swing): bool   { return $this->schreib('swingHVid', $this->hin('swingH', $swing) ?? $swing); }
     public function setLight(bool $on): bool         { return $this->schreib('lightVid', $on); }
+    public function setFireplace(string $modus): bool { return false; }   // kennt dieses Geraet nicht
+
     public function setPowerLevel(int $prozent): bool { return $this->schreib('powerLevelVid', $prozent); }
     public function setScheduled(bool $folgen): bool { return $this->schreib('scheduleVid', $folgen); }
 

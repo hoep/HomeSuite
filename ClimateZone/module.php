@@ -110,6 +110,7 @@ class ClimateZone extends EntityModule
                      ['value' => 5, 'label' => 'Sleep'],
                      ['value' => 6, 'label' => 'Floor'],
                      ['value' => 7, 'label' => 'Comfort'],
+                     ['value' => 8, 'label' => 'CDU Silent 2'],
                  ]],
                 ['ident' => 'Ion', 'type' => ControlContract::T_SWITCH, 'role' => 'climate:ion',
                  'label' => 'Ionisierung', 'varType' => 0, 'profile' => '~Switch',
@@ -140,6 +141,12 @@ class ClimateZone extends EntityModule
                 ['ident' => 'NextChange', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:nextchange',
                  'label' => 'Naechste Aenderung', 'varType' => 1, 'profile' => '~UnixTimestamp',
                  'actionable' => false],
+                ['ident' => 'Fireplace', 'type' => ControlContract::T_SELECT, 'role' => 'climate:fireplace',
+                 'label' => 'Kaminmodus', 'varType' => 1, 'actionable' => true,
+                 'profile' => 'HSAC.Fireplace',
+                 'options' => [['value' => 0, 'label' => 'Aus'],
+                               ['value' => 1, 'label' => 'Kamin 1'],
+                               ['value' => 2, 'label' => 'Kamin 2']]],
                 ['ident' => 'SelfClean', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:selfclean',
                  'label' => 'Selbstreinigung', 'varType' => 0, 'profile' => '~Switch', 'actionable' => false],
                 ['ident' => 'OpenWindow', 'type' => ControlContract::T_REFLECT, 'role' => 'climate:window',
@@ -201,7 +208,10 @@ class ClimateZone extends EntityModule
         $this->driverResolved = false;
         $this->profileAnlegen();
         $this->sichtbarkeitPflegen();
-        $this->SetTimerInterval(self::TIMER_REFRESH, $this->cfgVal('driver', '') === '' ? 0 : self::REFRESH_MS);
+        $c = $this->driverCaps();
+        $takt = (int) ($c['pollSeconds'] ?? 60);
+        $this->SetTimerInterval(self::TIMER_REFRESH,
+            $this->cfgVal('driver', '') === '' ? 0 : max(30, $takt) * 1000);
     }
 
     public function RunTimer(string $was)
@@ -238,6 +248,7 @@ class ClimateZone extends EntityModule
             case 'Light':     $drv->setLight((bool) $value); break;
             case 'Scheduled': $drv->setScheduled((bool) $value); break;
             case 'PowerLevel': $drv->setPowerLevel((int) $value); break;
+            case 'Fireplace':  $drv->setFireplace(self::KAMIN[(int) $value] ?? ''); break;
             default:
                 $this->SendDebug('HSAC.apply', $c->ident . ' unbehandelt', 0);
                 break;
@@ -254,7 +265,9 @@ class ClimateZone extends EntityModule
                              4 => 'medium', 5 => 'high', 6 => 'veryhigh'];
     private const SCHWENK = [0 => 'off', 1 => 'vertical', 2 => 'horizontal', 3 => 'both'];
     private const SONDER  = [0 => 'off', 1 => 'highpower', 2 => 'silent', 3 => 'eco',
-                             4 => 'frost', 5 => 'sleep', 6 => 'floor', 7 => 'comfort'];
+                             4 => 'frost', 5 => 'sleep', 6 => 'floor', 7 => 'comfort',
+                             8 => 'silent2'];
+    private const KAMIN   = [0 => 'off', 1 => 'kamin1', 2 => 'kamin2'];
 
     // ==================================================================
     // Zustand einlesen
@@ -267,11 +280,34 @@ class ClimateZone extends EntityModule
             $this->anzeige('Online', false);
             return;
         }
-        $s = $drv->readState();
-        $this->anzeige('Online', $s->reachable);
-        if (!$s->reachable) {
+        /* RUECKFALL bei Stoerung.
+         *
+         * Beide Anbieter drosseln, wenn man zu oft fragt - und wer bei einer
+         * Drosselung im gleichen Takt weiterfragt, verlaengert sie. Nach einem
+         * misslungenen Lesen wird die Pause deshalb verdoppelt, von einer
+         * fuenf Minuten bis zu einer Stunde; das erste gelungene Lesen setzt
+         * sie zurueck. Am 29.08.2026 hat tado ab 23 Uhr mit HTTP 429
+         * dichtgemacht, und das Modul hat sieben Stunden lang unbeirrt
+         * weitergefragt.
+         */
+        $pause = (int) $this->GetBuffer('Pause');
+        $bis   = (int) $this->GetBuffer('PauseBis');
+        if ($bis > time()) {
             return;
         }
+        $s = $drv->readState();
+        if (!$s->reachable) {
+            $pause = $pause > 0 ? min(3600, $pause * 2) : 300;
+            $this->SetBuffer('Pause', (string) $pause);
+            $this->SetBuffer('PauseBis', (string) (time() + $pause));
+            $this->anzeige('Online', false);
+            return;
+        }
+        if ($pause > 0) {
+            $this->SetBuffer('Pause', '0');
+            $this->SetBuffer('PauseBis', '0');
+        }
+        $this->anzeige('Online', true);
         $this->anzeige('Power', $s->on);
         if ($s->target > -100)  { $this->anzeige('Target', $s->target); }
         if ($s->indoor > -100)  { $this->anzeige('Indoor', $s->indoor); }
@@ -285,6 +321,8 @@ class ClimateZone extends EntityModule
         if ($s->running !== null)   { $this->anzeige('Running', $s->running); }
         if ($s->presence !== '')    { $this->anzeige('Presence', $s->presence === 'home' ? 'Anwesend' : 'Abwesend'); }
         if ($s->selfClean !== null) { $this->anzeige('SelfClean', $s->selfClean); }
+        if ($s->fireplace !== '')   { $k = array_search($s->fireplace, self::KAMIN, true);
+                                      if ($k !== false) { $this->anzeige('Fireplace', $k); } }
         if ($s->openWindow !== null){ $this->anzeige('OpenWindow', $s->openWindow); }
         $this->anzeige('OverrideUntil', $s->overrideUntil);
         $this->anzeige('NextChange', $s->nextChange);
@@ -359,10 +397,32 @@ class ClimateZone extends EntityModule
         ]);
     }
 
-    private function driverCaps(): array
+    /**
+     * Faehigkeiten - GEPUFFERT.
+     *
+     * Bei tado kostet capabilities() eine Netzanfrage, und manifest() ruft es
+     * bei jedem Zugriff. Mit fuenf Zonen im Minutentakt waren das doppelt so
+     * viele Anfragen wie noetig; tado hat am 29.08.2026 ab etwa 23 Uhr mit
+     * HTTP 429 dichtgemacht, und die Zonen standen sieben Stunden still.
+     *
+     * Was ein Geraet kann, aendert sich nicht im Minutentakt - ein Tag Puffer
+     * ist reichlich. Bei einem Treiberwechsel wird er in configureDriver
+     * verworfen, sonst zeigte die Anzeige die Faehigkeiten des alten Treibers.
+     */
+    private function driverCaps(bool $frisch = false): array
     {
+        if (!$frisch) {
+            $p = json_decode((string) $this->GetBuffer('Caps'), true);
+            if (is_array($p) && isset($p['t'], $p['c']) && (time() - (int) $p['t']) < 86400) {
+                return is_array($p['c']) ? $p['c'] : [];
+            }
+        }
         $d = $this->driver();
-        return ($d instanceof IClimate) ? $d->capabilities() : [];
+        $c = ($d instanceof IClimate) ? $d->capabilities() : [];
+        if ($c !== []) {
+            $this->SetBuffer('Caps', json_encode(['t' => time(), 'c' => $c]));
+        }
+        return $c;
     }
 
     private function cfgVal(string $schluessel, $vorgabe)
@@ -457,6 +517,7 @@ class ClimateZone extends EntityModule
         @\IPS_ApplyChanges($this->InstanceID);
         $this->driverInstance = null;
         $this->driverResolved = false;
+        $this->SetBuffer('Caps', '');            // Treiberwechsel: Puffer verwerfen
         $this->sichtbarkeitPflegen();
         $d = $this->driver();
         return ['ok' => true, 'driver' => $treiber, 'driverActive' => $d instanceof IClimate,
@@ -495,6 +556,7 @@ class ClimateZone extends EntityModule
             'Swing'         => $leer($c['swings'] ?? []),
             'Fan'           => $leer($c['fans'] ?? []),
             'Preset'        => $leer($c['presets'] ?? []),
+            'Fireplace'     => !is_array($c['fireplaces'] ?? null) || ($c['fireplaces'] ?? []) === [],
             'Scheduled'     => empty($c['schedule']),
             'OverrideUntil' => empty($c['schedule']),
             'NextChange'    => empty($c['schedule']),
@@ -526,7 +588,9 @@ class ClimateZone extends EntityModule
         $mk('HSAC.Swing',  [0 => 'Aus', 1 => 'Vertikal', 2 => 'Horizontal', 3 => 'Beides']);
         $mk('HSAC.SwingH', [0 => 'Aus', 1 => 'An']);
         $mk('HSAC.PowerLevel', [50 => '50 %', 75 => '75 %', 100 => '100 %']);
+        $mk('HSAC.Fireplace', [0 => 'Aus', 1 => 'Kamin 1', 2 => 'Kamin 2']);
         $mk('HSAC.Preset', [0 => 'Aus', 1 => 'High Power', 2 => 'Silent', 3 => 'ECO',
-                            4 => 'Frostschutz', 5 => 'Sleep', 6 => 'Floor', 7 => 'Comfort']);
+                            4 => 'Heizen 8 °C', 5 => 'Sleep', 6 => 'Floor', 7 => 'Comfort',
+                            8 => 'CDU Silent 2']);
     }
 }

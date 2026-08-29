@@ -101,7 +101,10 @@ final class TadoCloud implements IClimate
             modes: $modi, fans: $fans, swings: $schwenkV, presets: [],
             ion: false, indoor: true, outdoor: false,
             humidity: true, swingsH: $schwenkH, light: $licht, schedule: true,
-            powerLevels: [], running: true, presence: true, selfClean: false
+            powerLevels: [], running: true, presence: true, selfClean: false,
+            // tado drosselt frueh. Fuenf Zonen im Minutentakt waren zu viel;
+            // zwei Minuten je Zone bleiben deutlich darunter.
+            pollSeconds: 120
         ))->toArray();
     }
 
@@ -200,6 +203,8 @@ final class TadoCloud implements IClimate
 
     public function setPreset(string $preset): bool { return false; }   // kennt tado nicht
     public function setIon(bool $on): bool          { return false; }
+    public function setFireplace(string $modus): bool { return false; }   // kennt dieses Geraet nicht
+
     public function setPowerLevel(int $prozent): bool { return false; }   // kennt tado nicht
 
     public function setSwingH(string $swing): bool
@@ -288,8 +293,12 @@ final class TadoCloud implements IClimate
         if ($code !== 200 || !isset($d['access_token'], $d['refresh_token'])) {
             // 4xx = Token verbrannt, da hilft kein Wiederholen. 5xx/Netz = beim
             // naechsten Zyklus erneut versuchen; der alte Token gilt bis dahin.
+            // 429 heisst gedrosselt, NICHT verbrannt - der Refresh-Token gilt
+            // weiter. Eine Aufforderung zur Neuregistrierung waere hier falsch
+            // und wuerde zu einer unnoetigen Browser-Bestaetigung verleiten.
             $this->log('Erneuerung fehlgeschlagen (HTTP ' . $code . ')'
-                . (($code >= 400 && $code < 500) ? ' - neu registrieren' : ' - naechster Versuch folgt'));
+                . ($code === 429 ? ' - gedrosselt, spaeter erneut'
+                   : (($code >= 400 && $code < 500) ? ' - neu registrieren' : ' - naechster Versuch folgt')));
             return $zugriff;   // notfalls den alten probieren
         }
         // ZUERST ablegen, dann weiterarbeiten.

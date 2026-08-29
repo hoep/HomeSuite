@@ -51,10 +51,17 @@ final class ToshibaCloud implements IClimate
                              'both' => '43', 'fix1' => '50', 'fix2' => '51',
                              'fix3' => '52', 'fix4' => '53', 'fix5' => '54'];
     /** Leistungsstufe: Byte 5. Die Cloud fuehrt sie als Hexpaar, nicht als Prozentwert. */
-    private const STUFEN  = [50 => '32', 75 => '48', 100 => '64'];
-    private const PRESETS = ['off' => '0', 'highpower' => '1', 'silent' => '2',
-                             'eco' => '3', 'frost' => '4', 'sleep' => '5',
-                             'floor' => '6', 'comfort' => '7'];
+    private const STUFEN  = [50 => '32', 75 => '4b', 100 => '64'];
+    /**
+     * Merit A - das NIEDRIGE Halbbyte von Byte 6. 0x04 heisst in der
+     * Herstellerlogik "Heizen auf 8 Grad", also Frostschutz.
+     */
+    private const PRESETS = [ 'off' => 0, 'highpower' => 1, 'silent' => 2,
+                              'eco' => 3, 'frost' => 4, 'sleep' => 5,
+                              'floor' => 6, 'comfort' => 7, 'silent2' => 10];
+
+    /** Merit B - das HOHE Halbbyte von Byte 6: der Kaminmodus. */
+    private const KAMIN   = ['off' => 0, 'kamin1' => 2, 'kamin2' => 3];
 
     private array $cfg = [];
 
@@ -71,7 +78,7 @@ final class ToshibaCloud implements IClimate
             swings: array_keys(self::SWINGS), presets: array_keys(self::PRESETS),
             ion: true, indoor: true, outdoor: true,
             powerLevels: array_keys(self::STUFEN), running: false, presence: false,
-            selfClean: true
+            selfClean: true, fireplaces: array_keys(self::KAMIN)
         ))->toArray();
     }
 
@@ -103,7 +110,9 @@ final class ToshibaCloud implements IClimate
         $wert = static fn(array $tab, string $h): string
             => (string) (array_search(strtolower($h), $tab, true) ?: '');
 
-        $merit = hexdec($b(6)) & 0x0F;   // nur das niedrige Halbbyte ist merit_a
+        $b6      = hexdec($b(6));
+        $merit   = $b6 & 0x0F;          // niedriges Halbbyte = Merit A
+        $kaminNr = ($b6 >> 4) & 0x0F;   // hohes Halbbyte  = Merit B (Kamin)
         return new ClimateState(
             on:       strtolower($b(0)) === '30',
             mode:     $wert(self::MODI, $b(1)),
@@ -112,14 +121,17 @@ final class ToshibaCloud implements IClimate
             outdoor:  (float) hexdec($b(9)),
             fan:      $wert(self::FANS, $b(3)),
             swing:    $wert(self::SWINGS, $b(4)),
-            preset:   (string) (array_search((string) $merit, self::PRESETS, true) ?: 'off'),
+            preset:   (string) (array_search($merit, self::PRESETS, true) ?: 'off'),
             ion:      strtolower($b(7)) === '18',
             humidity: -1.0,        // misst das Geraet nicht
             powerLevel: (int) (array_search(strtolower($b(5)), self::STUFEN, true) ?: -1),
-            // Byte 15 traegt die Selbstreinigung; ff heisst "nicht gesetzt".
-            // Die Bytes 10 bis 14 und 16 bis 18 sind unbelegt oder ihre
-            // Bedeutung ist nicht bekannt - hier wird nichts hineingedeutet.
-            selfClean: strtolower($b(15)) === 'ff' ? null : (strtolower($b(15)) !== '00'),
+            // Selbstreinigung steht in Byte 14, nicht 15: Merit A und B teilen
+            // sich Byte 6 als Halbbytes, wodurch sich alles Nachfolgende um
+            // eine Stelle verschiebt. 0x18 an, 0x10 aus, 0xff nicht vorhanden.
+            // Die Bytes 10 bis 13 und 15 bis 18 sind unbenutzt - auch in der
+            // Referenzbibliothek; hier wird nichts hineingedeutet.
+            selfClean: strtolower($b(14)) === 'ff' ? null : (strtolower($b(14)) === '18'),
+            fireplace: (string) (array_search($kaminNr, self::KAMIN, true) ?: 'off'),
             swingH:   '',
             light:    null,
             scheduled: null,
@@ -268,6 +280,26 @@ final class ToshibaCloud implements IClimate
         $h = self::STUFEN[$prozent] ?? null;
         return $h === null ? false : $this->byte(5, $h);
     }
+
+    /**
+     * Kaminmodus - das HOHE Halbbyte von Byte 6. Wie bei der Sonderfunktion
+     * muss das Nachbar-Halbbyte erhalten bleiben, sonst schaltet man beim
+     * Kamin ungewollt ECO ab.
+     */
+    public function setFireplace(string $modus): bool
+    {
+        $b = self::KAMIN[strtolower($modus)] ?? null;
+        if ($b === null) {
+            return false;
+        }
+        $hex = $this->zustandHex();
+        if ($hex === null) {
+            $this->log('Kaminmodus nicht gesetzt: Zustand nicht lesbar (Halbbyte unbekannt)');
+            return false;
+        }
+        $niedrig = hexdec(substr($hex, 12, 2)) & 0x0F;
+        return $this->byte(6, sprintf('%02x', ($b << 4) | $niedrig));
+    }
     public function setLight(bool $on): bool         { return false; }
     public function setScheduled(bool $folgen): bool { return false; }
 
@@ -316,7 +348,7 @@ final class ToshibaCloud implements IClimate
             return false;
         }
         $hoch = hexdec(substr($hex, 12, 2)) & 0xF0;
-        return $this->byte(6, sprintf('%02x', $hoch | (int) $a));
+        return $this->byte(6, sprintf('%02x', $hoch | $a));
     }
 
     /** Genau ein Byte setzen, alle uebrigen auf FF = unveraendert. */
