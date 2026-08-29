@@ -335,6 +335,18 @@ class HeatingZone extends EntityModule
         // Uebertragen.
         if ($c->ident === 'Presence') {
             $this->selectDeviceProfile($drv, (int) $value);
+            // Ein Geraet mit nur EINEM Speicherplatz (CC-TC, RT-DN) kennt keinen
+            // Zeiger - dort IST die Praesenzwahl das Uebertragen des Plans. Das ist
+            // eine ausdrueckliche Ansage des Nutzers, kein Routinedurchlauf: sie
+            // darf weder an der Erstberuehrungs-Sperre noch an einer laufenden
+            // Ruhezeit haengenbleiben. Der Merker wird beim naechsten Durchlauf
+            // ausgewertet und dort geloescht.
+            $caps = $drv->capabilities();
+            if ((int) ($caps['deviceProfiles'] ?? 1) < 2) {
+                $rt = $this->readRt();
+                $rt['pushAnsage'] = $this->activeVariant();
+                $this->writeRt($rt);
+            }
         }
 
         // Praesenz-/Modus-Wechsel: Zeitplan sofort anwenden (device: Push,
@@ -864,14 +876,28 @@ class HeatingZone extends EntityModule
         }
         $hash = md5($variant . '|' . json_encode($week));
         $rt   = $this->readRt();
-        // Je Variante ein eigener Merker: das Geraet fuehrt drei Profile (P1..P3),
-        // und ein Wechsel der Praesenz darf nicht wie ein geaenderter Plan aussehen.
+        // Der Merker gehoert an den GERAETESPEICHERPLATZ, nicht an die Variante.
+        // Ein TC-IT fuehrt drei Profile (P1..P3) - dort hat jede Variante ihren
+        // eigenen Platz und einen eigenen Merker, sonst saehe ein Praesenzwechsel
+        // wie ein geaenderter Plan aus. Ein CC-TC oder RT-DN hat aber nur EINEN
+        // Platz, den sich alle Varianten teilen: ein Merker je Variante behauptet
+        // dort "schon aktuell", waehrend im Geraet laengst der Plan einer anderen
+        // Praesenz liegt. Gemessen am 29.08.2026 an der Kueche - nach Normal und
+        // zurueck auf Abgesenkt lief das Geraet weiter mit dem Normal-Plan.
+        $einSlot    = (int) ($caps['deviceProfiles'] ?? 1) < 2;
+        $schluessel = $einSlot ? '*' : $variant;
+        $ansage     = $einSlot && ((string) ($rt['pushAnsage'] ?? '') === $variant);
+
         $bekannt = is_array($rt['pushHashes'] ?? null) ? $rt['pushHashes'] : [];
-        $vorher  = (string) ($bekannt[$variant] ?? '');
+        $vorher  = (string) ($bekannt[$schluessel] ?? '');
         if ($vorher === $hash) {
+            if ($ansage) {
+                unset($rt['pushAnsage']);
+                $this->writeRt($rt);
+            }
             return; // schon aktuell - ohne einen einzigen Netzzugriff
         }
-        if ((int) ($rt['pushNext'] ?? 0) > time()) {
+        if (!$ansage && (int) ($rt['pushNext'] ?? 0) > time()) {
             return; // nach einem Fehlschlag erst wieder nach einer Ruhezeit
         }
         if (!$this->ccuSlotFrei()) {
@@ -894,9 +920,9 @@ class HeatingZone extends EntityModule
             return;
         }
         if (self::wochenGleich($imGeraet, $week)) {
-            $bekannt[$variant] = $hash;
-            $rt['pushHashes']  = $bekannt;
-            unset($rt['pushNext']);
+            $bekannt[$schluessel] = $hash;
+            $rt['pushHashes']     = $bekannt;
+            unset($rt['pushNext'], $rt['pushAnsage']);
             $this->writeRt($rt);
             $this->ccuSlotSchliessen();
             $this->SendDebug('HSHT.push', 'Geraet fuehrt den Plan bereits (' . $variant . ')', 0);
@@ -910,7 +936,7 @@ class HeatingZone extends EntityModule
         // ungefragt fuer 23 Zonen auf einmal; genau das ist am 23.08. passiert.
         // Also: vermerken, sichtbar machen, und die Entscheidung dem Menschen
         // lassen (`syncToDevice` schreibt, `adoptDevice` uebernimmt).
-        if ($modus === 1 && $vorher === '') {
+        if ($modus === 1 && $vorher === '' && !$ansage) {
             $ab = is_array($rt['pushDiff'] ?? null) ? $rt['pushDiff'] : [];
             $ab[$variant] = time();
             $rt['pushDiff'] = $ab;
@@ -926,10 +952,10 @@ class HeatingZone extends EntityModule
         // geschrieben, und das ist bei einem TC-IT immer P1 - der Abgesenkt-Plan
         // waere im Normal-Profil gelandet.
         if ($drv->writeWeekProfile($week, $pi)) {
-            $bekannt[$variant] = $hash;
-            $rt['pushHashes']  = $bekannt;
-            $rt['pushHash']    = $hash;
-            unset($rt['pushNext']);
+            $bekannt[$schluessel] = $hash;
+            $rt['pushHashes']     = $bekannt;
+            $rt['pushHash']       = $hash;
+            unset($rt['pushNext'], $rt['pushAnsage']);
             if (is_array($rt['pushDiff'] ?? null)) {
                 unset($rt['pushDiff'][$variant]);
             }
@@ -1015,19 +1041,23 @@ class HeatingZone extends EntityModule
         $hash    = md5($variant . '|' . json_encode($week));
         $rt      = $this->readRt();
         $bekannt = is_array($rt['pushHashes'] ?? null) ? $rt['pushHashes'] : [];
+        // Denselben Schluessel wie pushWeekIfChanged verwenden, sonst meldet die
+        // Diagnose bei Einzelprofil-Geraeten einen Merker, den der Abgleich gar
+        // nicht liest - und der Seed legte ihn an die falsche Stelle.
+        $schluessel = ((int) ($caps['deviceProfiles'] ?? 1) < 2) ? '*' : $variant;
         $leer    = $this->weekIsEmpty($week);
         $dev     = $leer ? [] : $drv->readWeekProfile($pi);
         $gleich  = ($dev !== [] && self::wochenGleich($dev, $week));
         if ($seed && $gleich) {
-            $bekannt[$variant] = $hash;
-            $rt['pushHashes']  = $bekannt;
+            $bekannt[$schluessel] = $hash;
+            $rt['pushHashes']     = $bekannt;
             unset($rt['pushNext']);
             $this->writeRt($rt);
         }
         $antwort = [
             'ok' => true, 'variante' => $variant, 'praesenz' => $pi, 'planLeer' => $leer,
             'geraetGelesen' => $dev !== [], 'gleich' => $gleich,
-            'geseedet' => ($seed && $gleich), 'merkerPasst' => (($bekannt[$variant] ?? '') === $hash),
+            'geseedet' => ($seed && $gleich), 'merkerPasst' => (($bekannt[$schluessel] ?? '') === $hash),
             'schreibmodus' => $this->weekWriteMode(),
             // Worauf zeigt das GERAET gerade? Beim Scharfstellen zieht der Abgleich
             // den Zeiger auf die Praesenz des Moduls - das ist ein echter Eingriff
