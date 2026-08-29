@@ -34,8 +34,25 @@ final class TadoCloud implements IClimate
 {
     private const API       = 'https://my.tado.com/api/v2';
     private const TOKEN_URL = 'https://login.tado.com/oauth2/token';
-    private const CLIENT_ID = '1bb50063-6b0c-4d11-bd99-387f4a91cc46';
-    private const VORLAUF   = 300;   // Sekunden vor Ablauf erneuern
+    /* Client-Kennung der tado-App statt der oeffentlichen Drittanbieter-Kennung.
+     *
+     * Die oeffentliche Kennung 1bb50063-... ist seit 27.01.2026 auf ein
+     * Tagesbudget gedeckelt (gemessen 1000 Anfragen, Kopf "RateLimit-Policy").
+     * Fuer die App-Kennung gilt das nicht: dieselbe Abfrage lief am 29.08.2026
+     * mit HTTP 200 durch, waehrend das Budget der alten Kennung bei r=0 stand,
+     * und die Antwort trug ueberhaupt keinen RateLimit-Kopf mehr.
+     *
+     * Der Ablauf ist aus einem Charles-Mitschnitt der iPhone-App nachgebaut:
+     * Autorisierungscode mit PKCE, ohne Client-Geheimnis. Geraetecode und
+     * Passwort-Weg sind fuer diesen Client serverseitig abgeschaltet.
+     */
+    private const CLIENT_ID = 'eec8b609-9e2d-4403-9336-4f62a475271e';
+    private const TENANT    = '1d543ad5-a8ac-4704-b9e2-26838b4d6513';
+    private const REDIR     = 'tado://auth/redirect';
+    private const SCOPE     = 'home.user offline_access';
+    private const UA        = 'tado/15158 CFNetwork/3860.700.1 Darwin/25.6.0';
+    private const AUTH_URL  = 'https://login.tado.com/oauth2/authorize';
+    private const VORLAUF   = 300;   // Sekunden vor Ablauf erneuern (Token gilt 1800 s)
 
     /** sprechend <-> tado */
     private const MODI  = ['auto' => 'AUTO', 'cool' => 'COOL', 'heat' => 'HEAT',
@@ -105,10 +122,11 @@ final class TadoCloud implements IClimate
             ion: false, indoor: true, outdoor: false,
             humidity: true, swingsH: $schwenkH, light: $licht, schedule: true,
             powerLevels: [], running: true, presence: true, selfClean: false,
-            // Kontingent 1000 Anfragen je Tag (gemessen 29.08.2026). Mit der
-            // Sammelabfrage ist EINE Anfrage je Takt noetig: 180 s ergeben 480
-            // Anfragen taeglich und lassen die Haelfte fuer Schaltbefehle frei.
-            pollSeconds: 180
+            // Mit der App-Kennung gilt kein Tagesbudget mehr (siehe CLIENT_ID).
+            // Zwei Minuten sind fuer Raumtemperaturen reichlich; die
+            // Sammelabfrage holt dabei alle Zonen in EINER Anfrage, und
+            // unveraenderte Antworten kosten dank ETag nur ein 304.
+            pollSeconds: 120
         ))->toArray();
         // Kam die Abfrage nicht durch (z. B. Kontingent leer), ist das hier nur
         // der Notbehelf - ALLE Modi und Luefterstufen. Den 24 Stunden lang
@@ -146,7 +164,7 @@ final class TadoCloud implements IClimate
      * anderen Endpunkt.
      */
     private const ABLAGE = '/var/lib/symcon/scripts/data/tado-';
-    private const FRISCH = 150;      // Sekunden, die die Ablage als aktuell gilt
+    private const FRISCH = 100;      // Sekunden, die die Ablage als aktuell gilt (< Takt)
 
     private function zonen(): ?array
     {
@@ -385,6 +403,103 @@ final class TadoCloud implements IClimate
      * Gueltiger Zugriffstoken, vorsorglich erneuert.
      * Leerer String = keine Anmeldung; dann hilft nur eine neue Registrierung.
      */
+    /**
+     * Vollstaendige Neuanmeldung mit hinterlegten Zugangsdaten.
+     *
+     * Nachgebaut aus dem Charles-Mitschnitt der iPhone-App: der Anmeldeserver
+     * ist ein FusionAuth, die Zugangsdaten gehen als loginId/password an
+     * POST /oauth2/authorize, danach laeuft eine Weiterleitungskette ueber
+     * complete-registration und consent bis zur Rueckleitung tado://auth/redirect
+     * mit dem Autorisierungscode. Ohne Client-Geheimnis, dafuer mit PKCE.
+     *
+     * Liefert den frischen Zugriffstoken oder '' - dann bleibt es beim alten.
+     */
+    private function neuAnmelden(): string
+    {
+        $benutzer = trim((string) $this->wert('benutzerVid', ''));
+        $kennwort = (string) $this->wert('kennwortVid', '');
+        if ($benutzer === '' || $kennwort === '') {
+            $this->log('keine Zugangsdaten hinterlegt - Neuanmeldung nicht moeglich');
+            return '';
+        }
+        $b64 = static fn(string $r): string => rtrim(strtr(base64_encode($r), '+/', '-_'), '=');
+        $pruefer   = $b64(random_bytes(40));
+        $forderung = $b64(hash('sha256', $pruefer, true));
+        $zustand   = $b64(random_bytes(16));
+        $kekse     = tempnam(sys_get_temp_dir(), 'tado');
+        $ziel      = '';
+
+        $ruf = function (string $verb, string $url, ?array $form) use ($kekse, &$ziel): int {
+            $ziel = '';
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL            => $url,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_COOKIEFILE     => $kekse,
+                CURLOPT_COOKIEJAR      => $kekse,
+                CURLOPT_TIMEOUT        => 25,
+                CURLOPT_USERAGENT      => self::UA,
+                CURLOPT_HTTPHEADER     => ['Accept: */*', 'X-Amzn-Trace-Id: tado=iOS-15158'],
+                CURLOPT_HEADERFUNCTION => function ($c, $z) use (&$ziel) {
+                    if (stripos(trim($z), 'location:') === 0) { $ziel = trim(substr(trim($z), 9)); }
+                    return strlen($z);
+                },
+            ]);
+            if ($form !== null) {
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($form));
+                curl_setopt($ch, CURLOPT_HTTPHEADER,
+                    ['Content-Type: application/x-www-form-urlencoded', 'Accept: */*',
+                     'X-Amzn-Trace-Id: tado=iOS-15158']);
+            }
+            $a = curl_exec($ch);
+            $c = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            return $c;
+        };
+
+        $gemein = ['client_id' => self::CLIENT_ID, 'code_challenge' => $forderung,
+                   'code_challenge_method' => 'S256', 'redirect_uri' => self::REDIR,
+                   'response_type' => 'code', 'scope' => self::SCOPE, 'state' => $zustand];
+        $ruf('GET', self::AUTH_URL . '?' . http_build_query($gemein), null);
+        $ruf('POST', self::AUTH_URL, $gemein + [
+            'tenantId' => self::TENANT, 'timezone' => 'Europe/Vienna',
+            'metaData.device.name' => 'iPhone/iPod Safari', 'metaData.device.type' => 'BROWSER',
+            'userVerifyingPlatformAuthenticatorAvailable' => 'true',
+            'loginId' => $benutzer, 'password' => $kennwort]);
+
+        $code = '';
+        for ($n = 0; $n < 8 && $ziel !== ''; $n++) {
+            if (stripos($ziel, self::REDIR) === 0) {
+                parse_str((string) parse_url($ziel, PHP_URL_QUERY), $q);
+                $code = (string) ($q['code'] ?? '');
+                break;
+            }
+            $ruf('GET', ($ziel[0] === '/' ? 'https://login.tado.com' . $ziel : $ziel), null);
+        }
+        if ($code === '') {
+            @unlink($kekse);
+            $this->log('Neuanmeldung: kein Autorisierungscode erhalten');
+            return '';
+        }
+        $antwort = $this->http('POST', self::TOKEN_URL, null, null, $c2, [], http_build_query([
+            'scope' => self::SCOPE, 'grant_type' => 'authorization_code',
+            'client_id' => self::CLIENT_ID, 'redirect_uri' => self::REDIR,
+            'code' => $code, 'code_verifier' => $pruefer]));
+        @unlink($kekse);
+        $d = json_decode((string) $antwort, true);
+        if (!isset($d['access_token'], $d['refresh_token'])) {
+            $this->log('Neuanmeldung: Tausch fehlgeschlagen (HTTP ' . $c2 . ')');
+            return '';
+        }
+        $this->setze('refreshVid', (string) $d['refresh_token']);
+        $this->setze('accessVid',  (string) $d['access_token']);
+        $this->setze('expiresVid', time() + (int) ($d['expires_in'] ?? 1800));
+        $this->log('Neuanmeldung gelungen');
+        return (string) $d['access_token'];
+    }
+
     private function token(): string
     {
         $ablauf = (int) $this->wert('expiresVid', 0);
@@ -418,7 +533,8 @@ final class TadoCloud implements IClimate
         }
         $refresh = (string) $this->wert('refreshVid', '');
         $antwort = $this->http('POST', self::TOKEN_URL
-            . '?client_id=' . self::CLIENT_ID . '&grant_type=refresh_token&refresh_token=' . urlencode($refresh),
+            . '?client_id=' . self::CLIENT_ID . '&grant_type=refresh_token&scope=' . rawurlencode(self::SCOPE)
+            . '&refresh_token=' . urlencode($refresh),
             null, null, $code);
         $d = json_decode((string) $antwort, true);
         if ($code !== 200 || !isset($d['access_token'], $d['refresh_token'])) {
@@ -427,9 +543,19 @@ final class TadoCloud implements IClimate
             // 429 heisst gedrosselt, NICHT verbrannt - der Refresh-Token gilt
             // weiter. Eine Aufforderung zur Neuregistrierung waere hier falsch
             // und wuerde zu einer unnoetigen Browser-Bestaetigung verleiten.
+            if ($code >= 400 && $code < 500 && $code !== 429) {
+                // Refresh-Token verbrannt. Frueher hiess das: der Nutzer muss
+                // im Browser neu bestaetigen. Mit hinterlegten Zugangsdaten
+                // meldet sich der Treiber selbst wieder an - genau dafuer
+                // liegen Benutzer und Kennwort im Baum.
+                $this->log('Erneuerung fehlgeschlagen (HTTP ' . $code . ') - melde neu an');
+                $frisch = $this->neuAnmelden();
+                if ($frisch !== '') {
+                    return $frisch;
+                }
+            }
             $this->log('Erneuerung fehlgeschlagen (HTTP ' . $code . ')'
-                . ($code === 429 ? ' - gedrosselt, spaeter erneut'
-                   : (($code >= 400 && $code < 500) ? ' - neu registrieren' : ' - naechster Versuch folgt')));
+                . ($code === 429 ? ' - gedrosselt, spaeter erneut' : ' - naechster Versuch folgt'));
             return $zugriff;   // notfalls den alten probieren
         }
         // ZUERST ablegen, dann weiterarbeiten.
@@ -462,9 +588,13 @@ final class TadoCloud implements IClimate
         return is_array($d) ? $d : [];
     }
 
-    private function http(string $verb, string $url, ?array $daten, ?string $token, ?int &$code, array $zusatz = [])
+    private function http(string $verb, string $url, ?array $daten, ?string $token, ?int &$code, array $zusatz = [], ?string $formular = null)
     {
-        $kopf = array_merge(['Content-Type: application/json'], $zusatz);
+        // Wie die App auftreten, nicht nur mit ihrer Kennung: Kennzeichner und
+        // Ablaufmarke gehen bei jeder Anfrage mit.
+        $kopf = array_merge(['Content-Type: application/json',
+                             'Accept: application/json, text/plain, */*',
+                             'X-Amzn-Trace-Id: tado=iOS-15158'], $zusatz);
         if ($token !== null && $token !== '') {
             $kopf[] = 'Authorization: Bearer ' . $token;
         }
@@ -476,8 +606,14 @@ final class TadoCloud implements IClimate
             CURLOPT_HTTPHEADER     => $kopf,
             CURLOPT_TIMEOUT        => 20,
             CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_USERAGENT      => self::UA,
         ]);
-        if ($daten !== null) {
+        if ($formular !== null) {
+            // Der Anmeldeserver nimmt nur Formularkodierung, kein JSON.
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $formular);
+            curl_setopt($ch, CURLOPT_HTTPHEADER,
+                array_merge(['Content-Type: application/x-www-form-urlencoded'], $zusatz));
+        } elseif ($daten !== null) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($daten));
         }
         // Den Kontingent-Kopf mitlesen: er nennt Restanfragen und die Sekunden
