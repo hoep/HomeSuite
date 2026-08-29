@@ -222,6 +222,24 @@ final class ToshibaCloud implements IClimate
                 return false;
             }
         }
+
+        /* Zweite Sperre, die auch bei MISSLUNGENER Anmeldung greift.
+         *
+         * Die Sperre oben haengt am Zeitstempel des Tokens - der aendert sich nur
+         * bei Erfolg. Scheitert die Anmeldung, merkt sich also niemand etwas, und
+         * beide Instanzen versuchen es beim naechsten Takt erneut. Genau so ist am
+         * 29.08.2026 eine Sperre bei Toshiba entstanden, die auch achtzehn Minuten
+         * spaeter noch "Too many requests" lieferte - die angegebenen 60 Sekunden
+         * sind nicht woertlich zu nehmen. Der Versuch wird deshalb in einer Datei
+         * vermerkt, gemeinsam fuer alle Instanzen, und zwar VOR dem Aufruf.
+         */
+        $marke = '/var/lib/symcon/scripts/data/toshiba-anmeldung.zeit';
+        $letzt = (int) @file_get_contents($marke);
+        if ($letzt > 0 && (time() - $letzt) < 900) {
+            $this->log('Anmeldung uebersprungen - letzter Versuch vor ' . (time() - $letzt) . ' s');
+            return false;
+        }
+        @file_put_contents($marke, (string) time());
         $u = (string) $this->varWert('userVid');
         $p = (string) $this->varWert('passVid');
         if ($u === '' || $p === '') {
