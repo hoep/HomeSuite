@@ -1190,6 +1190,75 @@ abstract class EntityModule extends \IPSModule
     }
 
     /**
+     * Leitet aus den `options` eines select-Controls ein IPS-Variablenprofil ab
+     * und gibt dessen Namen zurueck ('' wenn nicht moeglich).
+     *
+     * Der Name ist bewusst je Domaene und Ident stabil (`HS.<domain>.<Ident>`):
+     * alle Zonen einer Domaene teilen dieselben Beschriftungen, also genuegt EIN
+     * Profil fuer alle Instanzen - und ein spaeter umbenannter Eintrag wirkt
+     * ueberall zugleich. Idempotent: die Verknuepfungen werden nur geschrieben,
+     * wenn sie tatsaechlich abweichen.
+     */
+    private function profilAusOptionen(Control $c, array $descriptor = []): string
+    {
+        // Nur ganzzahlige Auswahlen; ein Profil ist an den Variablentyp gebunden.
+        if ($c->options === [] || (int) $c->varType !== 1) {
+            return '';
+        }
+        $m      = $this->manifest();
+        $domain = (string) ($m['domain'] ?? '');
+        if ($domain === '' || $c->ident === '') {
+            return '';
+        }
+        $name = 'HS.' . $domain . '.' . $c->ident;
+
+        // Ein Modul, dessen Beschriftungen der Nutzer je Instanz aendern darf,
+        // haengt seine InstanzID an (`profileSuffix`). Solange die Vorgabe gilt,
+        // teilen sich alle Zonen EIN Profil - die Profilliste bleibt aufgeraeumt,
+        // und erst eine echte Umbenennung erzeugt ein eigenes.
+        $suffix = (string) ($descriptor['profileSuffix'] ?? '');
+        if ($suffix !== '') {
+            $name .= '.' . $suffix;
+        }
+
+        // Soll-Verknuepfungen aus dem Manifest.
+        $soll = [];
+        foreach ($c->options as $opt) {
+            if (!is_array($opt) || !array_key_exists('value', $opt)) {
+                continue;
+            }
+            $soll[] = [(int) $opt['value'], (string) ($opt['label'] ?? $opt['value'])];
+        }
+        if ($soll === []) {
+            return '';
+        }
+
+        if (!@IPS_VariableProfileExists($name)) {
+            if (!@IPS_CreateVariableProfile($name, 1)) {
+                return '';
+            }
+            @IPS_SetVariableProfileIcon($name, (string) ($m['icon'] ?? ''));
+        } elseif ((int) (@IPS_GetVariableProfile($name)['ProfileType'] ?? 1) !== 1) {
+            return ''; // Fremdprofil gleichen Namens: nicht anfassen.
+        }
+
+        // Nur bei echter Abweichung schreiben - ApplyChanges laeuft oft.
+        $ist = [];
+        foreach ((array) (@IPS_GetVariableProfile($name)['Associations'] ?? []) as $a) {
+            $ist[] = [(int) $a['Value'], (string) $a['Name']];
+        }
+        if ($ist !== $soll) {
+            foreach ($ist as $a) {
+                @IPS_SetVariableProfileAssociation($name, $a[0], '', '', -1);
+            }
+            foreach ($soll as $a) {
+                @IPS_SetVariableProfileAssociation($name, $a[0], $a[1], '', -1);
+            }
+        }
+        return $name;
+    }
+
+    /**
      * Legt fuer jedes Manifest-Control die Statusvariable an und aktiviert bei
      * actionable Controls die native RequestAction (auch fuer command! F5).
      */
@@ -1205,6 +1274,23 @@ abstract class EntityModule extends \IPSModule
             }
             $c = Control::fromArray($descriptor);
             $profile = $c->profile ?? '';
+
+            // Ein select-Control KENNT seine Beschriftungen - sie stehen als
+            // `options` im Manifest. Benutzt wurden sie bisher nur zum Pruefen
+            // des geschriebenen Wertes; ein Variablenprofil entstand nur, wenn
+            // der Deskriptor ausdruecklich eines nannte. Folge: die Variable
+            // stand profillos im Baum, und JEDE Oberflaeche ausserhalb der
+            // eigenen Kachel zeigte die nackte Zahl - Konsole, App, Alexa.
+            //
+            // Abgeleitet wird nur auf ANSAGE (`deriveProfile`), nicht fuer jedes
+            // select: Auswahllisten wie die Radiofavoriten oder Wiedergabelisten
+            // einer Audiozone sind je Instanz verschieden UND veraenderlich. Ein
+            // gemeinsames Profil wuerden sich solche Zonen bei jedem
+            // ApplyChanges gegenseitig ueberschreiben. Feste Mengen sagen es zu.
+            if ($profile === '' && $c->type === ControlContract::T_SELECT
+                && !empty($descriptor['deriveProfile'])) {
+                $profile = $this->profilAusOptionen($c, $descriptor);
+            }
 
             switch ($c->varType) {
                 case 0:

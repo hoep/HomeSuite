@@ -93,6 +93,23 @@ class HeatingZone extends EntityModule
      */
     protected function entityLabel(): string { return 'Heizung'; }
 
+    /** Presence-Optionen aus den (ggf. umbenannten) Anzeigenamen. */
+    private function presenceOptions(): array
+    {
+        $out = [];
+        foreach ($this->presenceLabels() as $i => $t) {
+            $out[] = ['value' => $i, 'label' => $t];
+        }
+        return $out;
+    }
+
+    /** Eigenes Profil erst, wenn wirklich umbenannt wurde. */
+    private function presenceProfileSuffix(): string
+    {
+        return ($this->presenceLabels() === self::PRESENCE_VARIANTS)
+            ? '' : (string) $this->InstanceID;
+    }
+
     protected function manifest(): array
     {
         return [
@@ -131,16 +148,17 @@ class HeatingZone extends EntityModule
                         ['value' => 2, 'label' => 'Boost'],
                         ['value' => 3, 'label' => 'Frostschutz'],
                     ],
+                    'deriveProfile' => true,
                 ],
                 [
                     'ident' => 'Presence', 'type' => ControlContract::T_SELECT,
                     'role' => 'heating:presence', 'label' => 'Praesenz',
                     'varType' => 1, 'actionable' => true,
-                    'options' => [
-                        ['value' => 0, 'label' => 'Normal'],
-                        ['value' => 1, 'label' => 'Erweitert'],
-                        ['value' => 2, 'label' => 'Abgesenkt'],
-                    ],
+                    // Beschriftungen frei benennbar (Eigenschaft PresenceLabels);
+                    // solange die Vorgabe gilt, teilen sich alle Zonen ein Profil.
+                    'options'       => $this->presenceOptions(),
+                    'deriveProfile' => true,
+                    'profileSuffix' => $this->presenceProfileSuffix(),
                 ],
                 [
                     'ident' => 'Online', 'type' => ControlContract::T_REFLECT,
@@ -455,6 +473,37 @@ class HeatingZone extends EntityModule
         //   0 = nur auf Befehl   1 = bei Aenderung (Vorgabe)   2 = laufend
         // Siehe weekWriteMode() - die Begruendung steht dort.
         $this->RegisterPropertyInteger('WeekWrite', 1);
+        // Anzeigenamen der drei Praesenzen. Bewusst GETRENNT von den
+        // Wochenplan-Schluesseln (PRESENCE_VARIANTS): die Schluessel benennen
+        // die Plaene in ScheduleJson und liessen sich nicht umbenennen, ohne
+        // jeden Zeitplan zu migrieren. Leer = Vorgabe.
+        $this->RegisterPropertyString('PresenceLabels', '');
+    }
+
+    /**
+     * Anzeigenamen der Praesenzen (drei Stueck), Vorgabe = Wochenplan-Schluessel.
+     * @return string[]
+     */
+    private function presenceLabels(): array
+    {
+        // manifest() laeuft auch waehrend parent::Create(), also BEVOR die
+        // Eigenschaft registriert ist - dann gilt die Vorgabe.
+        try {
+            $roh = trim((string) $this->ReadPropertyString('PresenceLabels'));
+        } catch (\Throwable $e) {
+            return self::PRESENCE_VARIANTS;
+        }
+        $out = self::PRESENCE_VARIANTS;
+        if ($roh === '') {
+            return $out;
+        }
+        foreach (explode(',', $roh) as $i => $t) {
+            $t = trim($t);
+            if ($i < count($out) && $t !== '') {
+                $out[$i] = $t;
+            }
+        }
+        return $out;
     }
 
     /** Effektives Refresh-Intervall in Millisekunden aus QueryInterval (Boden 2s gegen Hot-Loop). */
@@ -641,6 +690,7 @@ class HeatingZone extends EntityModule
                 ['type' => 'SelectObject', 'name' => 'TargetId', 'caption' => 'Ziel (Variable bei generic, CCU-Instanz bei hm-*)'],
                 ['type' => 'SelectObject', 'name' => 'SensorId', 'caption' => 'Ist-Sensor (optional: Variable bzw. CCU-Instanz)'],
                 ['type' => 'NumberSpinner', 'name' => 'FrostTemp', 'caption' => 'Frostschutz-Solltemperatur (°C)', 'digits' => 1, 'minimum' => 3, 'maximum' => 15],
+                ['type' => 'ValidationTextBox', 'name' => 'PresenceLabels', 'caption' => 'Praesenz-Beschriftungen (drei, mit Komma; leer = Normal,Erweitert,Abgesenkt)'],
                 ['type' => 'CheckBox', 'name' => 'Armed', 'caption' => 'Scharf — schaltet real (sonst Schatten-Modus; Altsteuerung bleibt Regler)'],
             ],
             'actions' => [
