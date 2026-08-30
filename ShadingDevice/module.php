@@ -72,6 +72,8 @@ class ShadingDevice extends EntityModule
     /** Timer + Reconcile-Parameter. */
     private const TIMER_REFRESH  = 'Refresh';
     private const TIMER_MOVE      = 'MoveStop'; // Ein-Schuss: stoppt/settlet eine zeitbasierte Fahrt
+    /** Nach so vielen Sekunden ueber der Fahrdauer gilt der Fahrt-Merker als tot. */
+    private const MOVE_TOT_S      = 60;
     private const REFRESH_MS      = 30000;   // Reflect + Reconcile
     private const POS_TOLERANCE   = 3;        // % Drift, bevor gefahren wird
     private const SAFE_POS        = 0;        // Sturm-/Regen-sichere Position (offen/eingefahren)
@@ -2227,8 +2229,32 @@ class ShadingDevice extends EntityModule
         // Waehrend einer Fahrt wird deshalb nichts nachgeregelt - nur Sturm darf abbrechen.
         $rtMove = $this->readRt();
         if (!empty($rtMove['moving']) && empty($d['storm'])) {
-            $this->setBlock('');   // faehrt gerade - kein Hindernis, nur beschaeftigt
-            return;
+            /* Der Merker muss sich selbst heilen koennen.
+             *
+             * Zurueckgesetzt wird er sonst NUR vom MoveStop-Timer. Bleibt der
+             * einmal aus, kehrt jeder Abgleich hier sofort um - und weil nur ein
+             * Abgleich den Merker wieder loesen wuerde, ist die Instanz dauerhaft
+             * verklemmt. Genau so stand die Beschattung Balkon (#<ID>) vom
+             * 29.08.2026 13:50 bis zum 30.08. 21:21 still: MoveStop war dort NIE
+             * gelaufen, das Entscheidungsprotokoll brach mitten am Tag ab, und
+             * "Fahrbefehl steht an" stand 31 Stunden auf wahr, ohne dass je
+             * gefahren wurde. Die uebrigen sechzehn Rollos liefen normal weiter -
+             * es faellt also nicht auf, solange man nicht danebensteht.
+             *
+             * Eine Fahrt kann nicht laenger dauern als ihre eigene berechnete
+             * Dauer plus Reserve. Danach gilt der Merker als tot und wird
+             * abgeschlossen, statt ewig zu blockieren. */
+            $startTs = (int) ($rtMove['moveStartTs'] ?? 0);
+            $durS    = (int) ceil(((int) ($rtMove['moveDurMs'] ?? 0)) / 1000);
+            $frist   = $startTs + $durS + self::MOVE_TOT_S;
+            if ($startTs > 0 && time() > $frist) {
+                $this->SendDebug('HSSH.move', 'Fahrt-Merker seit ' . (time() - $startTs)
+                    . ' s gesetzt (Dauer war ' . $durS . ' s) - als tot behandelt und abgeschlossen', 0);
+                $this->finishMove(false);          // Position auf das Ziel, Merker frei
+            } else {
+                $this->setBlock('');   // faehrt gerade - kein Hindernis, nur beschaeftigt
+                return;
+            }
         }
         // Globaler Automatik-Schalter (Hub) aus -> keine Komfort-Automatik; Sturm/Safety bleibt.
         if (!$this->automationEnabled() && empty($d['storm'])) {

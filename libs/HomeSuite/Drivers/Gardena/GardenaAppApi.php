@@ -25,6 +25,10 @@ final class GardenaAppApi implements IDriver
     private ?string $token    = null;
     private string $provider  = 'husqvarna';
     private string $userId    = '';
+    private string $username  = '';
+    private string $password  = '';
+    private int $tokenAblauf  = 0;      // JWT-exp
+    private bool $loginVersucht = false;
 
     /** @var callable|null */
     private $send = null;
@@ -57,12 +61,98 @@ final class GardenaAppApi implements IDriver
         }
         $this->token    = (string) $j['token'];
         $this->provider = (string) ($j['provider'] ?? 'husqvarna');
-        // JWT-Payload (Teil 2, base64url) -> sub
+        $this->username = (string) ($j['username'] ?? '');
+        $this->password = (string) ($j['password'] ?? '');
+        // JWT-Payload (Teil 2, base64url) -> sub und exp
         $parts = explode('.', $this->token);
         if (count($parts) >= 2) {
             $pl = json_decode((string) base64_decode(strtr($parts[1], '-_', '+/')), true);
-            $this->userId = (string) ($pl['sub'] ?? $pl['user_id'] ?? '');
+            $this->userId      = (string) ($pl['sub'] ?? $pl['user_id'] ?? '');
+            $this->tokenAblauf = (int) ($pl['exp'] ?? 0);
         }
+        if ($this->tokenAblauf === 0) {
+            $this->tokenAblauf = (int) ($j['expiration'] ?? 0);
+        }
+    }
+
+    /** Ist der Token noch brauchbar? Fuenf Minuten Sicherheitsabstand. */
+    private function tokenGueltig(): bool
+    {
+        return $this->token !== null && $this->tokenAblauf > (time() + 300);
+    }
+
+    /**
+     * Token bei Bedarf erneuern.
+     *
+     * Der Husqvarna-Legacy-Token laeuft nach ZEHN TAGEN ab, und bis hierher hat
+     * ihn niemand erneuert: loadToken() las die Datei und fertig. Am 23.08.2026
+     * 11:35 lief er aus, danach scheiterte JEDER Gardena-Abruf still - die
+     * Geraete standen auf Online=false, die Messwerte froren ein, und weil die
+     * Online-Variable weiter geschrieben wurde, hat es auch die Cloud-Wache
+     * nicht gemeldet. Sieben Tage lang.
+     *
+     * Die Zugangsdaten liegen in derselben Datei, eine Neuanmeldung ist also
+     * moeglich. Sie wird HOECHSTENS EINMAL je Prozess versucht - sonst haemmert
+     * ein Poll-Timer bei anhaltendem Fehler im Minutentakt gegen die IAM.
+     */
+    private function tokenSichern(): bool
+    {
+        if ($this->tokenGueltig()) { return true; }
+        if ($this->loginVersucht) { return false; }
+        $this->loginVersucht = true;
+        if ($this->username === '' || $this->password === '') {
+            $this->lastError = 'no_credentials';
+            return false;
+        }
+        return $this->anmelden();
+    }
+
+    /** Anmeldung an der Husqvarna-IAM; Ergebnis zurueck in die Tokendatei. */
+    private function anmelden(): bool
+    {
+        $felder = ['data' => ['type' => 'token',
+            'attributes' => ['username' => $this->username, 'password' => $this->password]]];
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => 'https://iam-api.dss.husqvarnagroup.net/api/v3/token',
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => json_encode($felder),
+            CURLOPT_HTTPHEADER     => ['Accept: application/json', 'Content-Type: application/json'],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 20,
+            CURLOPT_CONNECTTIMEOUT => 10,
+        ]);
+        $roh  = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        $res = ($roh === false || $roh === '') ? null : json_decode((string) $roh, true);
+        $neu = $res['data']['id'] ?? null;
+        if ($code !== 201 && $code !== 200) { $this->lastError = 'login_http_' . $code; return false; }
+        if (empty($neu)) { $this->lastError = 'login_no_token'; return false; }
+
+        $this->token    = (string) $neu;
+        $this->provider = (string) ($res['data']['attributes']['provider'] ?? 'husqvarna');
+        $parts = explode('.', $this->token);
+        if (count($parts) >= 2) {
+            $pl = json_decode((string) base64_decode(strtr($parts[1], '-_', '+/')), true);
+            $this->userId      = (string) ($pl['sub'] ?? $pl['user_id'] ?? '');
+            $this->tokenAblauf = (int) ($pl['exp'] ?? 0);
+        }
+
+        // Zurueckschreiben, damit alle Instanzen und der naechste Lauf davon haben.
+        if ($this->tokenFile) {
+            $j = @json_decode((string) @file_get_contents($this->tokenFile), true);
+            if (!is_array($j)) { $j = []; }
+            $j['token']      = $this->token;
+            $j['provider']   = $this->provider;
+            $j['expiration'] = $this->tokenAblauf;
+            $j['erneuert']   = date('c');
+            @file_put_contents($this->tokenFile . '.tmp', json_encode($j, JSON_PRETTY_PRINT));
+            @chmod($this->tokenFile . '.tmp', 0600);
+            @rename($this->tokenFile . '.tmp', $this->tokenFile);
+        }
+        return true;
     }
 
     private function headers(?array $body): array
@@ -84,6 +174,9 @@ final class GardenaAppApi implements IDriver
      */
     private function req(string $method, string $path, array $query = [], ?array $body = null): array
     {
+        if (!$this->tokenSichern()) {
+            return ['code' => 0, 'body' => null];
+        }
         if (!$this->token || $this->userId === '') {
             return ['code' => 0, 'body' => null];
         }
@@ -106,6 +199,15 @@ final class GardenaAppApi implements IDriver
         $raw  = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
+        // 401 heisst: der Token gilt nicht mehr, obwohl sein Ablauf noch in der
+        // Zukunft liegt (zurueckgezogen, Passwort geaendert, Sitzung beendet).
+        // Genau einmal neu anmelden und den Aufruf wiederholen.
+        if ($code === 401 && !$this->loginVersucht) {
+            $this->loginVersucht = true;
+            if ($this->anmelden()) {
+                return $this->req($method, $path, $query, $body);
+            }
+        }
         if ($code >= 400 || $code === 0) {
             $this->lastError = 'http_' . $code;
         }
