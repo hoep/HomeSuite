@@ -988,8 +988,19 @@ final class HusqvarnaAppApi implements IMower
         if (is_array($msgList)) {
             foreach ($msgList as $m) {
                 $mc = ($v = $this->g($m, 'code')) !== null ? (int) $v : null;
+                // Husqvarna liefert die Zeitstempel der Meldungen als ORTSZEIT,
+                // kodiert als waere es UTC. Wer sie unbesehen als Unix-Zeit liest,
+                // rechnet den Versatz ein zweites Mal hinein - die Fehlerhistorie
+                // lag dadurch im Sommer zwei Stunden in der ZUKUNFT.
+                // Nachgewiesen am 02.09.2026 an zwei Ereignissen von Righty: der
+                // Zustand kippte laut Archiv um 19:15:12 und 19:20:13 auf "Fehler",
+                // die Historie meldete 21:14:52 und 21:19:59 - auf die Sekunde
+                // genau zwei Stunden spaeter. date('Z') statt einer festen Zahl,
+                // damit Winter- und Sommerzeit gleichermassen stimmen.
+                $mt = ($v = $this->g($m, 'time')) !== null ? (int) $v : null;
+                if ($mt !== null && $mt > 0) { $mt -= (int) date('Z', $mt); }
                 $messages[] = [
-                    'time' => ($v = $this->g($m, 'time')) !== null ? (int) $v : null,
+                    'time' => $mt,
                     'code' => $mc,
                     'text' => ($mc !== null) ? $this->errorText($mc) : null,
                 ];

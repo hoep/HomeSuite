@@ -130,9 +130,24 @@ function renderPositionMap($positions, $geofence = null, $activityColor = '#E91E
             border-radius: 50%;
         }
 
-        /* Leaflet-Attribution ausblenden (wie Original) */
+        /* Namensnennung der Kartenanbieter.
+           Sie war frueher ganz ausgeblendet ("wie im Original") - das ist bei Esri World
+           Imagery und OpenStreetMap-Kacheln aber nicht in Ordnung: beide verlangen die
+           Nennung. Sie steht deshalb wieder da, nur dezent - dieselbe Sprache wie in der
+           Sonnenszene und auf der Auto-Karte: klein, gedaempft, rechts unten, ohne den
+           weissen Kasten, den Leaflet von Haus aus darum zieht. */
         .leaflet-control-attribution {
-            display: none;
+            background: rgba(13, 19, 21, .58) !important;
+            color: #7e9198 !important;
+            font-size: 9px;
+            line-height: 1.25;
+            padding: 1px 5px;
+            border-radius: 4px 0 0 0;
+            box-shadow: none;
+        }
+        .leaflet-control-attribution a {
+            color: #8ba0a6 !important;
+            text-decoration: none;
         }
     </style>
 </head>
@@ -151,17 +166,24 @@ function renderPositionMap($positions, $geofence = null, $activityColor = '#E91E
         center: [{$centerLat}, {$centerLng}],
         zoom: {$zoomJs},
         maxZoom: 24,
-        attributionControl: false
+        attributionControl: true
     });
+    // Ohne Praefix steht dort sonst noch "Leaflet" - das ist der Bibliothek geschuldet,
+    // nicht den Kartendaten, und traegt fuer den Betrachter nichts bei.
+    map.attributionControl.setPrefix(false);
 
-    // Satellit (Esri World Imagery) - Default wie im Original
+    // Satellit (Esri World Imagery) - Default wie im Original.
+    // Die Nennung haengt AM LAYER, nicht an der Karte: dann wechselt sie mit, sobald
+    // ueber die Layer-Auswahl auf Strassen umgeschaltet wird.
     const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-        maxZoom: 24
+        maxZoom: 24,
+        attribution: 'Luftbild &copy; Esri, Maxar, Earthstar Geographics'
     });
 
     // Strassen (OpenStreetMap)
     const streets = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap-Mitwirkende'
     });
 
     satellite.addTo(map);
