@@ -57,6 +57,8 @@ class HomeSuiteHub extends EntityModule
     private const GUID_HSAU  = '{C4F2639D-2A87-453D-8175-B586BF605A38}'; // AudioZone parentless
     private const GUID_HSAUX = '{053E7017-584E-4F62-A246-EBA6CE3DE034}'; // AudioZone bridged
     private const GUID_HSIR  = '{D264A82B-DE31-45CC-8AF2-8F4C5D076508}'; // IrrigationCircuit
+    private const GUID_HSAC  = '{81B7257F-4B34-4024-89B3-98BC43E00E54}'; // ClimateZone (tado)
+    private const GUID_HSLTE = '{B7E1C3A4-5D62-4F08-9A1E-2C7D6B4F0E93}'; // LightDevice
     private const GUID_HSSP  = '{5598F752-886D-475F-91CE-5813A3C581E5}'; // HomeSuite Bereich (Struktur)
 
     /** Audio-Bridges (Splitter, type 2) — provisionierbar, aber keine Entitaeten. */
@@ -2587,8 +2589,18 @@ class HomeSuiteHub extends EntityModule
     /**
      * AUTOMATISCHE Domaenen-/Gewerk-Klassifikation eines (verlinkten) Rohobjekts
      * anhand seiner Variablen-Idents, Profile und des Moduls. Liefert die
-     * HomeSuite-Domaene (heating/shading/audio/irrigation) bzw. 'lighting' (noch
-     * ohne Modul, aber erkennbar) oder '' wenn unklar. Loest Links auf.
+     * HomeSuite-Domaene oder '' wenn unklar. Loest Links auf.
+     *
+     * Vergebene Werte, in der Reihenfolge der Pruefung:
+     *   audio    Modulname (Sonos/HEOS/MusicCast/Denon/AirPlay/Cast)
+     *   heating  SET_TEMPERATURE / ACTUAL_TEMPERATURE / Temperatur-Profil
+     *   shading  LEVEL + STOP|DIRECTION|SHUTTER, oder Rollo-/Jalousie-Profil
+     *   irrigation WATERING / IRRIGATION / VALVE_OPEN
+     *   security MELDER: STATE ohne Stellkanal, dafuer LOWBAT|INSTALL_TEST|ERROR
+     *   power    ENERGY_COUNTER|POWER|VOLTAGE|CURRENT, oder STATE + WORKING|INHIBIT ohne Dimmer
+     *   lighting Intensity-/Dimmer-/Brightness-Profil, sonst STATE mit Schalterprofil
+     * Die REIHENFOLGE traegt die Aussage: Melder und Steckdose muessen VOR der Lichtregel
+     * stehen, sonst schluckt deren STATE-Zweig beide.
      */
     private function classifyDomain(int $objId): string
     {
@@ -2667,9 +2679,43 @@ class HomeSuiteHub extends EntityModule
         if ($has('WATERING') || $has('IRRIGATION') || $has('VALVE_OPEN') || $prof('irrigation') || $prof('bewaess')) {
             return 'irrigation';
         }
+        // MELDER VOR LICHT.
+        //
+        // Ein Tuer-/Fensterkontakt, Rauch- oder Bewegungsmelder hat STATE mit einem
+        // Schalterprofil - und fiel damit in die Lichtregel darunter. Auf der Raumkarte
+        // stand "FS_Esszimmer · Kontakt [lighting]" (nachgemessen 05.09.2026).
+        // Der Unterschied ist nicht das STATE, sondern das FEHLEN eines Stellkanals:
+        // ein Melder MELDET, er schaltet nichts. HM-Sec-SCo fuehrt ERROR, INSTALL_TEST,
+        // LOWBAT und STATE - kein LEVEL, kein WORKING, kein INHIBIT. Ein Schaltaktor
+        // (HM-ES-PMSw1) hat dagegen WORKING und INHIBIT neben dem STATE.
+        // 'security' ist keine Erfindung: das SecurityCenter-Modul fuehrt dieselbe Domaene.
+        if ($has('STATE')
+            && !$has('LEVEL') && !$has('WORKING') && !$has('INHIBIT')
+            && !$has('ON_TIME') && !$has('RAMP_TIME')
+            && ($has('LOWBAT') || $has('INSTALL_TEST') || $has('ERROR'))) {
+            return 'security';
+        }
+        // STROM/STECKDOSE VOR LICHT.
+        //
+        // Ein einfacher Schaltaktor sah bisher aus wie eine Lampe: STATE mit Schalterprofil,
+        // und die Lichtregel darunter griff zu. In der Standort D hiessen deshalb die
+        // Steckdosen fuer Fernseher und IT "lighting". Zwei Merkmale trennen das sauber:
+        //   MESSKANAL  ENERGY_COUNTER / POWER / VOLTAGE / CURRENT - misst Strom, schaltet nichts
+        //   SCHALTAKTOR STATE zusammen mit WORKING oder INHIBIT, aber OHNE Dimmkanal
+        // Ein Dimmer (Intensity/Brightness-Profil) bleibt Licht - das ist der Fall, den die
+        // Lichtregel wirklich meint, und so sind die 21 verlinkten Dimmkanaele im Haus
+        // eingestuft (nachgemessen: ~Intensity.100 MIT Schaltaktion).
+        // Was an einer Steckdose haengt, sagt kein Datenpunkt. 'power' behauptet deshalb nur,
+        // was messbar ist: hier wird Strom geschaltet oder gemessen.
+        $dimmbar = $prof('intensity') || $prof('dimmer') || $prof('brightness');
+        if ($has('ENERGY_COUNTER') || $has('POWER') || $has('VOLTAGE') || $has('CURRENT')) {
+            return 'power';
+        }
+        if (!$dimmbar && $has('STATE') && ($has('WORKING') || $has('INHIBIT'))) {
+            return 'power';
+        }
         // Licht (noch kein HomeSuite-Modul, aber erkennbar -> spaeter nutzbar).
-        if ($prof('intensity') || $prof('dimmer') || $prof('brightness')
-            || ($has('STATE') && ($prof('switch') || $prof('~switch')))) {
+        if ($dimmbar || ($has('STATE') && ($prof('switch') || $prof('~switch')))) {
             return 'lighting';
         }
         return '';
@@ -2986,6 +3032,18 @@ class HomeSuiteHub extends EntityModule
             [self::GUID_HSAU,  'audio'],
             [self::GUID_HSAUX, 'audio'],
             [self::GUID_HSIR,  'irrigation'],
+            // ClimateZone fehlte hier. Die Instanzen gibt es laengst (sieben an den
+            // Auslandsstandorten), sie erben wie alle anderen von EntityModule - sie tauchten
+            // nur in der Raumtopologie nicht auf, weil diese Liste sie nicht kannte. Damit
+            // standen die Klimazonen unter Standort B/Standort C weder in einem Raum noch in
+            // 'unassigned': sie waren schlicht unsichtbar.
+            [self::GUID_HSAC,  'climate'],
+            // LightDevice fehlte aus demselben Grund wie die ClimateZone. Alle 42 Leuchten
+            // haengen laengst korrekt unter ihren HSSP-Raeumen, tauchten in der Topologie aber
+            // nur als verlinkte ROHGERAETE mit geratener Domaene auf - die HSLT-Entitaeten
+            // selbst nicht. Doppelungen entstehen dadurch nicht: ein Link traegt die ID des
+            // Zielgeraets, die Entitaet ihre eigene.
+            [self::GUID_HSLTE, 'lighting'],
         ];
     }
 

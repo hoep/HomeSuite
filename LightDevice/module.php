@@ -53,7 +53,10 @@ class LightDevice extends EntityModule
     protected function manifest(): array
     {
         return [
-            'domain' => 'light',
+            // 'lighting', nicht 'light': das ist der Wert, den classifyDomain im Hub seit jeher
+            // fuer verlinkte Rohgeraete liefert und auf den die Topologie schaut. Zwei
+            // Schreibweisen fuer dieselbe Domaene waren eine Stolperfalle (05.09.2026).
+            'domain' => 'lighting',
             'title'  => 'Licht',
             'icon'   => 'Bulb',
 
