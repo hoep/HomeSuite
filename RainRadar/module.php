@@ -91,6 +91,9 @@ class RainRadar extends IPSModule
             . "  'outputDir'      => \$out,\n"
             . "  'radarBaseUrl'   => IPS_GetProperty(\$IID, 'RadarUrl'),\n"
             . "  'hours'          => IPS_GetProperty(\$IID, 'Hours'),\n"
+            // 0 = Dateiname traegt oesterreichische Ortszeit (nachgemessen). Ausdruecklich gesetzt,
+            // damit der Wert nicht still an der Bibliotheks-Vorgabe haengt.
+            . "  'hourOffset'     => 0,\n"
             . "  'coordinates'    => [\$coord],\n"
             . "  'drawMarkers'    => (bool) IPS_GetProperty(\$IID, 'DrawMarkers'), 'markerColor' => [255,0,0], 'markerSize' => 10,\n"
             . "  'showDateTime'   => true, 'dateFormat' => 'd.m.y-H:i',\n"

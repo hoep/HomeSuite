@@ -81,6 +81,14 @@ class ShadingDevice extends EntityModule
     private const CAL_TIMEOUT     = 900;      // Kalibrier-Lock: Not-Aus nach 15 Min ohne Abschluss
 
     /** Umgebungs-Sensoren (Standort-Defaults; per config.env ueberschreibbar). */
+    /**
+     * Ab welcher Sonnenhoehe der waagrechte Strahlungssensor als Zeuge taugt.
+     * sin(12 Grad) = 0,2079. Darunter wird der zuletzt gueltige Klarheitsindex
+     * weitergetragen (siehe clearIndex), hoechstens CLEAR_HOLD_S lang.
+     */
+    private const CLEAR_EL_MIN_SIN = 0.2079;
+    private const CLEAR_HOLD_S     = 5400;   // 90 Minuten
+
     private const SUN_AZ_ID      = 15291;    // Azimut (Location #<ID>)
     private const SUN_EL_ID      = 45609;    // Elevation
     private const WIND_ID        = 58381;    // Wind (km/h)
@@ -2477,8 +2485,12 @@ class ShadingDevice extends EntityModule
             $off = (float) ($geo['brightnessOff'] ?? 0);
             if ($off > 0) { $geo['brightnessMin'] = $off; }
         }
+        // Die Helligkeitsschwelle wird mit der WIRKSAMEN Helligkeit geprueft, nicht mit
+        // dem Rohwert - siehe wirksameHelligkeit(): unterhalb von zwoelf Grad Sonnenhoehe
+        // ist der waagrechte Sensor kein gueltiger Zeuge fuer eine senkrechte Fassade.
+        $hell = $this->wirksameHelligkeit($inp['bright'] ?? null, $inp['el']);
         $rawSun = (is_array($geo) && $inp['el'] !== null)
-            ? $this->schedules()->evalGeo((float) ($inp['az'] ?? 0), (float) $inp['el'], (float) ($inp['bright'] ?? 0), $geo)
+            ? $this->schedules()->evalGeo((float) ($inp['az'] ?? 0), (float) $inp['el'], (float) ($hell ?? 0), $geo)
             : null;
         // Strahlungs-Gate: die Geometrie sagt, WO die Sonne steht - die Strahlung, OB sie
         // scheint. Bei geschlossener Decke faellt die Sonnenregel damit weg, obwohl der
@@ -2615,14 +2627,74 @@ class ShadingDevice extends EntityModule
      * traegt es nicht mehr, und ein durch die Division aufgeblasener Index wuerde dort
      * Beschattung rechtfertigen, wo kaum Energie ankommt.
      */
+    /**
+     * Die fuer die Fassade WIRKSAME Helligkeit.
+     *
+     * Dasselbe Problem wie beim Klarheitsindex, nur an der absoluten Schwelle: der
+     * waagrechte Strahlungssensor bricht bei flacher Sonne zusammen (gemessen am
+     * 04.09.2026 bei wolkenlosem Himmel von 250 auf 19 W/m2 zwischen 18:05 und 19:00,
+     * waehrend die Geometrie nur eine Halbierung hergibt). Fuer eine senkrechte
+     * Westwand ist das der Zeitpunkt der GROESSTEN Last - der Strahl trifft sie dann
+     * nahezu im rechten Winkel.
+     *
+     * Deshalb gilt oberhalb von zwoelf Grad der Messwert, darunter der zuletzt
+     * belastbare. Beendet wird die Beschattung dann nicht mehr von einem blinden
+     * Sensor, sondern von der Geometrie: der Elevationsschwelle des Sonnenprofils.
+     * Die 90 Minuten sind nur die Reissleine, falls die Sonne nie wieder hochkommt.
+     */
+    private function wirksameHelligkeit(?float $bright, ?float $elDeg): ?float
+    {
+        if ($bright === null || $elDeg === null) { return $bright; }
+        if (sin(deg2rad($elDeg)) > self::CLEAR_EL_MIN_SIN) {
+            $this->SetBuffer('brightLast', json_encode(['v' => $bright, 't' => time()]));
+            return $bright;
+        }
+        $letzt = json_decode((string) $this->GetBuffer('brightLast'), true);
+        if (is_array($letzt) && isset($letzt['v'], $letzt['t'])
+            && (time() - (int) $letzt['t']) <= self::CLEAR_HOLD_S) {
+            return (float) $letzt['v'];
+        }
+        return $bright;
+    }
+
     private function clearIndex(?float $ghi, ?float $elDeg): ?float
     {
         if ($ghi === null || $elDeg === null) { return null; }
         $s = sin(deg2rad($elDeg));
-        if ($s <= 0.05) { return null; }                       // ~3 Grad
-        $clear = 1098.0 * $s * exp(-0.057 / $s);               // Haurwitz-Klarhimmel (W/m²)
-        if ($clear < 50.0) { return null; }
-        return max(0.0, $ghi) / $clear;
+
+        // Unterhalb von CLEAR_EL_MIN ist der WAAGRECHTE Sensor kein gueltiger Zeuge mehr.
+        // Gemessen am 04.09.2026 bei wolkenlosem Himmel (die Kurve von 16:14 bis 18:05 ist
+        // glatt, ohne jede Zacke):
+        //
+        //     18:05   Elevation 10,0 Grad   Modell 137 W/m2   gemessen 250   Index 182 %
+        //     19:00   Elevation  5,9 Grad   Modell  64 W/m2   gemessen  19   Index  30 %
+        //
+        // Der gemessene Wert faellt auf ein Dreizehntel, das Modell nur auf die Haelfte -
+        // der Himmel hat sich nicht geaendert, der Sensor sieht die Sonne bei streifendem
+        // Einfall nicht mehr (Cosinus-Fehler bzw. Abschattung durch Gelaende und Dach).
+        //
+        // Fuer eine SENKRECHTE Fassade ist das der schlimmste denkbare Zeitpunkt zu
+        // verstummen: waehrend der waagrechte Sensor gegen null geht, trifft der Strahl
+        // die Westwand nahezu senkrecht. Deshalb wird der letzte belastbare Index
+        // WEITERGETRAGEN, statt in ein "keine Sonne" zu kippen, das nur ein Messartefakt
+        // ist. Wolken entstehen nicht aus dem Nichts in der letzten halben Stunde; und
+        // faellt die Strahlung wirklich weg, greift weiterhin die absolute W/m2-Schranke.
+        if ($s > self::CLEAR_EL_MIN_SIN) {
+            $clear = 1098.0 * $s * exp(-0.057 / $s);           // Haurwitz-Klarhimmel (W/m²)
+            if ($clear < 50.0) { return null; }
+            $kc = max(0.0, $ghi) / $clear;
+            $this->SetBuffer('clearLast', json_encode(['kc' => $kc, 't' => time()]));
+            return $kc;
+        }
+
+        $letzt = json_decode((string) $this->GetBuffer('clearLast'), true);
+        if (is_array($letzt) && isset($letzt['kc'], $letzt['t'])
+            && (time() - (int) $letzt['t']) <= self::CLEAR_HOLD_S) {
+            return (float) $letzt['kc'];
+        }
+        // Nichts Belastbares in Reichweite: wie bisher null - das Gate wird uebersprungen,
+        // nicht etwa negativ entschieden.
+        return null;
     }
 
     /** Sturm-/Regen-Lage aus den Umgebungssensoren (Regen nur wenn Wetterprofil rainClose). */
@@ -2715,20 +2787,46 @@ class ShadingDevice extends EntityModule
         return is_numeric($v) ? (float) $v : null;
     }
 
+    /**
+     * Eingefrorene Messwerte gelten als nicht vorhanden.
+     *
+     * Geprueft wurde bisher nur, ob die Variable EXISTIERT. Ein Fuehler, der vor
+     * Wochen verstummt ist, lieferte damit weiter seinen letzten Wert - und der
+     * ist genau dann falsch, wenn es darauf ankommt (Wind, Helligkeit, Regen).
+     * Nachweislich vorgekommen an #<ID> und #<ID>. null bedeutet fuer die
+     * aufrufende Regel "keine Angabe", nicht "Wert 0".
+     */
+    private const ENV_MAXALTER = 600;   // Sekunden
+
     private function envNum(string $key, int $def): ?float
     {
         $id = $this->envId($key, $def);
         if ($id <= 0 || !function_exists('IPS_VariableExists') || !@\IPS_VariableExists($id)) {
             return null;
         }
+        if (!$this->envFrisch($id)) {
+            return null;
+        }
         $v = @GetValue($id);
         return is_numeric($v) ? (float) $v : null;
+    }
+
+    /** Wurde die Variable in den letzten ENV_MAXALTER Sekunden geschrieben? */
+    private function envFrisch(int $id): bool
+    {
+        $v = @\IPS_GetVariable($id);
+        if (!is_array($v) || !isset($v['VariableUpdated'])) { return true; }   // im Zweifel gelten lassen
+        $u = (int) $v['VariableUpdated'];
+        return $u > 0 && (time() - $u) <= self::ENV_MAXALTER;
     }
 
     private function envBool(string $key, int $def): ?bool
     {
         $id = $this->envId($key, $def);
         if ($id <= 0 || !function_exists('IPS_VariableExists') || !@\IPS_VariableExists($id)) {
+            return null;
+        }
+        if (!$this->envFrisch($id)) {
             return null;
         }
         $v = @GetValue($id);

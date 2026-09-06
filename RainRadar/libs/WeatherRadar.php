@@ -345,14 +345,17 @@ class RainRadarEngine {   // eindeutiger Name (Legacy PHPRainRadar.php nutzt 'We
             // Aktuelle Zeit bestimmen
             $now = new DateTime();
             
-            // Sommerzeit prüfen
-            $isSummerTime = (int)date('I');
-            
-            // Stunden-Offset für Radar-URL berechnen (bei Sommerzeit -2, bei Winterzeit -1)
-            $hourOffset = $tempConfig['hourOffset'] !== null ? $tempConfig['hourOffset'] : ($isSummerTime ? 2 : 1);
-            
-            // Debug-Information
-            $this->log("Starte Verarbeitung von {$hours} Radarbildern. Sommerzeit: " . ($isSummerTime ? "Ja" : "Nein") . ", Stunden-Offset: {$hourOffset}", 'info');
+            // Stunden-Offset fuer die Radar-URL. FRUEHER: ($isSummerTime ? 2 : 1) - das unterstellte,
+            // GeoSphere benenne INCAL_VW1398 nach UTC. Tut sie NICHT: die Dateinamen tragen die
+            // OESTERREICHISCHE ORTSZEIT. Nachgemessen am 05.09.2026: Regenbeginn an der Station
+            // 08:15:51 MESZ; die Kachel um den Haus-Pixel ist in _0400 bis _0700 leer und erst in
+            // _0800/_0900 kraeftig blau. Mit Offset 2 lud der Lauf also zu jedem Zeitpunkt das Bild
+            // von vor zwei Stunden und beschriftete es mit der aktuellen Stunde - der Regen erschien
+            // dadurch durchgaengig zwei Stunden zu spaet. Richtig ist 0; nur eine ausdrueckliche
+            // Vorgabe in der Konfiguration weicht davon ab.
+            $hourOffset = $tempConfig['hourOffset'] !== null ? (int) $tempConfig['hourOffset'] : 0;
+
+            $this->log("Starte Verarbeitung von {$hours} Radarbildern. Stunden-Offset: {$hourOffset}", 'info');
             
             $successCount = 0;
             
