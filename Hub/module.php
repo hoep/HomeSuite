@@ -1634,24 +1634,62 @@ class HomeSuiteHub extends EntityModule
         $this->store()->set('_lightAutoState', $st);
     }
 
-    /** Wecken (L9): Szene anwenden + optional Audio-Zone starten (koppelt an AudioZone). */
+    /**
+     * Wecken (L9) — REIN AUDIO.
+     *
+     * Die Weckregel schaltet ausdruecklich KEIN Licht. Wer zum Wecken auch Licht
+     * will, legt dafuer eine eigene 'schedule'-Regel auf dieselbe Zeit; das
+     * Regelmodell ist genau dafuer gemacht, und beides in einer Regel zu buendeln
+     * hiesse, zwei Zwecke in ein Feld zu zwingen.
+     *
+     * Quelle als {kind, id}: damit sind Playlist und Favorit genauso erreichbar
+     * wie Radio. Frueher stand hier ein Platzhalter, der ausschliesslich
+     * playDirect(station) kannte und rampMin schlicht verworfen hat.
+     *
+     * Regel: {type:'wake', time, days[], audioZone, audioSource:{kind,id}|string,
+     *         volume?, rampMin?}
+     */
     private function applyWake(array $rule): void
     {
-        $sid = (string) ($rule['sceneId'] ?? '');
-        if ($sid !== '') {
-            $sc = $this->scenes()->get($sid);
-            if ($sc) {
-                $this->applyScene($sc);
-            }
-        }
         $az = (int) ($rule['audioZone'] ?? 0);
-        if ($az > 0 && @\IPS_InstanceExists($az) && function_exists('HSAU_Manage')) {
-            $src = (string) ($rule['audioSource'] ?? '');
-            $op = $src !== '' ? ['op' => 'radioNow'] : ['op' => 'radioNow']; // Platzhalter: Weck-Quelle
-            // Bewusst konservativ: nur wenn eine Weck-Quelle konfiguriert ist, spielen.
-            if ($src !== '') {
-                @\HSAU_Manage($az, json_encode(['op' => 'playDirect', 'args' => ['station' => $src]]));
-            }
+        if ($az <= 0 || !@\IPS_InstanceExists($az) || !function_exists('HSAU_Manage')) {
+            $this->LogMessage('Wecken: Audiozone ' . $az . ' nicht ansprechbar - nichts gestartet.', KL_WARNING);
+            return;
+        }
+
+        // Quelle: neues Format {kind,id}; eine blosse Zeichenkette bleibt als
+        // Radiosender gueltig, damit bestehende Regeln weiterlaufen.
+        $q = $rule['audioSource'] ?? '';
+        if (is_array($q)) {
+            $kind = (string) ($q['kind'] ?? 'station');
+            $id   = (string) ($q['id'] ?? '');
+        } else {
+            $kind = 'station';
+            $id   = (string) $q;
+        }
+        if ($id === '') {
+            $this->LogMessage('Wecken: keine Quelle konfiguriert - nichts gestartet.', KL_WARNING);
+            return;
+        }
+
+        $args = ['kind' => $kind, 'id' => $id];
+        if (isset($rule['volume']))  { $args['volume']  = (int) $rule['volume']; }
+        if (isset($rule['rampMin'])) { $args['rampMin'] = (int) $rule['rampMin']; }
+
+        $r = json_decode((string) @\HSAU_Manage($az, json_encode(['op' => 'wake', 'args' => $args])), true);
+        if (!is_array($r) || empty($r['ok'])) {
+            $this->LogMessage('Wecken fehlgeschlagen (Zone ' . $az . ', ' . $kind . ' ' . $id . '): '
+                . substr((string) json_encode($r), 0, 120), KL_WARNING);
+            return;
+        }
+
+        // Selbsttaetiges Ausschalten: der Wecker soll nicht bis zum Abend spielen.
+        // Dafuer gibt es den Sleep-Timer der Zone - kein zweiter Mechanismus, und er
+        // laesst sich am Geraet wie in der Oberflaeche jederzeit abbrechen.
+        // 0 oder fehlend = laeuft weiter, wie bisher.
+        $aus = (int) ($rule['offAfterMin'] ?? 0);
+        if ($aus > 0) {
+            @\HSAU_Manage($az, json_encode(['op' => 'setSleep', 'args' => ['minutes' => $aus]]));
         }
     }
 

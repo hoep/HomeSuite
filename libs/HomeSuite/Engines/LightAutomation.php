@@ -18,7 +18,11 @@ namespace Hoep\HomeSuite\Engines;
  *              sceneAction:'on'|'off' (Vorgabe 'on'),
  *              endTrigger:{...wie trigger...} (optional; feuert die GEGENrichtung)}
  *   circadian: {type:'circadian', devices:[iid,...], minK, maxK, minLevel, maxLevel}
- *   wake     : {type:'wake', time:'HH:MM', days:[...], sceneId, rampMin, audioZone, audioSource}
+ *   wake     : {type:'wake', time:'HH:MM', days:[...], audioZone,
+ *              audioSource:{kind:'station'|'playlist'|'favorite'|'uri'|'preset', id},
+ *              volume, rampMin, offAfterMin}  -- REIN AUDIO, schaltet kein Licht.
+ *              offAfterMin>0 setzt nach dem Start den Sleep-Timer der Zone. Licht zum
+ *              Wecken laeuft ueber eine eigene 'schedule'-Regel auf dieselbe Zeit.
  *   motion   : {type:'motion', sensor:iid|varId, lux:varId, luxMax, sceneOn|deviceOn, holdSec, off:'scene'|'devices'}
  *   presence : {type:'presence', awayVar:varId, from:'HH:MM', to:'HH:MM', devices:[iid,...], every:minMinutes}
  *

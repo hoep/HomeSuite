@@ -370,12 +370,12 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable, IAudioQueu
 
     public function listFavorites(): array
     {
-        return $this->browseList('FV:2');       // Sonos Favorites-Container
+        return $this->browseList('FV:2', 0, 100, AudioSourceRef::KIND_FAVORITE);
     }
 
     public function listPlaylists(): array
     {
-        return $this->browseList('SQ:');        // Sonos Playlists-Container
+        return $this->browseList('SQ:', 0, 100, AudioSourceRef::KIND_PLAYLIST);
     }
 
     public function browse(string $containerId, int $offset, int $limit): AudioBrowseResult
@@ -545,8 +545,15 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable, IAudioQueu
             . '<CurrentURIMetaData>' . $this->esc($didl) . '</CurrentURIMetaData>');
     }
 
-    /** ContentDirectory-Browse -> AudioSourceRef[] (title/uri). */
-    private function browseList(string $container, int $offset = 0, int $limit = 100): array
+    /**
+     * ContentDirectory-Browse -> AudioSourceRef[] (title/uri).
+     *
+     * $kind sagt, als WAS die Treffer zurueckkommen. Vorher stand hier fest
+     * KIND_FAVORITE - damit meldete listPlaylists() seine Ergebnisse als Favoriten,
+     * und ein Aufrufer konnte die beiden Listen nicht auseinanderhalten.
+     */
+    private function browseList(string $container, int $offset = 0, int $limit = 100,
+                               string $kind = AudioSourceRef::KIND_FAVORITE): array
     {
         $svc = 'urn:schemas-upnp-org:service:ContentDirectory:1';
         $resp = $this->soap($svc, 'Browse',
@@ -558,7 +565,7 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable, IAudioQueu
         $out = [];
         if (preg_match_all('~<item[^>]*id="([^"]*)"[^>]*>(.*?)</item>~s', $didl, $mm, PREG_SET_ORDER)) {
             foreach ($mm as $it) {
-                $out[] = new AudioSourceRef(AudioSourceRef::KIND_FAVORITE, $it[1],
+                $out[] = new AudioSourceRef($kind, $it[1],
                     $this->tag($it[2], 'dc:title'), $this->tag($it[2], 'res'));
             }
         }

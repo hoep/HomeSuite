@@ -183,6 +183,8 @@ class AudioZone extends EntityModule
                 ['op' => 'updateProfile',   'label' => 'Wochenplan bearbeiten'],
                 ['op' => 'getSchedule',     'label' => 'Wochenplan lesen'],
                 ['op' => 'configureSchedule', 'label' => 'Zeitplan-Optionen (Quelle/Volume/Ramp/Ruhezeit)'],
+                ['op' => 'sources',        'label' => 'Quellen auflisten (Favoriten/Playlists)'],
+                ['op' => 'wake',           'label' => 'Wecken: Quelle starten (Lautstaerke/Rampe)'],
                 ['op' => 'setSleep',        'label' => 'Sleep-Timer setzen'],
                 ['op' => 'cancelSleep',     'label' => 'Sleep-Timer abbrechen'],
                 ['op' => 'computeProbe',    'label' => 'Zeitplan/Regel-Vorschau (Trockenlauf)'],
@@ -606,22 +608,150 @@ class AudioZone extends EntityModule
 
     private function scheduleStart(int $slotVal, array $sc): void
     {
-        $drv = $this->driver();
+        // Der Wochenplan unterliegt der Ruhezeit-Absenkung: er ist Dauerbeschallung,
+        // kein Weckruf. Beim Wecken (mgmtWake) gilt das ausdruecklich NICHT.
         $target = $this->ruleVolumeCap($sc, max(0, min(100, (int) $sc['volume'])));
         $kind = $sc['sourceKind'];
         $sid  = ($sc['sourceId'] !== '') ? $sc['sourceId'] : (string) $slotVal;
+        $this->quelleStarten($kind, $sid, $target, (int) $sc['rampMin'], 'HSAU.sched');
+    }
 
-        if (!$drv instanceof IAudioRenderer || !(bool) $this->cfgVal('armed', false)) {
-            $this->SendDebug('HSAU.sched', 'Schatten: WUERDE starten (' . $kind . ' #' . $sid . ', vol ' . $target . ')', 0);
-            return;
+    /**
+     * Gemeinsamer Startvorgang: einschalten, Quelle setzen, Lautstaerke bzw. Rampe.
+     * Genutzt vom Wochenplan UND vom Wecken - damit beide Wege dasselbe tun.
+     *
+     * @return array{ok:bool,armed:bool,kind:string,id:string,volume:int,rampMin:int}
+     */
+    private function quelleStarten(string $kind, string $sid, int $volume, int $rampMin, string $tag,
+                                   string $uri = '', string $titel = ''): array
+    {
+        $volume = max(0, min(100, $volume));
+        $drv    = $this->driver();
+        $scharf = (bool) $this->cfgVal('armed', false);
+        if (!$drv instanceof IAudioRenderer || !$scharf) {
+            $this->SendDebug($tag, 'Schatten: WUERDE starten (' . $kind . ' #' . $sid . ', vol ' . $volume . ')', 0);
+            return ['ok' => true, 'armed' => $scharf, 'kind' => $kind, 'id' => $sid,
+                    'volume' => $volume, 'rampMin' => $rampMin, 'note' => 'Schatten'];
         }
         $this->applyPower(true, $drv);
-        $drv->playSource(new AudioSourceRef($kind, $sid));
-        if ((int) $sc['rampMin'] > 0) {
-            $this->startRamp($target, (int) $sc['rampMin']);
+        $drv->playSource(new AudioSourceRef($kind, $sid, $titel, $uri));
+        if ($rampMin > 0) {
+            $this->startRamp($volume, $rampMin);
         } else {
-            $drv->setVolume($target);
+            $drv->setVolume($volume);
         }
+        return ['ok' => true, 'armed' => true, 'kind' => $kind, 'id' => $sid,
+                'volume' => $volume, 'rampMin' => $rampMin];
+    }
+
+    /**
+     * Waehlbare Quellen der Zone: Favoriten und Playlists, wie der Player sie kennt.
+     *
+     * Nur LESEN - unabhaengig von 'armed', denn eine Auswahlliste schaltet nichts.
+     * Ergebnis absichtlich schlank ({id,title}), die Oberflaeche braucht nicht mehr.
+     *
+     * @return array{ok:bool,favorites:array,playlists:array}
+     */
+    private function mgmtSources(): array
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof IAudioRenderer) {
+            return ['ok' => false, 'error' => 'kein Treiber', 'favorites' => [], 'playlists' => []];
+        }
+        $abbild = static function (array $liste): array {
+            $out = [];
+            foreach ($liste as $ref) {
+                if (!($ref instanceof AudioSourceRef)) {
+                    continue;
+                }
+                $out[] = ['id' => $ref->id, 'title' => ($ref->title !== '' ? $ref->title : $ref->id)];
+            }
+            return $out;
+        };
+        try {
+            $fav = $abbild($drv->listFavorites());
+        } catch (\Throwable $e) {
+            $fav = [];
+        }
+        try {
+            $pl = $abbild($drv->listPlaylists());
+        } catch (\Throwable $e) {
+            $pl = [];
+        }
+        return ['ok' => true, 'favorites' => $fav, 'playlists' => $pl];
+    }
+
+    /**
+     * Eine Quelle der Zone anhand ihrer Kennung auffinden (Favorit/Playlist).
+     * Liefert den vollstaendigen Verweis samt Adresse - ohne die spielt der
+     * Player nichts ab.
+     */
+    private function quelleFinden(string $kind, string $id): ?AudioSourceRef
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof IAudioRenderer || $id === '') {
+            return null;
+        }
+        try {
+            $liste = ($kind === AudioSourceRef::KIND_PLAYLIST) ? $drv->listPlaylists() : $drv->listFavorites();
+        } catch (\Throwable $e) {
+            return null;
+        }
+        foreach ($liste as $ref) {
+            if ($ref instanceof AudioSourceRef && (string) $ref->id === $id) {
+                return $ref;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Wecken: Quelle starten mit ausdruecklicher Lautstaerke und optionaler Rampe.
+     *
+     * Bewusst OHNE die Ruhezeit-Absenkung des Wochenplans: ein Weckruf um 6:30 faellt
+     * in aller Regel in die Nachtabsenkung, und ein gedeckelter Weckruf weckt nicht.
+     * Wer leise geweckt werden will, setzt die Lautstaerke in der Regel niedrig oder
+     * benutzt die Rampe.
+     *
+     * args: {kind: favorite|playlist|station|uri|preset, id, volume?, rampMin?}
+     */
+    private function mgmtWake(array $args): array
+    {
+        $kind = (string) ($args['kind'] ?? AudioSourceRef::KIND_STATION);
+        $sid  = (string) ($args['id'] ?? '');
+        if ($sid === '') {
+            return ['ok' => false, 'error' => 'keine Weck-Quelle angegeben (id fehlt)'];
+        }
+        $erlaubt = [AudioSourceRef::KIND_FAVORITE, AudioSourceRef::KIND_PLAYLIST,
+                    AudioSourceRef::KIND_STATION, AudioSourceRef::KIND_URI, AudioSourceRef::KIND_PRESET];
+        if (!in_array($kind, $erlaubt, true)) {
+            return ['ok' => false, 'error' => 'unbekannte Quellenart: ' . $kind];
+        }
+        $sc  = $this->scheduleCfg();
+        $vol = isset($args['volume']) ? (int) $args['volume'] : (int) $sc['volume'];
+        $ramp = max(0, isset($args['rampMin']) ? (int) $args['rampMin'] : 0);
+
+        // RADIO braucht den Umweg ueber RadioNow: playSource() baut die Adresse aus
+        // $ref->uri, und ein blosser Senderschluessel ergaebe 'x-rincon-mp3radio://'
+        // OHNE Ziel - der Wecker wuerde still bleiben. streamUrl() loest den
+        // Schluessel auf, genau wie mgmtPlayDirect es tut.
+        if ($kind === AudioSourceRef::KIND_STATION) {
+            $url = RadioNow::streamUrl($sid);
+            if ($url === '') {
+                return ['ok' => false, 'error' => 'unbekannter Sender: ' . $sid];
+            }
+            $titel = (string) (RadioNow::all()[$sid]['title'] ?? 'Radio');
+            return $this->quelleStarten($kind, $sid, $vol, $ramp, 'HSAU.wake', $url, $titel);
+        }
+        // Favorit/Playlist: die Kennung allein genuegt dem Player nicht, er braucht
+        // die Adresse aus der Liste. Wird sie nicht gefunden, ist die Regel veraltet
+        // (Playlist umbenannt oder geloescht) - dann lieber ein klarer Fehler als
+        // stilles Nichtstun zur Weckzeit.
+        $ref = $this->quelleFinden($kind, $sid);
+        if ($ref === null) {
+            return ['ok' => false, 'error' => 'Quelle nicht gefunden: ' . $kind . ' ' . $sid];
+        }
+        return $this->quelleStarten($kind, $sid, $vol, $ramp, 'HSAU.wake', $ref->uri, $ref->title);
     }
 
     private function scheduleStop(array $sc): void
@@ -774,6 +904,10 @@ class AudioZone extends EntityModule
                 return $this->mgmtGetSchedule($args);
             case 'configureSchedule':
                 return $this->mgmtConfigureSchedule($args);
+            case 'sources':
+                return $this->mgmtSources();
+            case 'wake':
+                return $this->mgmtWake($args);
             case 'setSleep':
                 return $this->mgmtSetSleep($args);
             case 'cancelSleep':
