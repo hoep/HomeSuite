@@ -55,6 +55,13 @@ final class ScheduleEngine
                     $entry['anchor'] = (string) $slot['anchor'];
                     $entry['offset'] = (int) ($slot['offset'] ?? 0);
                 }
+                // Betriebsart (Klima) durchreichen. Bewusst NEBEN 'val' und nicht darin:
+                // 'val' bleibt der Skalar, an dem Kurve, Farbskala und Pillen des Editors
+                // rechnen. Ein zusammengesetzter Wert haette jede dieser Stellen gebrochen.
+                // Domaenen ohne Betriebsart schreiben den Schluessel nie -> unveraendert.
+                if (isset($slot['mode']) && $slot['mode'] !== '' && $slot['mode'] !== null) {
+                    $entry['mode'] = (string) $slot['mode'];
+                }
                 $out[] = $entry;
             }
         }
@@ -86,6 +93,9 @@ final class ScheduleEngine
             if (isset($slot['anchor']) && $slot['anchor'] !== '' && $slot['anchor'] !== null) {
                 $entry['anchor'] = (string) $slot['anchor'];
                 $entry['offset'] = (int) ($slot['offset'] ?? 0);
+            }
+            if (isset($slot['mode']) && $slot['mode'] !== '' && $slot['mode'] !== null) {
+                $entry['mode'] = (string) $slot['mode'];
             }
             $norm[$end] = $entry;
         }
@@ -121,6 +131,31 @@ final class ScheduleEngine
         }
         // Fallback: letzter Slot (deckt bis 24:00).
         return $slots[count($slots) - 1]['val'];
+    }
+
+    /**
+     * Wie eval(), liefert aber den GANZEN Slot statt nur seinen Wert — inklusive
+     * 'mode' (Klima) und der Endzeit, aus der der Aufrufer den naechsten
+     * Umschaltzeitpunkt ableiten kann. eval() bleibt unveraendert, damit die
+     * bestehenden Domaenen nichts merken.
+     *
+     * @return array{end:int,val:mixed,mode?:string}|null
+     */
+    public function evalSlot(int $ts, string $variant): ?array
+    {
+        $day     = (int) date('N', $ts) - 1;
+        $minutes = ((int) date('G', $ts)) * 60 + (int) date('i', $ts);
+
+        $slots = $this->getSlots($variant, $day);
+        if ($slots === []) {
+            return null;
+        }
+        foreach ($slots as $slot) {
+            if ($minutes < $slot['end']) {
+                return $slot;
+            }
+        }
+        return $slots[count($slots) - 1];
     }
 
     /**
@@ -254,6 +289,9 @@ final class ScheduleEngine
                 $end = 1440;
             }
             $rastered[$end] = ['end' => $end, 'val' => $slot['val']];
+            if (isset($slot['mode'])) {
+                $rastered[$end]['mode'] = $slot['mode'];
+            }
         }
         ksort($rastered);
         $list = array_values($rastered);
@@ -280,7 +318,8 @@ final class ScheduleEngine
         $out = [];
         foreach ($list as $slot) {
             $n = count($out);
-            if ($n > 0 && $this->valEquals($out[$n - 1]['val'], $slot['val'])) {
+            if ($n > 0 && $this->valEquals($out[$n - 1]['val'], $slot['val'])
+                && ($out[$n - 1]['mode'] ?? '') === ($slot['mode'] ?? '')) {
                 // gleiche Temperatur -> vorherigen Slot bis zu diesem end verlaengern
                 $out[$n - 1]['end'] = $slot['end'];
             } else {
