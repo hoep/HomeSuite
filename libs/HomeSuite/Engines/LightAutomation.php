@@ -52,8 +52,13 @@ final class LightAutomation
         foreach ($rules as $r) {
             $type = (string) ($r['type'] ?? '');
             if ($type === 'schedule' || $type === 'wake') {
+                // Einmal-Wecker kennt keine Wochentage: er weckt beim naechsten
+                // Erreichen der Uhrzeit, egal welcher Tag, und schaltet sich danach
+                // selbst ab (das erledigt der Hub).
+                $einmal = ($type === 'wake') && !empty($r['once']);
                 $days = $r['days'] ?? ($r['trigger']['days'] ?? []);
-                if (is_array($days) && $days !== [] && !in_array($weekday, array_map('intval', $days), true)) {
+                if (!$einmal && is_array($days) && $days !== []
+                    && !in_array($weekday, array_map('intval', $days), true)) {
                     continue;
                 }
                 if ($type === 'wake') {

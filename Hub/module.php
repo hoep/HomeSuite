@@ -1462,6 +1462,41 @@ class HomeSuiteHub extends EntityModule
     // Licht-Automatik (L7-L11) — Timer/MessageSink -> LightAutomation-Engine
     // ==================================================================
 
+    /**
+     * Einen ausgeloesten Einmal-Wecker abschalten.
+     *
+     * Ueber den INHALT gesucht, nicht ueber den Index: der Tick arbeitet auf einer
+     * neu durchnummerierten Kopie (nur eingeschaltete Regeln), deren Indizes nicht
+     * zu denen im Speicher passen.
+     */
+    private function wakeEinmalEntschaerfen(array $regel): void
+    {
+        $c = $this->store()->get('lightAuto', []);
+        if (!is_array($c) || !is_array($c['rules'] ?? null)) {
+            return;
+        }
+        $gleich = static function (array $a, array $b): bool {
+            foreach (['type', 'name', 'time', 'audioZone', 'volume', 'rampMin'] as $k) {
+                if ((string) ($a[$k] ?? '') !== (string) ($b[$k] ?? '')) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        foreach ($c['rules'] as $i => $r) {
+            if (!is_array($r) || ($r['type'] ?? '') !== 'wake' || empty($r['once'])) {
+                continue;
+            }
+            if (($r['enabled'] ?? true) === false || !$gleich($r, $regel)) {
+                continue;
+            }
+            $c['rules'][$i]['enabled'] = false;
+            $this->store()->set('lightAuto', $c);
+            $this->LogMessage('Einmal-Wecker "' . (string) ($r['name'] ?? '') . '" hat geweckt und ist jetzt aus.', KL_MESSAGE);
+            return;
+        }
+    }
+
     private function lightAutoCfg(): array
     {
         $c = $this->store()->get('lightAuto', []);
@@ -1578,7 +1613,14 @@ class HomeSuiteHub extends EntityModule
                     $st['nachfassen'] = array_slice($st['nachfassen'], -self::NACHFASS_MAX);
                 }
             } elseif (($act['kind'] ?? '') === 'wake') {
-                $this->applyWake($act['rule'] ?? []);
+                $r = is_array($act['rule'] ?? null) ? $act['rule'] : [];
+                $this->applyWake($r);
+                // Einmal-Wecker: nach dem Ausloesen abschalten. Er bleibt stehen,
+                // damit man sieht, dass er gelaufen ist, und ihn mit einem Griff
+                // wieder scharf stellen kann.
+                if (!empty($r['once'])) {
+                    $this->wakeEinmalEntschaerfen($r);
+                }
             }
         }
 
