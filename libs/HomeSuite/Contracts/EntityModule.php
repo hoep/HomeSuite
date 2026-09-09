@@ -391,6 +391,21 @@ abstract class EntityModule extends \IPSModule
     }
 
     /** Interner, untypisierter Setz-Pfad (nicht exponiert -> beliebiger Wertetyp erlaubt). */
+    /**
+     * Bedienwert setzen - und den WIRKLICHEN Ausgang zurueckgeben.
+     *
+     * Hier stand frueher ein bedingungsloses `return true` nach dem RequestAction. Das war
+     * keine Aussage, sondern ein Versprechen ins Blaue: jedes Skript, jede Visu und jeder
+     * Aufruf der Prefix-Funktionen bekam "erfolgreich" gemeldet, sobald der Befehl
+     * ANGENOMMEN war - nicht, wenn er gewirkt hatte. Am 09.09.2026 meldeten so sechzehn
+     * Rollo-Befehle hintereinander Erfolg, waehrend kein einziges Telegramm den Socket
+     * verliess.
+     *
+     * RequestAction gibt in Symcon nichts zurueck; das Ergebnis kommt deshalb ueber
+     * $applyOk, das die Domaene in applyControl setzt. Domaenen, die es nicht setzen,
+     * verhalten sich wie bisher (Vorbelegung true) - der Umbau ist damit fuer alle anderen
+     * Domaenen wirkungsfrei, bis sie ihn selbst nutzen.
+     */
     protected function setControlValue(string $Ident, $Value): bool
     {
         $c = $this->control($Ident);
@@ -404,9 +419,19 @@ abstract class EntityModule extends \IPSModule
             $this->LogMessage("HS.SetControl '{$Ident}': " . $e->getMessage(), KL_ERROR);
             return false;
         }
+        $this->applyOk = true;                // Vorbelegung: wer nichts meldet, gilt als gelungen
         $this->RequestAction($Ident, $Value); // EINZIGER Bedienpfad (coerct erneut)
-        return true;
+        return $this->applyOk;
     }
+
+    /**
+     * Ergebnis des letzten applyControl-Durchlaufs.
+     *
+     * Bewusst eine schlichte Eigenschaft und kein Rueckgabewert von applyControl: die
+     * Signatur ist Vertragsbestandteil aller Domaenen, und ein Domaenen-Hook, der ploetzlich
+     * etwas zurueckgeben MUSS, waere ein Bruch. So meldet, wer etwas zu melden hat.
+     */
+    protected bool $applyOk = true;
 
     /**
      * Liest den aktuellen Statuswert eines Controls per Ident.

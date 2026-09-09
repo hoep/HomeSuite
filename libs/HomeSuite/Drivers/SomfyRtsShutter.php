@@ -237,7 +237,22 @@ final class SomfyRtsShutter implements IShutter
             $this->channel(), $dir, $gut, $repeat, $status, $gewartet, microtime(true) - $t0,
             $fehler !== '' ? ('  FEHLER: ' . $fehler) : ''));
 
-        return true;
+        // DER RUECKGABEWERT IST DIE EINZIGE QUITTUNG, DIE ES GIBT.
+        //
+        // Somfy RTS meldet nichts zurueck - kein Empfang, keine Position, nichts. Ob ein
+        // Befehl gefahren ist, weiss niemand. Was die Anlage aber sehr wohl weiss: ob das
+        // Telegramm ueberhaupt den SOCKET erreicht hat. Genau diese Information stand hier
+        // schon im Protokoll ("gesendet 0/3") und wurde in der naechsten Zeile weggeworfen.
+        //
+        // Die Folge war am 09.09.2026 zu besichtigen: um 19:39 lehnte der Socket jedes
+        // Telegramm ab (0/3, Status 200), das Modul schrieb den Sollwert trotzdem, und die
+        // Buchfuehrung stand auf "zu", waehrend die ganze Fassade offen war. Der naechste
+        // Abgleich sah "Ziel erreicht" und fuhr nie wieder. Sechzehn Rollos blieben offen,
+        // und kein Zaehler, keine Meldung, keine Variable hat es angezeigt.
+        //
+        // Ein Telegramm reicht: RTS wird ohnehin mehrfach gesendet, weil einzelne verloren
+        // gehen. Erst wenn KEINES den Socket erreicht hat, ist der Befehl nicht abgesetzt.
+        return $gut > 0;
     }
 
     /** Referenzfahrt = voll in einen Endanschlag; nur up|down. */

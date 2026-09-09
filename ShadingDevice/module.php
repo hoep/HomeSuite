@@ -526,6 +526,9 @@ class ShadingDevice extends EntityModule
         return $ids;
     }
 
+    /** Anzeigetext bei nicht abgesetztem Funkbefehl - eine Stelle, damit Setzen und Loeschen zusammenpassen. */
+    private const BLOCK_FUNK = 'Funkbefehl nicht abgesetzt';
+
     private function armed(): bool
     {
         return $this->armedEffective($this->ReadPropertyBoolean('Armed')); // Hub-Master hat Vorrang
@@ -800,12 +803,13 @@ class ShadingDevice extends EntityModule
                     $this->mirrorBack('Position');   // Sollwert zurueck: es ist nichts gefahren
                     break;
                 }
-                $this->driveTo($drv, $p); // ueber den Executor: zeitbasiert bei Somfy, mit Ramp + Positions-Rueckmeldung
+                // ueber den Executor: zeitbasiert bei Somfy, mit Ramp + Positions-Rueckmeldung
+                $this->fahrtQuittieren($this->driveTo($drv, $p), 'Position');
                 break;
             case 'Movement':
                 // Auf/Zu ueber den Executor (Endanschlag, selbstkalibrierend + Rueckmeldung); Stopp beendet die laufende Fahrt.
                 $mv = (int) $value;
-                if ($mv === 1)      { $this->driveTo($drv, self::POS_MIN); }   // auf
+                if ($mv === 1)      { $this->fahrtQuittieren($this->driveTo($drv, self::POS_MIN), 'Movement'); }   // auf
                 elseif ($mv === 2)  {
                     if ($this->closeBlockedByDoor($curForGuard, self::POS_MAX)) {
                         $this->setBlock('Tür offen');
@@ -813,11 +817,44 @@ class ShadingDevice extends EntityModule
                         $this->mirrorBack('Position');
                         break;
                     }
-                    $this->driveTo($drv, self::POS_MAX);
+                    $this->fahrtQuittieren($this->driveTo($drv, self::POS_MAX), 'Movement');
                 }   // zu
                 else                { $rtm = $this->readRt(); if (!empty($rtm['moving'])) { $this->finishMove(true); } else { $drv->move('stop'); } }
                 break;
         }
+    }
+
+    /**
+     * Ergebnis einer Fahrt auswerten - und bei Misserfolg die BUCHFUEHRUNG ZURUECKNEHMEN.
+     *
+     * Das ist der Kern der Selbstheilung. Ein Funkprotokoll ohne Rueckmeldung kann einen
+     * verlorenen Befehl nur dann nachholen, wenn der Sollwert die Wirklichkeit nicht
+     * ueberschreibt: bleibt "Ziel = Ist" stehen, obwohl nichts gefahren ist, sieht jeder
+     * weitere Abgleich "Ziel erreicht" und ruehrt das Rollo nie wieder an. Genau so blieben
+     * am 09.09.2026 sechzehn Rollos offen, waehrend die Anlage sie fuer geschlossen hielt.
+     *
+     * Wird der Sollwert dagegen zurueckgenommen, steht beim naechsten Automatiklauf wieder
+     * Ziel != Ist - und das Rollo faehrt von selbst nach. Kein Sonderweg, kein
+     * "Erzwingen"-Knopf, keine Handarbeit.
+     *
+     * Die Stoerung wird ausserdem sichtbar gemacht: BlockReason ist reine Anzeige und
+     * blockiert nichts, der naechste Versuch bleibt also erlaubt. Ein stiller Fehlschlag
+     * waere die schlechteste aller Moeglichkeiten - er sieht aus wie Erfolg.
+     */
+    private function fahrtQuittieren(bool $ok, string $ident): void
+    {
+        $this->applyOk = $ok;
+        if ($ok) {
+            if ((string) @$this->GetControlValue('BlockReason') === self::BLOCK_FUNK) {
+                $this->setBlock('');   // frueherer Fehlschlag ist ueberholt
+            }
+            return;
+        }
+        $this->setBlock(self::BLOCK_FUNK);
+        $this->SendDebug('HSSH.send', $ident . ': Telegramm nicht abgesetzt -> Sollwert zurueckgenommen', 0);
+        $this->LogMessage('HSSH: Fahrbefehl nicht abgesetzt (' . $ident . ') - Sollwert zurueckgenommen, '
+                        . 'die Automatik holt die Fahrt nach', KL_WARNING);
+        $this->mirrorBack('Position');
     }
 
     /**
@@ -1795,13 +1832,22 @@ class ShadingDevice extends EntityModule
             // Endanschlag ohne bekannte Position: vom Gegen-Endanschlag voll durchfahren (selbstkalibrierend).
             $from = ($target === self::POS_MIN) ? self::POS_MAX : self::POS_MIN;
         }
+        // "Nichts zu tun" und "geht nicht" sind ZWEI verschiedene Antworten und duerfen
+        // nicht beide false heissen: der Aufrufer nimmt bei false den Sollwert zurueck, und
+        // das waere bei einem bereits erreichten Ziel schlicht falsch.
+        $tAuf = (float) $this->cfgVal('timeOpening', 0);
+        $tZu  = (float) $this->cfgVal('timeClosing', 0);
+        if ($tAuf <= 0 || $tZu <= 0) {
+            $this->SendDebug('HSSH.move', 'keine Fahrzeiten konfiguriert -> keine Fahrt moeglich', 0);
+            return false;
+        }
         $steps = ShadeKinematics::steps($from, $target, [
-            'timeOpening'    => (float) $this->cfgVal('timeOpening', 0),
-            'timeClosing'    => (float) $this->cfgVal('timeClosing', 0),
+            'timeOpening'    => $tAuf,
+            'timeClosing'    => $tZu,
             'runIntoEndstop' => true,
         ]);
         if (empty($steps)) {
-            return false; // kein Bewegungsbedarf oder keine Fahrzeiten konfiguriert
+            return true; // kein Bewegungsbedarf - das Ziel steht bereits
         }
         $first = $steps[0];
         if ($first->action === 'stop' || $first->durationMs <= 0) {
