@@ -45,6 +45,12 @@ class IrrigationCircuit extends EntityModule
     private const DEF_COLD_PCT      = 80; // -20 %
     private const DEF_HOT_ABOVE_C   = 28; // > 28 C -> hotPct
     private const DEF_HOT_PCT       = 120; // +20 %
+    // Regenvorhersage (M3b): Vorausschau in Tagen ab heute, Sperrschwelle, Mindest-
+    // wahrscheinlichkeit. Zwei Schranken, weil 3 mm bei 20 % etwas anderes aussagen
+    // als 3 mm bei 100 % - ohne die zweite sperrt man sich an jedem unsicheren Tag aus.
+    private const DEF_FC_HORIZON_D  = 1;   // heute + 1 Tag
+    private const DEF_FC_THRESH_MM  = 3.0;
+    private const DEF_FC_MIN_PROB   = 60;  // Prozent
 
     private const TIMER_REFRESH = 'Refresh';   // zyklisch: Reflect + Watchdog
     private const TIMER_RUNSTOP = 'RunStop';    // Ein-Schuss: getimtes Schliessen (switch-Modus)
@@ -415,6 +421,126 @@ class IrrigationCircuit extends EntityModule
         return max(0.3, min(2.0, ((float) $et0) / $ref));
     }
 
+    /** Tagesindex in Klartext (0 = heute). */
+    private function rainFcTagText(int $i): string
+    {
+        if ($i <= 0) { return 'heute'; }
+        if ($i === 1) { return 'morgen'; }
+        return 'in ' . $i . ' Tagen';
+    }
+
+    /** Konfiguration der Regenvorhersage. */
+    private function rainFcCfg(): array
+    {
+        $c = $this->cfg();
+        $f = (isset($c['rainFc']) && is_array($c['rainFc'])) ? $c['rainFc'] : [];
+        return [
+            'enabled'     => (bool) ($f['enabled'] ?? false),
+            'srcId'       => (int) ($f['srcId'] ?? 0),
+            'horizonDays' => max(0, min(6, (int) ($f['horizonDays'] ?? self::DEF_FC_HORIZON_D))),
+            'thresholdMm' => (float) ($f['thresholdMm'] ?? self::DEF_FC_THRESH_MM),
+            'minProbPct'  => (float) ($f['minProbPct'] ?? self::DEF_FC_MIN_PROB),
+        ];
+    }
+
+    /**
+     * Regenvorhersage lesen. EINE gebundene Quelle, zwei Bauformen - welche es ist,
+     * entscheidet der Objekttyp, nicht eine Einstellung:
+     *
+     *  (a) Kategorie/Instanz -> Kindvariablen "TagN_Regen" / "TagN_Regenwahrscheinlichkeit".
+     *      Tag1 ist HEUTE (so legen es OpenWeatherMap- und WeatherBit-Abrufe hier ab).
+     *  (b) String-Variable -> JSON. Erkannt werden Open-Meteo (daily.precipitation_sum
+     *      + daily.precipitation_probability_max) und PirateWeather/DarkSky-Tagesreihen
+     *      ([{time, precipAccumulation|precipIntensity, precipProbability}]).
+     *
+     * Liefert je Tag 0..horizon einen Eintrag und zusaetzlich den STAERKSTEN davon.
+     * Rueckgabe null, wenn keine Quelle gebunden oder nichts lesbar ist - dann sperrt
+     * die Vorhersage NIE. Eine unlesbare Quelle darf keine Bewaesserung verhindern.
+     */
+    private function rainFcRead(): ?array
+    {
+        $f = $this->rainFcCfg();
+        $id = (int) $f['srcId'];
+        if ($id <= 0 || !function_exists('IPS_ObjectExists') || !@\IPS_ObjectExists($id)) {
+            return null;
+        }
+        $tage = [];
+        $ob   = @\IPS_GetObject($id);
+        $typ  = (int) ($ob['ObjectType'] ?? -1);
+
+        if ($typ === 2) {                                   // Variable -> JSON erwarten
+            $roh = @\GetValue($id);
+            $tage = is_string($roh) ? $this->rainFcAusJson($roh) : [];
+        } elseif ($typ === 0 || $typ === 1) {               // Kategorie/Instanz -> TagN_*
+            foreach (@\IPS_GetChildrenIDs($id) ?: [] as $c) {
+                $n = (string) @\IPS_GetName($c);
+                if (!preg_match('/^Tag(\d+)_(Regen|Regenwahrscheinlichkeit)$/', $n, $m)) { continue; }
+                $i = (int) $m[1] - 1;                       // Tag1 = heute = Index 0
+                if ($i < 0) { continue; }
+                $v = @\GetValue($c);
+                if (!is_numeric($v)) { continue; }
+                if (!isset($tage[$i])) { $tage[$i] = ['mm' => 0.0, 'prob' => null]; }
+                if ($m[2] === 'Regen') { $tage[$i]['mm'] = (float) $v; }
+                else                   { $tage[$i]['prob'] = (float) $v; }
+            }
+            ksort($tage);
+        }
+        if ($tage === []) { return null; }
+
+        $h = (int) $f['horizonDays'];
+        $max = null; $maxTag = 0;
+        for ($i = 0; $i <= $h; $i++) {
+            if (!isset($tage[$i])) { continue; }
+            $mm = (float) $tage[$i]['mm'];
+            if ($max === null || $mm > $max['mm']) { $max = $tage[$i]; $maxTag = $i; }
+        }
+        if ($max === null) { return null; }
+        return ['mm' => (float) $max['mm'], 'prob' => $max['prob'], 'tagIdx' => $maxTag,
+                'tage' => array_values(array_slice($tage, 0, $h + 1))];
+    }
+
+    /** JSON-Vorhersagen auf [index => ['mm','prob']] bringen. Unbekanntes -> []. */
+    private function rainFcAusJson(string $roh): array
+    {
+        $j = json_decode($roh, true);
+        if (!is_array($j)) { return []; }
+        $out = [];
+        // Open-Meteo: {"daily":{"time":[...],"precipitation_sum":[...],"precipitation_probability_max":[...]}}
+        if (isset($j['daily']) && is_array($j['daily'])) {
+            $d  = $j['daily'];
+            $mm = $d['precipitation_sum'] ?? $d['rain_sum'] ?? null;
+            $pr = $d['precipitation_probability_max'] ?? null;
+            if (is_array($mm)) {
+                foreach (array_values($mm) as $i => $v) {
+                    if (!is_numeric($v)) { continue; }
+                    $out[$i] = ['mm' => (float) $v,
+                                'prob' => (is_array($pr) && isset($pr[$i]) && is_numeric($pr[$i])) ? (float) $pr[$i] : null];
+                }
+            }
+            return $out;
+        }
+        // PirateWeather/DarkSky-Tagesreihe: [{time, precipAccumulation|precipIntensity, precipProbability}]
+        $liste = $j;
+        if (isset($j['daily']['data']) && is_array($j['daily']['data'])) { $liste = $j['daily']['data']; }
+        if (!isset($liste[0]) || !is_array($liste[0])) { return []; }
+        $heute = strtotime('today 00:00:00');
+        foreach ($liste as $e) {
+            if (!is_array($e)) { continue; }
+            $t = isset($e['time']) ? (int) $e['time'] : 0;
+            if ($t > 4e10) { $t = (int) ($t / 1000); }
+            $i = $t > 0 ? (int) floor(($t - $heute) / 86400) : count($out);
+            if ($i < 0 || $i > 15) { continue; }
+            $mm = $e['precipAccumulation'] ?? $e['precipitation'] ?? $e['precipIntensity'] ?? null;
+            if (!is_numeric($mm)) { continue; }
+            $p = $e['precipProbability'] ?? null;
+            $p = is_numeric($p) ? (float) $p : null;
+            if ($p !== null && $p <= 1.0) { $p *= 100.0; }   // 0..1 -> Prozent
+            $out[$i] = ['mm' => (float) $mm, 'prob' => $p];
+        }
+        ksort($out);
+        return $out;
+    }
+
     /** Aktuelle Regenmenge (sensorId, mm) oder null. */
     private function rainNow(): ?float
     {
@@ -443,6 +569,18 @@ class IrrigationCircuit extends EntityModule
             $rain = $this->rainNow();
             if ($rain !== null && $rain >= $thr) {
                 return 'Regen ' . $rain . ' mm (>= ' . $thr . ')';
+            }
+        }
+        $f = $this->rainFcCfg();
+        if ($f['enabled']) {
+            $fc = $this->rainFcRead();
+            // Beide Schranken muessen fallen. Fehlt die Wahrscheinlichkeit in der Quelle,
+            // zaehlt nur die Menge - sonst koennte eine Quelle ohne dieses Feld nie sperren.
+            if ($fc !== null && $fc['mm'] >= $f['thresholdMm']
+                && ($fc['prob'] === null || $fc['prob'] >= $f['minProbPct'])) {
+                return 'Regen erwartet ' . round($fc['mm'], 1) . ' mm'
+                     . ($fc['prob'] !== null ? ' / ' . round($fc['prob']) . ' %' : '')
+                     . ' (' . $this->rainFcTagText((int) $fc['tagIdx']) . ')';
             }
         }
         return null;
@@ -767,6 +905,16 @@ class IrrigationCircuit extends EntityModule
                 'thresholdMm' => (float) ($args['rain']['thresholdMm'] ?? 2.0),
             ];
         }
+        if (isset($args['rainFc']) && is_array($args['rainFc'])) {
+            $f = $args['rainFc'];
+            $patch['rainFc'] = [
+                'enabled'     => (bool) ($f['enabled'] ?? false),
+                'srcId'       => (int) ($f['srcId'] ?? 0),
+                'horizonDays' => max(0, min(6, (int) ($f['horizonDays'] ?? self::DEF_FC_HORIZON_D))),
+                'thresholdMm' => (float) ($f['thresholdMm'] ?? self::DEF_FC_THRESH_MM),
+                'minProbPct'  => (float) ($f['minProbPct'] ?? self::DEF_FC_MIN_PROB),
+            ];
+        }
         if (isset($args['evap']) && is_array($args['evap'])) {
             $patch['evap'] = [
                 'enabled'         => (bool) ($args['evap']['enabled'] ?? false),
@@ -776,6 +924,14 @@ class IrrigationCircuit extends EntityModule
         }
         if ($patch !== []) {
             $this->store()->patch('config', $patch);
+        }
+        // Der Regensensor ist ein Automatik-Eingang, liegt aber als PROPERTY vor
+        // (cfg() legt Properties ueber den Store - ein Store-Patch verpuffte hier).
+        // Deshalb ueber applyConfigProperties; das setzt nur den uebergebenen Schluessel.
+        if (array_key_exists('sensorId', $args)) {
+            $this->applyConfigProperties(['sensorId' => (int) $args['sensorId']], true);
+        }
+        if ($patch !== [] || array_key_exists('sensorId', $args)) {
             $this->syncReferences();
         }
         return ['ok' => true, 'config' => $this->cfg()];
@@ -793,6 +949,8 @@ class IrrigationCircuit extends EntityModule
             'tempFactor'     => $this->tempFactor(),
             'evapFactor'     => $this->evapFactor(),
             'rainNow'        => $this->rainNow(),
+            'rainFc'         => $this->rainFcRead(),
+            'rainFcCfg'      => $this->rainFcCfg(),
             'effectiveSec'   => $this->effectiveSeconds(),
             'effectiveMin'   => round($this->effectiveSeconds() / 60, 1),
             'gate'           => ['blocked' => $this->gateBlock() !== null, 'reason' => $this->gateBlock()],
@@ -884,6 +1042,9 @@ class IrrigationCircuit extends EntityModule
         }
         if (isset($cfg['evap']) && is_array($cfg['evap'])) {
             $add($cfg['evap']['et0VarId'] ?? 0);
+        }
+        if (isset($cfg['rainFc']) && is_array($cfg['rainFc'])) {
+            $add($cfg['rainFc']['srcId'] ?? 0);
         }
         foreach (array_keys($ids) as $id) {
             if (function_exists('IPS_ObjectExists') && @\IPS_ObjectExists($id)) {
@@ -1112,7 +1273,7 @@ class IrrigationCircuit extends EntityModule
     {
         // Zeitplan ist jetzt der native Wochenplan (Ereignis WateringSchedule) -> kein JSON-Spiegel mehr.
         $climate = [];
-        foreach (['temp', 'rain', 'evap'] as $k) {
+        foreach (['temp', 'rain', 'rainFc', 'evap'] as $k) {
             $v = $this->cfgVal($k, null);
             if ($v !== null) { $climate[$k] = $v; }
         }
@@ -1181,6 +1342,8 @@ class IrrigationCircuit extends EntityModule
         $add('bl_tempVarId', 'Temperatur', (int) ($temp['tempVarId'] ?? 0));
         $evap = is_array($cfg['evap'] ?? null) ? $cfg['evap'] : [];
         $add('bl_et0VarId', 'Verdunstung (ET0)', (int) ($evap['et0VarId'] ?? 0));
+        $rfc = is_array($cfg['rainFc'] ?? null) ? $cfg['rainFc'] : [];
+        $add('bl_rainFcSrcId', 'Regenvorhersage', (int) ($rfc['srcId'] ?? 0));
         return $out;
     }
 
