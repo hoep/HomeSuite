@@ -28,7 +28,7 @@ class RainRadar extends IPSModule
         // per Konstruktion genau auf der Kachelmitte sitzt - zwei Marken an derselben Stelle.
         // Voreinstellung daher AUS; wer die Bilder ausserhalb des Widgets nutzt, schaltet sie ein.
         $this->RegisterPropertyBoolean('DrawMarkers', false);
-        $this->RegisterPropertyString('BaseMap', '/usr/share/symcon/tile/kremsmuenster/austria.png');
+        $this->RegisterPropertyString('BaseMap', '/usr/share/symcon/tile/rainradar/basemap.png');
         $this->RegisterPropertyString('RadarUrl', 'https://portale.geosphere.at/hpAT/index.php?pu=default&op=getNoCacheImg&a=INCAL_VW1398&p=HP_RR_AT&i=');
         $this->RegisterPropertyString('OutputDir', '/usr/share/symcon/tile/rainradar');
         // Verarbeitung

@@ -78,7 +78,7 @@ das Radar ueber das LVB-Frontend verwaltet. Es zeigt zusaetzlich eine Statuszeil
 | `LocationID` | int | 0 | Symcon-Standort-Modul (nur wenn Lat/Lon = 0; 0 = auto) |
 | `LocX` | int | 875 | Fallback-Pixel X (nur ohne Geokoordinaten) |
 | `LocY` | int | 316 | Fallback-Pixel Y (nur ohne Geokoordinaten) |
-| `BaseMap` | string | `/usr/share/symcon/tile/kremsmuenster/austria.png` | Basiskarte (Pfad) |
+| `BaseMap` | string | `/usr/share/symcon/tile/rainradar/basemap.png` | Basiskarte (Pfad) |
 | `RadarUrl` | string | GeoSphere `INCAL_VW1398`-Endpunkt | Radar-Bildquelle (URL-Praefix) |
 | `OutputDir` | string | `/usr/share/symcon/tile/rainradar` | Ausgabe-Ordner (web unter `/tile/rainradar/`) |
 | `Hours` | int | 72 | Headroom-Stunden; der Lauf endet am echten Vorhersage-Horizont |

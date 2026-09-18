@@ -69,7 +69,7 @@ class RainRadarEngine {   // eindeutiger Name (Legacy PHPRainRadar.php nutzt 'We
     private function getDefaultConfig() {
         return [
             // Basispfade und URLs
-            'baseMapPath' => '/usr/share/symcon/tile/kremsmuenster/austria.png',
+            'baseMapPath' => '/usr/share/symcon/tile/rainradar/basemap.png',
             'outputDir' => './radar_images',
             'radarBaseUrl' => 'https://portale.geosphere.at/hpAT/index.php?pu=default&op=getNoCacheImg&a=INCAL_VW1398&p=HP_RR_AT&i=',
             'cleanOutputDir' => true,          // Ausgabeverzeichnis vor der Verarbeitung bereinigen
@@ -124,7 +124,7 @@ class RainRadarEngine {   // eindeutiger Name (Legacy PHPRainRadar.php nutzt 'We
             // Debug und Logging
             'debug' => true,                  // Debug-Modus aktivieren
             'debugRainDetection' => false,     // Debug-Ausgabe für Regenerkennung aktivieren
-            'logFile' => '/usr/share/symcon/tile/kremsmuenster/regenradar.log',  // Log-Datei (null = Standard-Error-Log)
+            'logFile' => '/usr/share/symcon/tile/rainradar/regenradar.log',  // Log-Datei (null = Standard-Error-Log)
             'logLevel' => 'info',             // Log-Level (debug, info, warning, error)
             
             // Regenerkennungs-Einstellungen
