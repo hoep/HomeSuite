@@ -283,15 +283,15 @@ if (isset($argv) && basename(__FILE__) === basename($argv[0])) {
     $dir = __DIR__;
     // Beispiel: kleiner Maehpfad um Hauskoordinaten (48.2082, 16.3738)
     $positions = [
+        ['lat' => 48.20820, 'lng' => 16.37380],
+        ['lat' => 48.20825, 'lng' => 16.37390],
+        ['lat' => 48.20830, 'lng' => 16.37385],
         ['lat' => 48.2082, 'lng' => 16.3738],
-        ['lat' => 48.2082, 'lng' => 16.3738],
-        ['lat' => 48.2082, 'lng' => 16.3738],
-        ['lat' => 48.2082, 'lng' => 16.3738],
-        ['lat' => 48.2082, 'lng' => 16.3738],
+        ['lat' => 48.20828, 'lng' => 16.37360],
         ['lat' => 48.2082, 'lng' => 16.3738],
         ['lat' => 48.2082, 'lng' => 16.3738],
     ];
-    $geofence = ['lat' => 48.2082, 'lng' => 16.3738, 'radius' => 40];
+    $geofence = ['lat' => 48.20823, 'lng' => 16.37377, 'radius' => 40];
     $html = renderPositionMap($positions, $geofence, '#4CAF50', 800, 600);
     file_put_contents($dir . '/04_map_test.html', $html);
     echo "wrote " . $dir . "/04_map_test.html\n";

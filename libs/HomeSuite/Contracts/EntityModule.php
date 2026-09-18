@@ -910,7 +910,7 @@ abstract class EntityModule extends \IPSModule
         }
         $lid = (int) $this->hubProp('LocationId', 0);
         if ($lid <= 0) {
-            $lid = 13098; // bekannte Location-Instanz als Fallback
+            $lid = 0;     // kein Rueckfall auf eine feste ID - fremde Anlagen haetten hier eine andere Instanz
         }
         if ($lid > 0 && function_exists('IPS_InstanceExists') && @\IPS_InstanceExists($lid)) {
             $c   = json_decode((string) @\IPS_GetConfiguration($lid), true);

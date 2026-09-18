@@ -89,11 +89,17 @@ class ShadingDevice extends EntityModule
     private const CLEAR_EL_MIN_SIN = 0.2079;
     private const CLEAR_HOLD_S     = 5400;   // 90 Minuten
 
-    private const SUN_AZ_ID      = 15291;    // Azimut (Location #<ID>)
-    private const SUN_EL_ID      = 45609;    // Elevation
-    private const WIND_ID        = 58381;    // Wind (km/h)
-    private const RAIN_ID        = 19991;    // Regen
-    private const BRIGHT_ID      = 53778;    // Helligkeit
+    /* Umgebungs-Sensoren. Gesetzt werden sie ueber config.env (sunAzId, sunElId,
+       windId, rainId, brightId) aus dem Hub. Die Vorgabe ist bewusst 0 = "nicht
+       vorhanden": eine fest eingetragene ID zeigt in einer anderen Anlage auf eine
+       voellig andere Variable, und ein falsch gelesener Windwert entscheidet hier
+       ueber Ein- und Ausfahren. envNum() liefert bei 0 null, die Automatik behandelt
+       das als "kein Zeuge". */
+    private const SUN_AZ_ID      = 0;    // Azimut     (Location-Instanz)
+    private const SUN_EL_ID      = 0;    // Elevation  (Location-Instanz)
+    private const WIND_ID        = 0;    // Wind (km/h)
+    private const RAIN_ID        = 0;    // Regen
+    private const BRIGHT_ID      = 0;    // Helligkeit
     private const WIND_STORM_KMH = 45.0;     // Sturm-Schwelle (km/h)
     private const BUS_GAP_MS     = 4000;     // Mindestabstand zweier Funktelegramme (haus-weit, Hub-Vorgabe)
 

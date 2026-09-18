@@ -1027,8 +1027,8 @@ class HomeSuiteHub extends EntityModule
     /**
      * Naechstgelegener Standort ueber dem Objekt (HSSP mit Kind = Haus).
      *
-     * Seit dem 28.08.2026 gibt es vier: Standort, Standort B, Standort C
-     * und Standort D. Raum- und Geschossnamen wiederholen sich zwischen ihnen,
+     * Seit dem 28.08.2026 gibt es mehrere. Raum- und Geschossnamen wiederholen
+     * sich zwischen ihnen,
      * die Standort-ID nicht. 0 = kein Standort gefunden (Geraet haengt neben
      * der Struktur).
      */
@@ -1102,7 +1102,7 @@ class HomeSuiteHub extends EntityModule
      *
      * `house` ohne ref bleibt bewusst "alles": die vier vorhandenen Szenen sind
      * so gespeichert, und sie meinen heute tatsaechlich das ganze Haus, weil es
-     * ausserhalb von Standort keine Lampen gibt. Sie stillschweigend
+     * ausserhalb des Hauptstandorts keine Lampen gibt. Sie stillschweigend
      * einzuengen waere eine Verhaltensaenderung ohne Anlass.
      */
     private function scopeDevices(array $scope): array
@@ -1380,8 +1380,8 @@ class HomeSuiteHub extends EntityModule
         //
         // STANDORTFEST seit 28.08.2026: Frueher war $rooms ein Woerterbuch
         // Name -> ID, bei dem der zuletzt gefundene Raum gewann. Mit einem Haus
-        // ging das gut. Seit es vier Standorte gibt (Standort, Standort B,
-        // Standort C, Standort D) kommen "Wohnzimmer" und "Schlafzimmer"
+        // ging das gut. Seit es mehrere Standorte gibt, kommen "Wohnzimmer"
+        // und "Schlafzimmer"
         // mehrfach vor - und das Aufraeumen haette Geraete in den falschen
         // Standort geschoben. Jetzt: Name -> LISTE, und verschoben wird nur,
         // wenn die Zuordnung eindeutig ist.
@@ -2778,7 +2778,7 @@ class HomeSuiteHub extends EntityModule
         // STROM/STECKDOSE VOR LICHT.
         //
         // Ein einfacher Schaltaktor sah bisher aus wie eine Lampe: STATE mit Schalterprofil,
-        // und die Lichtregel darunter griff zu. In der Standort D hiessen deshalb die
+        // und die Lichtregel darunter griff zu. An einem Nebenstandort hiessen deshalb die
         // Steckdosen fuer Fernseher und IT "lighting". Zwei Merkmale trennen das sauber:
         //   MESSKANAL  ENERGY_COUNTER / POWER / VOLTAGE / CURRENT - misst Strom, schaltet nichts
         //   SCHALTAKTOR STATE zusammen mit WORKING oder INHIBIT, aber OHNE Dimmkanal
@@ -3115,7 +3115,7 @@ class HomeSuiteHub extends EntityModule
             // ClimateZone fehlte hier. Die Instanzen gibt es laengst (sieben an den
             // Auslandsstandorten), sie erben wie alle anderen von EntityModule - sie tauchten
             // nur in der Raumtopologie nicht auf, weil diese Liste sie nicht kannte. Damit
-            // standen die Klimazonen unter Standort B/Standort C weder in einem Raum noch in
+            // standen die Klimazonen an den Nebenstandorten weder in einem Raum noch in
             // 'unassigned': sie waren schlicht unsichtbar.
             [self::GUID_HSAC,  'climate'],
             // LightDevice fehlte aus demselben Grund wie die ClimateZone. Alle 42 Leuchten
