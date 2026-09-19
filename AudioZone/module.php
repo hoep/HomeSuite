@@ -168,6 +168,7 @@ class AudioZone extends EntityModule
                 ['op' => 'getConfig',       'label' => 'Konfiguration lesen (Diagnose)'],
                 ['op' => 'validate',        'label' => 'Bindung pruefen (Diagnose)'],
                 ['op' => 'driverProbe',     'label' => 'Treiber-Status (Diagnose)'],
+                ['op' => 'topology',        'label' => 'Adressen aus der Anlage pruefen (Diagnose)'],
                 ['op' => 'setArmed',        'label' => 'Scharfschalten / Schatten-Modus'],
                 ['op' => 'migrateConfig',   'label' => 'Config auf Properties migrieren (einmalig)'],
                 ['op' => 'importLegacy',    'label' => 'Aus IPSSonos importieren'],
@@ -872,6 +873,8 @@ class AudioZone extends EntityModule
                 return $this->mgmtValidate();
             case 'driverProbe':
                 return $this->mgmtDriverProbe();
+            case 'topology':
+                return $this->mgmtTopology();
             case 'setArmed':
                 @\IPS_SetProperty($this->InstanceID, 'Armed', (bool) ($args['armed'] ?? false));
                 @\IPS_ApplyChanges($this->InstanceID);
@@ -1260,19 +1263,139 @@ class AudioZone extends EntityModule
     // ==================================================================
 
     /** Speaker-IP/RINCON aus der gebundenen Raum-Instanz (bind.transport-Variable -> Parent). */
+    /**
+     * Adresse der eigenen Box: [IP, RINCON].
+     *
+     * Rangfolge:
+     *   1. eigene Eigenschaften (SpeakerIp/SpeakerRincon) - der Normalfall,
+     *   2. Topologie: stimmt die hinterlegte IP nicht mehr, liefert sie ein beliebiger
+     *      erreichbarer Player anhand des RINCON neu - die Eigenschaft wird nachgezogen,
+     *   3. der IPSSonos-Altbaum, solange eine Zone noch keine eigenen Werte hat.
+     *
+     * Der RINCON ist die dauerhafte Kennung, die IP nicht: sie kommt per DHCP. Deshalb
+     * wird sie geprueft statt geglaubt - und dass mehrere Boxen ausgesteckt sind, ist
+     * dabei der Normalfall und kein Fehler: gefragt wird, wer gerade antwortet.
+     */
     private function resolveSpeaker(): array
     {
-        $tv = (int) ((($this->cfg()['bind'] ?? [])['transport']['varId']) ?? 0);
+        $cfg = $this->cfg();
+        $ip  = trim((string) ($cfg['speakerIp'] ?? ''));
+        $rin = trim((string) ($cfg['speakerRincon'] ?? ''));
+
+        if ($rin !== '') {
+            $topo = $this->sonosTopologie();
+            if (isset($topo[$rin]['ip']) && $topo[$rin]['ip'] !== '' && $topo[$rin]['ip'] !== $ip) {
+                $neu = (string) $topo[$rin]['ip'];
+                $this->LogMessage('HS.Audio: Sonos-Adresse geaendert '
+                    . ($ip === '' ? '(leer)' : $ip) . ' -> ' . $neu, KL_MESSAGE);
+                @\IPS_SetProperty($this->InstanceID, 'SpeakerIp', $neu);
+                @\IPS_ApplyChanges($this->InstanceID);
+                $ip = $neu;
+            }
+        }
+        if ($ip !== '' && $rin !== '') {
+            return [$ip, $rin];
+        }
+
+        // Rueckfall auf den Altbaum, solange die Zone keine eigenen Werte hat.
+        $tv = (int) ((($cfg['bind'] ?? [])['transport']['varId']) ?? 0);
         if ($tv <= 0 || !function_exists('IPS_GetParent')) {
-            return ['', ''];
+            return [$ip, $rin];
         }
         $room = (int) @\IPS_GetParent($tv);
         if ($room <= 0) {
-            return ['', ''];
+            return [$ip, $rin];
         }
-        $ip  = (string) @\GetValue((int) (@\IPS_GetObjectIDByIdent('IPADDR', $room) ?: 0));
-        $rin = (string) @\GetValue((int) (@\IPS_GetObjectIDByIdent('RINCON', $room) ?: 0));
-        return [$ip, $rin];
+        $aIp  = (string) @\GetValue((int) (@\IPS_GetObjectIDByIdent('IPADDR', $room) ?: 0));
+        $aRin = (string) @\GetValue((int) (@\IPS_GetObjectIDByIdent('RINCON', $room) ?: 0));
+        return [$ip !== '' ? $ip : $aIp, $rin !== '' ? $rin : $aRin];
+    }
+
+    /**
+     * Zeigt, was die Anlage ueber diese Zone weiss - und was hinterlegt ist.
+     *
+     * Schreibt bewusst nichts: wer eine Adresse aendert, soll das sehen. Automatisch
+     * nachgezogen wird nur im Betrieb, wenn der RINCON eindeutig unter einer anderen
+     * IP antwortet.
+     *
+     * @return array<string,mixed>
+     */
+    private function mgmtTopology(): array
+    {
+        $cfg = $this->cfg();
+        $rin = trim((string) ($cfg['speakerRincon'] ?? ''));
+        $ip  = trim((string) ($cfg['speakerIp'] ?? ''));
+        $rt  = $this->readRt();
+        unset($rt['topoCache']);            // frisch fragen, nicht aus dem Puffer
+        $this->writeRt($rt);
+        $topo = $this->sonosTopologie();
+        $ich  = ($rin !== '' && isset($topo[$rin])) ? $topo[$rin] : null;
+        return [
+            'ok'         => $topo !== [],
+            'hinterlegt' => ['rincon' => $rin, 'ip' => $ip],
+            'gefunden'   => $ich,
+            'stimmt'     => $ich !== null && (string) $ich['ip'] === $ip,
+            'erreichbar' => count($topo),
+            'haushalt'   => array_map(static function ($u, $a) {
+                return ['rincon' => $u, 'ip' => $a['ip'], 'name' => $a['name'], 'unsichtbar' => $a['invisible']];
+            }, array_keys($topo), array_values($topo)),
+        ];
+    }
+
+    /**
+     * UUID => Angaben aller Player des Haushalts, fuenf Minuten gepuffert.
+     *
+     * Gefragt wird der Reihe nach: der eingetragene Master, die eigene letzte Adresse,
+     * dann die Adressen der uebrigen Zonen. Der erste, der antwortet, kennt ohnehin alle.
+     *
+     * @return array<string,array{ip:string,name:string,invisible:bool}>
+     */
+    private function sonosTopologie(): array
+    {
+        $rt = $this->readRt();
+        $c  = $rt['topoCache'] ?? null;
+        if (is_array($c) && (time() - (int) ($c['ts'] ?? 0)) < 300 && !empty($c['data'])) {
+            return (array) $c['data'];
+        }
+        $cfg   = $this->cfg();
+        $hosts = [];
+        foreach ([trim((string) ($cfg['masterIp'] ?? '')), trim((string) ($cfg['speakerIp'] ?? ''))] as $h) {
+            if ($h !== '' && !in_array($h, $hosts, true)) { $hosts[] = $h; }
+        }
+        foreach ($this->andereZonenIps() as $h) {
+            if (!in_array($h, $hosts, true)) { $hosts[] = $h; }
+        }
+        $topo = [];
+        foreach (array_slice($hosts, 0, 6) as $h) {
+            try {
+                $drv = DriverFactory::create('sonos-upnp', ['host' => $h, 'timeout' => 2000]);
+                if ($drv instanceof SonosUpnp) {
+                    $topo = $drv->zoneGroupTopology();
+                }
+            } catch (\Throwable $e) {
+                $topo = [];
+            }
+            if ($topo !== []) { break; }
+        }
+        if ($topo !== []) {
+            $rt['topoCache'] = ['ts' => time(), 'data' => $topo];
+            $this->writeRt($rt);
+        }
+        return $topo;
+    }
+
+    /** Hinterlegte Adressen der uebrigen Audiozonen - Ausweichkandidaten fuer die Topologie. */
+    private function andereZonenIps(): array
+    {
+        $out = [];
+        foreach (\IPS_GetInstanceList() as $iid) {
+            if ($iid === $this->InstanceID) { continue; }
+            if ((\IPS_GetInstance($iid)['ModuleInfo']['ModuleName'] ?? '') !== 'AudioZone') { continue; }
+            $ip = '';
+            try { $ip = trim((string) @\IPS_GetProperty($iid, 'SpeakerIp')); } catch (\Throwable $e) {}
+            if ($ip !== '') { $out[] = $ip; }
+        }
+        return $out;
     }
 
     /** Radio "was laeuft": aktueller Titel (streamContent) + Song-Cover, 20s gecacht (RtState). */
@@ -1721,6 +1844,15 @@ class AudioZone extends EntityModule
             ['type' => 'Label', 'caption' => 'Audio/Media — Steuerung ueber generischen Treiber (Sonos im Uebergang '
                 . 'ueber IPSSonos-Raum-Variablen; spaeter nativ sonos-upnp/heos). Verwaltung/Visu im LiveViewBuilder.'],
             ['type' => 'NumberSpinner', 'name' => 'QueryInterval', 'caption' => 'Abfrage-Intervall (s)'],
+            ['type' => 'Label', 'caption' => 'Adresse der Box. Der RINCON ist dauerhaft, die IP kommt per DHCP - '
+                . 'stimmt sie nicht mehr, holt die Zone sie sich ueber einen beliebigen erreichbaren Player zurueck.'],
+            ['type' => 'RowLayout', 'items' => [
+                ['type' => 'ValidationTextBox', 'name' => 'SpeakerRincon', 'caption' => 'RINCON'],
+                ['type' => 'ValidationTextBox', 'name' => 'SpeakerIp', 'caption' => 'IP'],
+                ['type' => 'ValidationTextBox', 'name' => 'MasterIp', 'caption' => 'Master (optional)'],
+            ]],
+            ['type' => 'Button', 'caption' => 'Adressen aus der Anlage pruefen', 'onClick' =>
+                'echo HSAU_Manage($id, json_encode(["op"=>"topology"]));'],
             ['type' => 'SelectInstance', 'name' => 'cfgRoom', 'caption' => 'IPSSonos-Raum-Instanz (Import)'],
             ['type' => 'Button', 'caption' => 'Aus IPSSonos importieren (Schatten)', 'onClick' =>
                 'echo HSAU_Manage($id, json_encode(["op"=>"importLegacy","args"=>["roomInstanceId"=>$cfgRoom]]));'],
@@ -1753,6 +1885,32 @@ class AudioZone extends EntityModule
         $this->RegisterPropertyBoolean('Armed', false);
         $this->RegisterPropertyInteger('ConfigSchema', 0); // Migrations-Marker
         $this->RegisterPropertyInteger('QueryInterval', 5); // Abfrage-Intervall in SEKUNDEN (Default = REFRESH_MS/1000)
+        // EIGENE ADRESSE DER BOX. Bis 19.09.2026 holte sich die Zone IP und RINCON aus dem
+        // IPSSonos-Altbaum: ueber die gebundene Transport-Variable auf deren Elternobjekt
+        // und von dort die Idents IPADDR/RINCON. Damit haette das Entfernen der alten
+        // Bibliothek alle Zonen stillgelegt, obwohl sie laengst per UPnP selbst sprechen.
+        $this->RegisterPropertyString('SpeakerIp', '');
+        $this->RegisterPropertyString('SpeakerRincon', '');
+        // Fester Ansprechpartner fuer die Topologie. Jeder erreichbare Player kennt den
+        // ganzen Haushalt; ein benannter Master erspart das Durchprobieren im Normalfall.
+        $this->RegisterPropertyString('MasterIp', '');
+    }
+
+    /**
+     * Property lesen, die es vielleicht noch nicht gibt.
+     *
+     * Neu in Create() registrierte Properties entstehen auf einer LAUFENDEN Anlage erst
+     * mit dem naechsten Reload - der Modulcode wird aber sofort gelesen. Ohne diesen
+     * Umweg wirft jeder Abruf zwischen Dateiwechsel und Reload einen Fehler, und zwar
+     * im Sekundentakt ueber alle Zonen (am 19.09.2026 genau so passiert).
+     */
+    private function propStr(string $name): string
+    {
+        try {
+            return (string) $this->ReadPropertyString($name);
+        } catch (\Throwable $e) {
+            return '';
+        }
     }
 
     /** Effektives Refresh-Intervall in ms; Boden 2s, damit eine 0 keinen Hot-Loop verursacht. */
@@ -1774,8 +1932,11 @@ class AudioZone extends EntityModule
         $store = $this->store()->get('config', []);
         $store = is_array($store) ? $store : [];
         return array_merge($store, [
-            'driver' => $this->ReadPropertyString('Driver'),
-            'armed'  => $this->ReadPropertyBoolean('Armed'),
+            'driver'        => $this->ReadPropertyString('Driver'),
+            'armed'         => $this->ReadPropertyBoolean('Armed'),
+            'speakerIp'     => $this->propStr('SpeakerIp'),
+            'speakerRincon' => $this->propStr('SpeakerRincon'),
+            'masterIp'      => $this->propStr('MasterIp'),
         ]);
     }
 

@@ -642,6 +642,56 @@ final class SonosUpnp implements IAudioRenderer, IAudioStateReadable, IAudioQueu
     }
 
     /**
+     * Wer gehoert zum Haushalt, und unter welcher Adresse?
+     *
+     * Jeder erreichbare Player kennt die GANZE Anlage - man muss also nicht jede Box
+     * einzeln fragen, was praktisch ist, weil selten alle eingeschaltet sind. Die
+     * Antwort ist doppelt XML-kodiert (ein XML-Dokument als Textinhalt eines anderen),
+     * deshalb wird zweimal dekodiert.
+     *
+     * Die UUID (RINCON_...) ist die dauerhafte Kennung einer Box, die IP nicht: sie
+     * kommt per DHCP und wandert. Genau dafuer ist diese Abfrage da.
+     *
+     * @return array<string,array{ip:string,name:string,invisible:bool}> UUID => Angaben
+     */
+    public function zoneGroupTopology(): array
+    {
+        $xml = $this->soap(
+            'urn:schemas-upnp-org:service:ZoneGroupTopology:1',
+            'GetZoneGroupState',
+            '',
+            '/ZoneGroupTopology/Control'
+        );
+        if ($xml === '') {
+            return [];
+        }
+        $xml = html_entity_decode($xml, ENT_QUOTES | ENT_XML1);
+        $xml = html_entity_decode($xml, ENT_QUOTES | ENT_XML1);
+        $out = [];
+        if (!preg_match_all('~<ZoneGroupMember\b([^>]*)>~i', $xml, $mm)) {
+            return [];
+        }
+        foreach ($mm[1] as $attr) {
+            if (!preg_match('~UUID="([^"]+)"~i', $attr, $u)) {
+                continue;
+            }
+            $ip = '';
+            if (preg_match('~Location="https?://([0-9.]+):~i', $attr, $l)) {
+                $ip = $l[1];
+            }
+            preg_match('~ZoneName="([^"]*)"~i', $attr, $n);
+            $out[$u[1]] = [
+                'ip'        => $ip,
+                'name'      => $n[1] ?? '',
+                // Unsichtbare Mitglieder sind z. B. der zweite Lautsprecher eines
+                // Stereopaars oder ein Sub - eigene UUID, aber keine eigene Zone.
+                'invisible' => (bool) preg_match('~Invisible="1"~i', $attr),
+            ];
+        }
+        return $out;
+    }
+
+    /**
      * Synchroner SOAP-POST an den Player. Liefert den Response-Body (oder '').
      * Kein Kernel/IPS — reines stream-context-HTTP (portabel, kein persistenter Socket).
      */
