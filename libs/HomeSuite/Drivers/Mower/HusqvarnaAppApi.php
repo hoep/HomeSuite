@@ -152,8 +152,19 @@ final class HusqvarnaAppApi implements IMower
      * NORMALISIERTER Ist-Zustand (40-Key-Schema).
      *
      * @param bool $full true = voller Poll (statistics/messages/missions/timers/
-     *                   geofence/workAreas/stayOutZones); false = leichter Poll
-     *                   (nur status/settings/robot). Nicht geholte Felder = null/[].
+     *                   geofence/stayOutZones); false = leichter Poll
+     *                   (status/settings/robot/workAreas). Nicht geholte Felder = null/[].
+     *
+     * `missions` haengt bewusst am LEICHTEN Poll, obwohl es ein eigener Aufruf ist: dort
+     * stehen bei den systematisch maehenden Modellen (AE/EPOS) die Flaechen SAMT Fortschritt,
+     * und der bewegt sich waehrend des Maehens laufend (gemessen 20.09.2026: "Unten" 4 % ->
+     * 7 % in elf Minuten). Im 15-Minuten-Takt waere die Anzeige die meiste Zeit veraltet.
+     * Ohne die Liste laesst sich ausserdem die aktive missionId nicht in einen Bereichsnamen
+     * aufloesen - genau deshalb stand in `mission` vorher immer der Modus.
+     *
+     * Warum missions und nicht workAreas: an dieser Anlage antwortet /workAreas mit 404, die
+     * Flaechen kommen aus /missions (siehe Fallback in normalizeState). Kostenpunkt ist EIN
+     * zusaetzlicher Aufruf je Poll (leicht: 3 -> 4); die dss-App-API kennt keine Rate-Limits.
      * @return array leeres Array => nicht verfuegbar (Modul setzt Online=false).
      */
     public function readState(bool $full = true): array
@@ -171,7 +182,7 @@ final class HusqvarnaAppApi implements IMower
         $keys  = $full
             ? ['status', 'settings', 'statistics', 'messages', 'missions',
                'timers', 'geofence', 'workAreas', 'stayOutZones', 'robot']
-            : ['status', 'settings', 'robot'];
+            : ['status', 'settings', 'robot', 'missions'];   // missions: siehe unten
         $paths = [
             'status'       => 'mowers/' . $id . '/status',
             'settings'     => 'mowers/' . $id . '/settings',
@@ -1021,6 +1032,9 @@ final class HusqvarnaAppApi implements IMower
                     'name'          => $this->first($wa, ['name', 'attributes.name']),
                     'cuttingHeight' => ($v = $this->first($wa, ['cuttingHeight', 'attributes.cuttingHeight'])) !== null ? (int) $v : null,
                     'enabled'       => ($enabled === null) ? null : (bool) $enabled,
+                    // Die offizielle Automower-Connect-API fuehrt den Fortschritt auch hier.
+                    // Er fehlte, weshalb er bisher nur ueber den missions-Fallback ankam.
+                    'progress'      => ($p = $this->first($wa, ['progress', 'attributes.progress'])) !== null ? (int) $p : null,
                 ];
             }
         }
@@ -1064,10 +1078,16 @@ final class HusqvarnaAppApi implements IMower
         $timers = $this->normalizeTimers($this->timerList($rawTimers));
 
         // ---- aktive Mission ----------------------------------------------
+        // Die dss-App-API nennt den gerade bearbeiteten Arbeitsbereich `missionId` -
+        // NICHT `workAreaId`, wie es die offizielle Automower-Connect-API tut. Ohne
+        // diesen Schluessel blieb `activeWaId` immer null und `mission` fiel auf den
+        // Modus zurueck: in der Anzeige stand jahrelang "Maehen nach Plan" statt
+        // "Hausbereich". Gemessen 20.09.2026 an Lefty: status.missionId = 11675, und
+        // genau diese Id fuehrt workAreas als "Hausbereich".
         $mission = null;
-        $activeWaId = $sr !== null ? $this->first($sr, ['workAreaId', 'mowerStatus.workAreaId']) : null;
+        $activeWaId = $sr !== null ? $this->first($sr, ['workAreaId', 'mowerStatus.workAreaId', 'missionId']) : null;
         if ($activeWaId === null && $rawRobot !== null) {
-            $activeWaId = $this->first($rawRobot, ['status.workAreaId']);
+            $activeWaId = $this->first($rawRobot, ['status.workAreaId', 'status.missionId']);
         }
         if ($activeWaId !== null) {
             foreach ($workAreas as $wa) {
@@ -1085,6 +1105,17 @@ final class HusqvarnaAppApi implements IMower
                             break;
                         }
                     }
+                }
+            }
+        }
+        // Fortschritt GENAU des aktiven Bereichs. Er steht in workAreas, die Zuordnung
+        // aber nur ueber die Id von oben - deshalb hier und nicht beim Einlesen.
+        $missionProgress = null;
+        if ($activeWaId !== null) {
+            foreach ($workAreas as $wa) {
+                if ((string) $wa['id'] === (string) $activeWaId && ($wa['progress'] ?? null) !== null) {
+                    $missionProgress = (int) $wa['progress'];
+                    break;
                 }
             }
         }
@@ -1126,6 +1157,8 @@ final class HusqvarnaAppApi implements IMower
             'firmware'          => ($firmware !== null) ? (string) $firmware : null,
             'updateRequired'    => $updateRequired,
             'mission'           => ($mission !== null) ? (string) $mission : null,
+            'missionAreaId'     => ($activeWaId !== null) ? (string) $activeWaId : null,
+            'missionProgress'   => $missionProgress,
             'lat'               => $lat,
             'lng'               => $lng,
             'positions'         => $positions,

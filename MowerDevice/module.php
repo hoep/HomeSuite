@@ -51,6 +51,7 @@ class MowerDevice extends EntityModule
         'chargingCycles' => 'ChargingCycles', 'bladeHours' => 'BladeHours', 'searchHours' => 'SearchHours',
         'bladeUsagePct' => 'BladeUsagePct', 'efficiencyPct' => 'Efficiency',
         'model' => 'Model', 'firmware' => 'Firmware', 'updateRequired' => 'UpdateRequired', 'mission' => 'Mission',
+        'missionProgress' => 'MissionProgress',
         'cuttingHeight' => 'CuttingHeight', 'headlight' => 'Headlight',
     ];
 
@@ -297,6 +298,11 @@ class MowerDevice extends EntityModule
                  'label' => 'Messer-Verschleiss', 'varType' => 2, 'unit' => ' %', 'actionable' => false],
                 ['ident' => 'Efficiency', 'type' => ControlContract::T_REFLECT, 'role' => 'mower:efficiency',
                  'label' => 'Effizienz', 'varType' => 2, 'unit' => ' %', 'actionable' => false],
+                // Fortschritt des GERADE bearbeiteten Arbeitsbereichs - dieselbe Zahl, die
+                // die Husqvarna-App je Bereich zeigt. Welcher Bereich gemeint ist, steht in
+                // 'Mission'; beides kommt aus derselben Auswertung im Treiber.
+                ['ident' => 'MissionProgress', 'type' => ControlContract::T_REFLECT, 'role' => 'mower:missionprogress',
+                 'label' => 'Fortschritt Bereich', 'varType' => 1, 'unit' => ' %', 'actionable' => false],
                 ['ident' => 'ErrorCode', 'type' => ControlContract::T_REFLECT, 'role' => 'mower:errorcode',
                  'label' => 'Fehlercode', 'varType' => 1, 'actionable' => false],
                 // --- JSON-Reflects (nicht loggen; nur Voll-Poll) ---
