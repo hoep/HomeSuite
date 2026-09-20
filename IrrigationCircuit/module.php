@@ -629,7 +629,7 @@ class IrrigationCircuit extends EntityModule
                 $this->SendDebug('HSIR.gate', 'Start gesperrt: ' . $reason, 0);
                 // Ein NICHT ausgefuehrter Lauf ist auch eine Entscheidung - und die, nach der
                 // man im Zweifel fragt ("warum war heute frueh nichts an?").
-                $this->logDecision('Kein Lauf', $anlass . ' - gesperrt: ' . $reason, $this->entscheidWerte($seconds), true);
+                $this->entscheidungMerken('Kein Lauf', $anlass . ' - gesperrt: ' . $reason, $this->entscheidWerte($seconds), true);
                 return;
             }
         }
@@ -644,7 +644,7 @@ class IrrigationCircuit extends EntityModule
             $this->setReflect('LastRun', 'Schatten: ' . round($seconds / 60) . ' min geplant');
             // real=false: genau dieser Eintrag ist der Beleg, an dem sich entscheiden
             // laesst, ob der Kreis scharf geschaltet werden kann.
-            $this->logDecision(round($seconds / 60) . ' min bewaessern', $anlass, $this->entscheidWerte($seconds), false);
+            $this->entscheidungMerken(round($seconds / 60) . ' min bewaessern', $anlass, $this->entscheidWerte($seconds), false);
             return;
         }
         $caps = $drv->capabilities();
@@ -652,7 +652,7 @@ class IrrigationCircuit extends EntityModule
         $ok = $selfTiming ? $drv->pulse($seconds) : $drv->open();
         if (!$ok) {
             $this->SendDebug('HSIR.run', 'Start fehlgeschlagen', 0);
-            $this->logDecision('Kein Lauf', $anlass . ' - Ventil meldete Fehlschlag', $this->entscheidWerte($seconds), true);
+            $this->entscheidungMerken('Kein Lauf', $anlass . ' - Ventil meldete Fehlschlag', $this->entscheidWerte($seconds), true);
             return;
         }
         $rt = $this->readRt();
@@ -663,7 +663,7 @@ class IrrigationCircuit extends EntityModule
         $this->writeRt($rt);
         $this->setReflect('Running', true);
         $this->setReflect('LastRun', date('d.m. H:i') . ' — ' . round($seconds / 60) . ' min');
-        $this->logDecision(round($seconds / 60) . ' min bewaessern', $anlass, $this->entscheidWerte($seconds), true);
+        $this->entscheidungMerken(round($seconds / 60) . ' min bewaessern', $anlass, $this->entscheidWerte($seconds), true);
         // switch-Modus: Modul schliesst nach der Dauer; duration/script: Geraet timt selbst
         // -> nur Watchdog (Dauer + 30 s Puffer).
         $ms = $selfTiming ? ($seconds * 1000 + 30000) : ($seconds * 1000);

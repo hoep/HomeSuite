@@ -714,7 +714,7 @@ abstract class EntityModule extends \IPSModule
      * @param array  $werte  Eingangsgroessen, auf denen die Entscheidung beruht
      * @param bool   $real   true = wirklich ausgefuehrt, false = nur berechnet (Schatten)
      */
-    protected function logDecision(string $was, string $warum, array $werte = [], bool $real = true): void
+    protected function entscheidungMerken(string $was, string $warum, array $werte = [], bool $real = true): void
     {
         try {
             $e = ['t' => time(), 'was' => $was, 'warum' => $warum, 'real' => $real ? 1 : 0];
