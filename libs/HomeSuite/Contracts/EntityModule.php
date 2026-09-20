@@ -686,6 +686,62 @@ abstract class EntityModule extends \IPSModule
         @$this->SetValue($ident, $json);
     }
 
+    // ==================================================================
+    // Entscheidungsprotokoll
+    // ==================================================================
+    //
+    // Warum das hier und nicht je Modul: bis 20.09.2026 konnte GENAU EIN Modul sagen,
+    // warum es etwas getan hat - ShadingDevice, mit eigenem logDecision() und der
+    // Variablen AutoGrund. Heizung, Bewaesserung, Klima, Pool, Maeher und Licht
+    // begruendeten nichts. Bei einer Automatik im Schatten ist das besonders teuer:
+    // sie rechnet, entscheidet, schaltet nicht - und hinterlaesst keine Spur, an der
+    // man pruefen koennte, ob man ihr trauen kann. Genau diese Spur braucht der
+    // Cutover von Bewaesserung und Klima.
+    //
+    // Bewusst VARIABLEN statt eines Attributs (so macht es ShadingDevice): ein
+    // nachtraeglich ergaenztes Attribut gibt es auf der laufenden Anlage erst nach
+    // einem Kernel-Neustart, eine Variable legt ApplyChanges sofort an. Ausserdem
+    // ist der Zweck ja gerade Sichtbarkeit - im Baum und in der Visualisierung.
+
+    /** Wieviele Entscheidungen je Instanz aufgehoben werden. */
+    protected const ENTSCHEID_MAX = 50;
+
+    /**
+     * Eine Entscheidung festhalten.
+     *
+     * @param string $was    was entschieden wurde, in Worten ("Kreis 12 min bewaessern")
+     * @param string $warum  der Grund ("Zeitfenster 06:00, Regenschranke frei")
+     * @param array  $werte  Eingangsgroessen, auf denen die Entscheidung beruht
+     * @param bool   $real   true = wirklich ausgefuehrt, false = nur berechnet (Schatten)
+     */
+    protected function logDecision(string $was, string $warum, array $werte = [], bool $real = true): void
+    {
+        try {
+            $e = ['t' => time(), 'was' => $was, 'warum' => $warum, 'real' => $real ? 1 : 0];
+            if ($werte !== []) { $e['werte'] = $werte; }
+
+            $vid = @$this->GetIDForIdent('Entscheidungen');
+            $log = [];
+            if ($vid) {
+                $d = json_decode((string) @GetValue($vid), true);
+                if (is_array($d)) { $log = $d; }
+            }
+            $log[] = $e;
+            if (count($log) > static::ENTSCHEID_MAX) {
+                $log = array_slice($log, -static::ENTSCHEID_MAX);
+            }
+            $this->mirrorVar('Entscheidungen', 'Entscheidungen (JSON)', $log, 96);
+
+            // Eine Zeile im Klartext - das ist, was man im Baum und in der Kachel liest,
+            // ohne JSON aufzuklappen. Der Schattenmodus wird ausdruecklich benannt,
+            // sonst liest sich eine berechnete Entscheidung wie eine ausgefuehrte.
+            @$this->RegisterVariableString('AutoGrund', 'Entscheidung wegen', '', 97);
+            @$this->SetValue('AutoGrund', ($real ? '' : '[Schatten] ') . $was . ' - ' . $warum);
+        } catch (\Throwable $e) {
+            // Ein Protokoll darf den Betrieb nie stoeren.
+        }
+    }
+
     /** Domaenen-Hook: Spiegel-Variablen fuer verschachtelte Store-Daten pflegen (Default: nichts). */
     protected function refreshMirrors(): void
     {

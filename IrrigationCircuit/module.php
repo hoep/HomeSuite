@@ -587,9 +587,36 @@ class IrrigationCircuit extends EntityModule
         return null;
     }
 
+    /**
+     * Die Groessen, auf denen eine Laufentscheidung beruht - fuer das Protokoll.
+     *
+     * Ohne sie steht im Log nur das Ergebnis, und die Frage "warum 14 und nicht 20
+     * Minuten" bleibt offen. Die Faktoren sind genau die aus effectiveSeconds().
+     */
+    private function entscheidWerte(int $seconds): array
+    {
+        $w = [
+            'dauer_min'  => round($seconds / 60, 1),
+            'basis_min'  => (float) $this->valOf('Duration', self::DEF_DURATION),
+            'saison_pct' => (float) $this->valOf('SeasonalAdjust', 100),
+            'f_temp'     => round($this->tempFactor(), 2),
+            'f_verdunst' => round($this->evapFactor(), 2),
+        ];
+        $t = $this->tempNow();
+        if ($t !== null) { $w['temperatur_c'] = round($t, 1); }
+        $r = $this->rainNow();
+        if ($r !== null) { $w['regen_mm'] = round((float) $r, 1); }
+        $fc = $this->rainFcRead();
+        if (is_array($fc)) {
+            $w['regen_erwartet_mm'] = round((float) $fc['mm'], 1);
+            if (($fc['prob'] ?? null) !== null) { $w['regen_wkt_pct'] = round((float) $fc['prob']); }
+        }
+        return $w;
+    }
+
     /** Startet einen Bewaesserungslauf ueber $seconds. armed=false -> nur Log (Schatten).
      *  $force=true umgeht die Gates (explizite Bedienung); geplante Laeufe pruefen die Gates. */
-    private function startRun(int $seconds, bool $force = false): void
+    private function startRun(int $seconds, bool $force = false, string $anlass = 'Handbedienung'): void
     {
         if ($seconds <= 0) {
             return;
@@ -600,6 +627,9 @@ class IrrigationCircuit extends EntityModule
                 $this->setReflect('RainBlocked', true);
                 $this->setReflect('LastRun', 'Gesperrt: ' . $reason);
                 $this->SendDebug('HSIR.gate', 'Start gesperrt: ' . $reason, 0);
+                // Ein NICHT ausgefuehrter Lauf ist auch eine Entscheidung - und die, nach der
+                // man im Zweifel fragt ("warum war heute frueh nichts an?").
+                $this->logDecision('Kein Lauf', $anlass . ' - gesperrt: ' . $reason, $this->entscheidWerte($seconds), true);
                 return;
             }
         }
@@ -612,6 +642,9 @@ class IrrigationCircuit extends EntityModule
         if (!(bool) $this->cfgVal('armed', false)) {
             $this->SendDebug('HSIR.shadow', 'WUERDE bewaessern: ' . $seconds . 's (nicht scharf)', 0);
             $this->setReflect('LastRun', 'Schatten: ' . round($seconds / 60) . ' min geplant');
+            // real=false: genau dieser Eintrag ist der Beleg, an dem sich entscheiden
+            // laesst, ob der Kreis scharf geschaltet werden kann.
+            $this->logDecision(round($seconds / 60) . ' min bewaessern', $anlass, $this->entscheidWerte($seconds), false);
             return;
         }
         $caps = $drv->capabilities();
@@ -619,6 +652,7 @@ class IrrigationCircuit extends EntityModule
         $ok = $selfTiming ? $drv->pulse($seconds) : $drv->open();
         if (!$ok) {
             $this->SendDebug('HSIR.run', 'Start fehlgeschlagen', 0);
+            $this->logDecision('Kein Lauf', $anlass . ' - Ventil meldete Fehlschlag', $this->entscheidWerte($seconds), true);
             return;
         }
         $rt = $this->readRt();
@@ -629,6 +663,7 @@ class IrrigationCircuit extends EntityModule
         $this->writeRt($rt);
         $this->setReflect('Running', true);
         $this->setReflect('LastRun', date('d.m. H:i') . ' — ' . round($seconds / 60) . ' min');
+        $this->logDecision(round($seconds / 60) . ' min bewaessern', $anlass, $this->entscheidWerte($seconds), true);
         // switch-Modus: Modul schliesst nach der Dauer; duration/script: Geraet timt selbst
         // -> nur Watchdog (Dauer + 30 s Puffer).
         $ms = $selfTiming ? ($seconds * 1000 + 30000) : ($seconds * 1000);
@@ -772,7 +807,7 @@ class IrrigationCircuit extends EntityModule
         $rt    = $this->readRt();
         $prev  = !empty($rt['schedOn']);
         if ($onNow && !$prev) {
-            $this->startRun($this->effectiveSeconds(), false); // geplant -> Gates aktiv
+            $this->startRun($this->effectiveSeconds(), false, 'Zeitplan'); // geplant -> Gates aktiv
             $rt = $this->readRt();
             $rt['lastRunDate'] = date('Y-m-d', $now); // Anker fuer "jeden n-ten Tag"
         } elseif (!$onNow && $prev && !empty($rt['running'])) {
