@@ -181,6 +181,7 @@ class IrrigationCircuit extends EntityModule
 
         $active = $this->driver() instanceof IValve;
         $this->SetTimerInterval(self::TIMER_REFRESH, $active ? $this->refreshMs() : 0);
+        $this->rueckmeldungHorchen();
         $this->syncReferences();
         $this->updateHealth();
 
@@ -656,7 +657,67 @@ class IrrigationCircuit extends EntityModule
     }
 
     /** Timer-Callback (HSIR_Refresh): Ist-Zustand spiegeln + Watchdog. */
-    public function Refresh(): void
+    /**
+     * Auf die Ist-Rueckmeldung des Ventils horchen.
+     *
+     * Ohne das hier kam ein Ventilzustand erst mit dem Refresh-Timer an - bei
+     * QueryInterval 30 also im Mittel 15 Sekunden nach dem Aufdrehen. An dieser Anlage
+     * fahren alle sechs Kreise im Modus "duration" ueber Start-/Stop-Impulse; die
+     * einzige Zustandsquelle ist FeedbackVarId. SwitchVarId wird mitgenommen, weil der
+     * Schalt-Modus sie als Zustand fuehrt.
+     *
+     * FlowVarId und SensorId bleiben bewusst aussen vor: ein Durchflusszaehler meldet
+     * im Sekundentakt, und der Regen-/Feuchtesensor aendert sich langsam - beide
+     * rechtfertigen keine Kernel-Thread-Last.
+     */
+    private function rueckmeldungHorchen(): void
+    {
+        $want = [];
+        foreach (['FeedbackVarId', 'SwitchVarId'] as $prop) {
+            $vid = (int) $this->ReadPropertyInteger($prop);
+            if ($vid > 0 && @\IPS_VariableExists($vid)) {
+                $want[] = $vid;
+            }
+        }
+        $want = array_values(array_unique($want));
+
+        $rt  = $this->readRt();
+        $old = is_array($rt['watchState'] ?? null) ? $rt['watchState'] : [];
+        foreach ($old as $v) {
+            if (!in_array((int) $v, $want, true)) {
+                @$this->UnregisterMessage((int) $v, VM_UPDATE);
+            }
+        }
+        // Immer neu registrieren: die Anmeldungen ueberleben einen Reload nicht,
+        // rt.watchState schon.
+        foreach ($want as $v) {
+            @$this->RegisterMessage($v, VM_UPDATE);
+        }
+        $rt['watchState'] = $want;
+        $this->writeRt($rt);
+    }
+
+    public function MessageSink($Timestamp, $Sender, $Message, $Data)
+    {
+        parent::MessageSink($Timestamp, $Sender, $Message, $Data);
+        if ((int) $Message !== 10603 /* VM_UPDATE */) {
+            return;
+        }
+        $rt = $this->readRt();
+        $w  = is_array($rt['watchState'] ?? null) ? array_map('intval', $rt['watchState']) : [];
+        if (in_array((int) $Sender, $w, true)) {
+            $this->zustandSpiegeln();
+        }
+    }
+
+    /**
+     * Nur den Ist-Zustand des Ventils spiegeln - ohne Watchdog und ohne Zeitplan.
+     *
+     * Diese Trennung ist der Grund, warum MessageSink nicht Refresh() ruft: Refresh
+     * stoesst runSchedule() an und koennte damit aus dem Kernel-Thread heraus eine
+     * Bewaesserung STARTEN. Eine Rueckmeldung des Ventils darf das nie ausloesen.
+     */
+    private function zustandSpiegeln(): void
     {
         $drv = $this->driver();
         if (!$drv instanceof IValve) {
@@ -667,6 +728,15 @@ class IrrigationCircuit extends EntityModule
             $this->setReflect('Running', (bool) $open);
             $this->setReflect('Online', true);
         }
+    }
+
+    public function Refresh(): void
+    {
+        $drv = $this->driver();
+        if (!$drv instanceof IValve) {
+            return;
+        }
+        $this->zustandSpiegeln();
         // Watchdog: laeuft laenger als Dauer + Puffer -> hart stoppen.
         $rt = $this->readRt();
         if (!empty($rt['running'])) {

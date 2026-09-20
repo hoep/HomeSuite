@@ -610,6 +610,10 @@ class HeatingZone extends EntityModule
         // lauschen (jemand verstellt am Geraet/HM-Oberflaeche).
         $this->registerSetpointWatch($drv);
 
+        // Ist-Werte: ohne Anmeldung kaemen sie erst mit dem Refresh-Timer an
+        // (QueryInterval 30 s). Siehe registerStateWatch().
+        $this->registerStateWatch($drv);
+
         // Aufraeumen: frueher angelegte native Wochenplan-Ereignisse (HeatSchedule_*)
         // entfernen — fuer stufenlose Solltemperaturen ungeeignet (Symcon-Limits).
         $this->cleanupHeatEvents();
@@ -1205,8 +1209,26 @@ class HeatingZone extends EntityModule
             return;
         }
         $rt = $this->readRt();
+
+        // Ist-Wert-Aenderung: nur spiegeln. Bewusst NICHT Refresh(), denn das
+        // enthaelt reconcile() und wuerde aus dem Kernel-Thread heraus aufs Geraet
+        // schreiben.
+        if (in_array((int) $Sender, array_map('intval', is_array($rt['watchState'] ?? null) ? $rt['watchState'] : []), true)) {
+            $drv = $this->driver();
+            if ($drv instanceof IThermostat) {
+                $this->reflectFromDriver($drv);
+            }
+            return;
+        }
+
         if ((int) ($rt['watchVid'] ?? 0) !== (int) $Sender) {
             return;
+        }
+        // Der Sollwert ist auch eine Anzeige - ohne das hier stuende der alte Wert
+        // bis zum naechsten Timer-Takt in der Visualisierung.
+        $drv = $this->driver();
+        if ($drv instanceof IThermostat) {
+            $this->reflectFromDriver($drv);
         }
         $newVal = isset($Data[0]) && is_numeric($Data[0]) ? (float) $Data[0] : null;
         if ($newVal === null) {
@@ -1257,6 +1279,81 @@ class HeatingZone extends EntityModule
     }
 
     /** Objekt-ID der geraeteseitigen Sollwertvariable (fuer den Watch). */
+    /**
+     * Auf die IST-Variablen des Geraets horchen.
+     *
+     * Der Sollwert war schon angemeldet - aber nur, um einen Griff ans Thermostat als
+     * Manuell-Eingriff zu erkennen. Gespiegelt wurde erst beim naechsten Timer-Takt,
+     * bei QueryInterval 30 also im Mittel 15 Sekunden spaeter. Fuer die Anzeige ist
+     * das der gleiche Verzug, den LightDevice beim Licht hatte.
+     *
+     * Angemeldet wird die Ist-Temperatur (am Geraet oder am getrennten Sensor). Der
+     * Sollwert steckt bereits in watchVid und wird hier nicht doppelt registriert -
+     * IPS haelt die Liste zwar eindeutig, aber das Abmelden unten wuerde ihn sonst
+     * der Manuell-Erkennung wegnehmen.
+     */
+    private function registerStateWatch(?IThermostat $drv): void
+    {
+        $want = [];
+        if ($drv instanceof IThermostat) {
+            $spVid = $this->deviceSetpointVarId($drv);
+            foreach ($this->deviceActualVarIds() as $v) {
+                if ((int) $v > 0 && (int) $v !== (int) $spVid) {
+                    $want[] = (int) $v;
+                }
+            }
+        }
+        $want = array_values(array_unique($want));
+
+        $rt  = $this->readRt();
+        $old = is_array($rt['watchState'] ?? null) ? $rt['watchState'] : [];
+        foreach ($old as $v) {
+            if (!in_array((int) $v, $want, true)) {
+                @$this->UnregisterMessage((int) $v, VM_UPDATE);
+            }
+        }
+        // Wie beim Sollwert IMMER registrieren: nach Reload/Restart sind die
+        // Anmeldungen weg, waehrend rt.watchState weiterlebt.
+        foreach ($want as $v) {
+            @$this->RegisterMessage($v, VM_UPDATE);
+        }
+        $rt['watchState'] = $want;
+        $this->writeRt($rt);
+    }
+
+    /**
+     * Ist-Temperatur-Variable(n) des Geraets.
+     *
+     * Bei hm-* ist config.targetId die Kanalinstanz; ein getrennter Sensor steht in
+     * der Property SensorId und darf entweder selbst eine Variable oder wiederum eine
+     * Instanz sein (so ist das Formularfeld beschrieben).
+     */
+    private function deviceActualVarIds(): array
+    {
+        $out    = [];
+        $cfg    = $this->cfg();
+        $target = (int) $cfg['targetId'];
+        $driver = (string) $cfg['driver'];
+
+        if ($target > 0 && strncmp($driver, 'hm-', 3) === 0) {
+            $a = @\IPS_GetObjectIDByIdent('ACTUAL_TEMPERATURE', $target);
+            if (is_int($a) && $a > 0) { $out[] = $a; }
+        }
+
+        $sensor = (int) $this->ReadPropertyInteger('SensorId');
+        if ($sensor > 0) {
+            if (@\IPS_VariableExists($sensor)) {
+                $out[] = $sensor;
+            } elseif (@\IPS_InstanceExists($sensor)) {
+                foreach (['ACTUAL_TEMPERATURE', 'TEMPERATURE'] as $ident) {
+                    $v = @\IPS_GetObjectIDByIdent($ident, $sensor);
+                    if (is_int($v) && $v > 0) { $out[] = $v; break; }
+                }
+            }
+        }
+        return $out;
+    }
+
     private function deviceSetpointVarId(IThermostat $drv): int
     {
         // Generisch: config.targetId ist bei generic die Sollwert-Variable,
