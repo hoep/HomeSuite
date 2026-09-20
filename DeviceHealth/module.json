@@ -1,0 +1,13 @@
+{
+    "id": "{76B650A1-98ED-4B9D-8C86-ED3D6C2C95A7}",
+    "name": "DeviceHealth",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["DeviceHealth", "Geraetegesundheit", "Gerätegesundheit", "Erreichbarkeit", "Funkqualitaet"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSDH",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "hidden": false
+}
