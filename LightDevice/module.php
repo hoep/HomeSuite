@@ -178,8 +178,49 @@ class LightDevice extends EntityModule
 
         $active = $this->driver() instanceof ILight;
         $this->SetTimerInterval(self::TIMER_REFRESH, $active ? $this->refreshIntervalMs() : 0);
+        $this->quellenHorchen();
         $this->syncReferences();
         $this->updateHealth();
+    }
+
+    /**
+     * Auf die gebundenen Quellvariablen horchen.
+     *
+     * Ohne das hier kam ein Schaltzustand erst mit dem naechsten Timer-Takt an - bei
+     * QueryInterval 30 also im Mittel 15 Sekunden spaeter. Der Weg von HomeSuite in die
+     * Visualisierung ist laengst ereignisgetrieben; die Bremse sass davor, beim Abholen
+     * aus der Geraetevariablen.
+     *
+     * Watt wird bewusst NICHT angemeldet: Leistungsmesser melden im Sekundentakt, und
+     * ein Auffrischen je Messwert waere Dauerlast im Kernel-Thread fuer eine Anzeige,
+     * die auf 30 Sekunden genau reicht.
+     */
+    private function quellenHorchen(): void
+    {
+        // Erst abmelden, was frueher gebunden war - sonst haengt die Instanz nach dem
+        // Umbinden weiter an der alten Variablen. Sender 0 ist die Kernel-Anmeldung
+        // der Basisklasse und bleibt.
+        foreach ((array) @$this->GetMessageList() as $sid => $msgs) {
+            if ((int) $sid > 0 && in_array(10603 /* VM_UPDATE */, (array) $msgs, true)) {
+                @$this->UnregisterMessage((int) $sid, 10603);
+            }
+        }
+        foreach (['SwitchVarId', 'LevelVarId', 'ColorVarId', 'CctVarId'] as $prop) {
+            $vid = (int) $this->ReadPropertyInteger($prop);
+            if ($vid > 0 && @\IPS_VariableExists($vid)) {
+                @$this->RegisterMessage($vid, 10603 /* VM_UPDATE */);
+            }
+        }
+    }
+
+    public function MessageSink($Timestamp, $Sender, $Message, $Data)
+    {
+        parent::MessageSink($Timestamp, $Sender, $Message, $Data);
+        if ((int) $Message === 10603 /* VM_UPDATE */) {
+            // readState() liest nur Variablen, kein Geraetezugriff - der Kernel-Thread
+            // wird dadurch nicht aufgehalten.
+            $this->Refresh();
+        }
     }
 
     // ==================================================================
