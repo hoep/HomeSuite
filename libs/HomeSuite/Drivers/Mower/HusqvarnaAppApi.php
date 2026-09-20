@@ -891,7 +891,15 @@ final class HusqvarnaAppApi implements IMower
         if ($nsRaw === null && $rawRobot !== null) {
             $nsRaw = $this->g($rawRobot, 'status.nextStartTimestamp');
         }
+        // Derselbe Ortszeit-als-UTC-Versatz wie bei den Meldungen weiter unten: der
+        // naechste Start stand dadurch zwei Stunden zu spaet. Gemessen 20.09.2026 an
+        // Lefty - Rohwert 1789929156 ergibt lokal formatiert 20:32:36, die App nennt
+        // 18:32. Dass storedTimestamp aus DERSELBEN Antwort ein korrekter UTC-Wert ist
+        // (gegengeprueft: lokal 18:14:34 bei echter Serverzeit 18:14:37), macht es
+        // heimtueckisch - die Felder folgen zwei verschiedenen Regeln.
+        // date('Z', ...) statt einer festen Zahl, damit Winter- und Sommerzeit stimmen.
         $nextStart     = ($nsRaw !== null) ? (int) $nsRaw : null;
+        if ($nextStart !== null && $nextStart > 0) { $nextStart -= (int) date('Z', $nextStart); }
         $nextStartText = ($nextStart !== null && $nextStart > 0)
             ? date('Y-m-d H:i:s', $nextStart)
             : (($nextStart !== null) ? 'Nicht geplant' : null);
