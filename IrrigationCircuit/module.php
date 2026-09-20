@@ -139,6 +139,7 @@ class IrrigationCircuit extends EntityModule
                 ['op' => 'computeProbe',   'label' => 'Dauer/Gate-Berechnung (Trockenlauf)'],
                 ['op' => 'updateProfile',  'label' => 'Wochenplan bearbeiten'],
                 ['op' => 'getSchedule',    'label' => 'Wochenplan lesen'],
+                ['op' => 'rebuildSchedule', 'label' => 'Wochenplan aus dem Zeitplan neu aufbauen'],
                 ['op' => 'importLegacy',   'label' => 'Aus IPSWatering importieren'],
             ],
 
@@ -249,6 +250,35 @@ class IrrigationCircuit extends EntityModule
                 $prev = (int) ($s['end'] ?? 1440);
             }
         }
+    }
+
+    /**
+     * Wochenplan-Ereignis aus dem Zeitplan-Store NEU aufbauen.
+     *
+     * ensureScheduleEvent() migriert nur EINMAL - bei frisch angelegtem Ereignis oder
+     * wenn es noch keine Punkte hat. Das ist als Schutz gedacht, damit eine Handaenderung
+     * am Ereignis nicht beim naechsten ApplyChanges ueberschrieben wird. Die Kehrseite:
+     * wird der Store spaeter korrigiert - etwa durch einen erneuten Import - erreicht das
+     * das Ereignis nie mehr, und der Plan bleibt auf einem Altstand stehen, ohne dass es
+     * jemand bemerkt.
+     *
+     * Genau das war am 20.09.2026 der Fall: der Store trug die richtigen Zeiten
+     * (Buchshecke 05:00 und 21:00), das Ereignis einen eingefrorenen Stand mit 15:07 und
+     * nur einem Fenster. Die Archivhistorie der Ventil-Rueckmeldung belegte den Store.
+     */
+    private function mgmtRebuildSchedule(): array
+    {
+        $eid = $this->wateringEventId();
+        if ($eid <= 0) {
+            $this->ensureScheduleEvent();
+            $eid = $this->wateringEventId();
+        }
+        if ($eid <= 0) { return ['ok' => false, 'error' => 'kein Wochenplan-Ereignis']; }
+        $this->migrateScheduleToEvent($eid);
+        $e = @\IPS_GetEvent($eid);
+        $n = 0;
+        foreach (($e['ScheduleGroups'] ?? []) as $g) { $n += count($g['Points'] ?? []); }
+        return ['ok' => true, 'eventId' => $eid, 'points' => $n];
     }
 
     /** Liest den nativen Wochenplan: ist zur Zeit $now die Aktion 'An' (1) aktiv? */
@@ -884,6 +914,8 @@ class IrrigationCircuit extends EntityModule
                 return $this->mgmtUpdateProfile($args, $ctx);
             case 'getSchedule':
                 return $this->mgmtGetSchedule($args);
+            case 'rebuildSchedule':
+                return $this->mgmtRebuildSchedule();
             default:
                 return parent::mgmt($op, $args, $ctx);
         }
