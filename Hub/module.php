@@ -2354,6 +2354,17 @@ class HomeSuiteHub extends EntityModule
     {
         $limit = max(1, min(1000, (int) ($args['limit'] ?? 300)));
         $out   = [];
+        // Raum = die ELTERN-Instanz, wenn sie ein HSSP-Bereich ist. Alles andere ist ein
+        // Geraetename und gehoert NICHT in die Raumspalte: "Beschattung Sued" ist die Zone,
+        // der Raum dazu heisst Esszimmer. Ich hatte das fuer die Beschattung verwechselt.
+        $raumVon = function (int $iid): string {
+            $p = (int) @\IPS_GetParent($iid);
+            if ($p > 0 && @\IPS_InstanceExists($p)
+                && (string) (@\IPS_GetInstance($p)['ModuleInfo']['ModuleID'] ?? '') === self::GUID_HSSP) {
+                return (string) @\IPS_GetName($p);
+            }
+            return '';
+        };
         foreach (@\IPS_GetInstanceList() ?: [] as $iid) {
             $vid = 0;
             foreach (@\IPS_GetChildrenIDs($iid) ?: [] as $c) {
@@ -2373,12 +2384,7 @@ class HomeSuiteHub extends EntityModule
             // sitzen direkt unter der HomeSuite-Wurzel - dort stand deshalb "HomeSuite" als
             // Raum, und das ist Unsinn. Ein Raum ist eine HSSP-Instanz (Space); alles
             // andere bleibt leer, dann zeigt die Tabelle den Geraetenamen.
-            $eltern = (int) @\IPS_GetParent($iid);
-            $raum = '';
-            if ($eltern > 0 && @\IPS_InstanceExists($eltern)
-                && (string) (@\IPS_GetInstance($eltern)['ModuleInfo']['ModuleID'] ?? '') === self::GUID_HSSP) {
-                $raum = (string) @\IPS_GetName($eltern);
-            }
+            $raum = $raumVon($iid);
             // Ein Raumname allein ist mehrdeutig: "Schlafzimmer" gibt es an mehreren
             // Standorten. standortVon() laeuft die Elternkette hoch bis zur HSSP-Instanz
             // der Art "Haus" - Bennogasse, Hausleitnerweg, BellaDuna, BellaVista.
@@ -2439,8 +2445,10 @@ class HomeSuiteHub extends EntityModule
             $out[] = [
                 't'       => (int) ($e['t'] ?? 0),
                 'iid'     => (int) ($e['id'] ?? 0),
+                // $e['room'] liefert HSSH getLog als ZONENname ("Beschattung Sued") - das
+                // ist das Geraet. Der Raum kommt wie ueberall sonst aus der Elternschaft.
                 'geraet'  => (string) ($e['room'] ?? ''),
-                'raum'    => (string) ($e['room'] ?? ''),
+                'raum'    => $raumVon((int) ($e['id'] ?? 0)),
                 'ort'     => (function (int $z): string {
                     $h = $z > 0 ? $this->standortVon($z) : 0;
                     return $h > 0 ? (string) @\IPS_GetName($h) : '';
