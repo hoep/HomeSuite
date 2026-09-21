@@ -55,6 +55,7 @@ class HeatingZone extends EntityModule
 
     /** Periodisches Re-Assert des Sollwerts spaetestens alle N Sekunden (Failsafe). */
     private const REASSERT_SECONDS = 300;
+    private const SETTLE_SECONDS   = 30;   // Ruhefenster nach ApplyChanges
 
     /**
      * Mindestabstand zwischen zwei CCU-Profilzugriffen - ueber ALLE Zonen hinweg.
@@ -613,6 +614,16 @@ class HeatingZone extends EntityModule
         // Ist-Werte: ohne Anmeldung kaemen sie erst mit dem Refresh-Timer an
         // (QueryInterval 30 s). Siehe registerStateWatch().
         $this->registerStateWatch($drv);
+
+        // Einschwing-Fenster merken. Das Neu-Anmelden laesst JEDES gebundene Geraet
+        // sofort seinen Sollwert melden; zu diesem Zeitpunkt steht die aktive
+        // Zeitplan-Variante noch nicht zuverlaessig fest, und der Vergleich gegen den
+        // Plan liefert Unsinn. Am 21.09.2026 trugen dadurch 21 von 28 Zonen binnen
+        // Sekunden einen "Handeingriff" ein - gedreht hatte niemand, pruefePush meldete
+        // hinterher fuer alle 28 Zonen Gleichstand mit dem Plan.
+        $rt = $this->readRt();
+        $rt['applyTs'] = time();
+        $this->writeRt($rt);
 
         // Aufraeumen: frueher angelegte native Wochenplan-Ereignisse (HeatSchedule_*)
         // entfernen — fuer stufenlose Solltemperaturen ungeeignet (Symcon-Limits).
@@ -1279,12 +1290,36 @@ class HeatingZone extends EntityModule
             return;
         }
         // Externer Eingriff -> Override bis zur naechsten Slot-Grenze halten.
+        // NICHT jede fremde Aenderung ist ein Mensch. Alle HomeMatic-Thermostate laufen im
+        // Geraete-Modus (capabilities.scheduleMode = 'device'): das Geraet fuehrt sein
+        // Wochenprogramm SELBST und schreibt an jeder Slot-Grenze einen neuen Sollwert.
+        // Bis 21.09.2026 galt das als Handeingriff - sechs Zonen trugen binnen Sekunden
+        // einen solchen Eintrag, und gedreht hatte niemand.
+        //
+        // Unterscheiden laesst es sich am Wert: stimmt der neue Sollwert mit dem ueberein,
+        // den der hinterlegte Plan fuer JETZT vorsieht, war es das Programm. Weicht er ab,
+        // hat jemand gedreht. Nur dann ein Hold - im controller-Modus wuerde der sonst das
+        // Nachfuehren bis zur naechsten Slot-Grenze aussetzen.
+        // Kurz nach ApplyChanges ist eine fremde Sollwert-Meldung fast sicher die
+        // Wiederanmeldung, kein Mensch. Lieber einen echten Eingriff in diesen
+        // Sekunden verpassen als jedes Mal 28 Fehleintraege erzeugen.
+        if ((time() - (int) ($rt['applyTs'] ?? 0)) < self::SETTLE_SECONDS) {
+            $this->SendDebug('HSHT.override', 'Sollwert ' . $newVal . ' im Einschwing-Fenster -> ignoriert', 0);
+            return;
+        }
+        $geplant = $this->desiredSetpoint($this->intVal('Mode'));
+        if ($geplant !== null && abs($geplant - $newVal) < 0.01) {
+            $this->SendDebug('HSHT.override', 'Sollwert ' . $newVal . ' = Plan -> Geraeteprogramm, kein Hold', 0);
+            $this->heizMerken($newVal, 'Wochenprogramm des Geraets', null);
+            return;
+        }
         $this->manualHold('Setpoint', $this->secondsToNextBoundary($this->activeVariant()));
         $this->SendDebug('HSHT.override', 'Externer Sollwert ' . $newVal . ' erkannt -> Hold bis Slot-Grenze', 0);
         // Ein Griff ans Thermostat ist die Entscheidung eines MENSCHEN - die gehoert
         // sichtbar ins Protokoll, sonst wundert man sich spaeter, warum der Plan nicht griff.
         $this->entscheidungMerken('Sollwert ' . round($newVal, 1) . ' C', 'Handeingriff am Geraet',
-            ['soll_c' => round($newVal, 1), 'hold_bis_slotgrenze' => true], true);
+            ['soll_c' => round($newVal, 1), 'geplant_c' => $geplant === null ? null : round($geplant, 1),
+             'hold_bis_slotgrenze' => true], true);
     }
 
     /** Sekunden bis zur naechsten Slot-Grenze der aktiven Variante (Default 1 h). */
