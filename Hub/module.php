@@ -653,7 +653,7 @@ class HomeSuiteHub extends EntityModule
     }
 
     /** Idents der Scharf-Master je Domaene (Bool-Master + Integer-Mode-Var <ident>Mode). */
-    private const ARM_IDENTS = ['ArmLight', 'ArmHeating', 'ArmShading', 'ArmIrrigation', 'ArmAudio', 'ArmPool', 'ArmMower', 'ArmClimate'];
+    private const ARM_IDENTS = ['ArmLight', 'ArmHeating', 'ArmShading', 'ArmIrrigation', 'ArmAudio', 'ArmPool', 'ArmMower', 'ArmClimate', 'ArmEnergy'];
 
     /**
      * 3-Zustand-Master (Aus/Auto/Scharf): Profil + je Domaene eine Integer-Mode-Variable <ident>Mode

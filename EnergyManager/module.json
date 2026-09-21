@@ -1,0 +1,13 @@
+{
+    "id": "{9536CCA2-1C32-1B76-763E-6B72B7D14554}",
+    "name": "EnergyManager",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["EnergyManager", "Energie", "Lastverschiebung", "Strompreis"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSEN",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "hidden": false
+}

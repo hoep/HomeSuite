@@ -33,6 +33,7 @@ ModuleType-Angabe (sie ist Container, kein Modul).
 | `HSPC`  | PoolController (ProCon.IP Pool-Steuerung)     | `{878CA345-86D1-84FC-B196-5B3224C067CF}` | 3          |
 | `HSSC`  | SecurityCenter (Waechter, Einbruchmeldung)    | `{0E7216C3-FCCA-41FF-BE4E-E5939D9AA571}` | 3          |
 | `HSDH`  | DeviceHealth (Erreichbarkeit, Funkqualitaet)  | `{76B650A1-98ED-4B9D-8C86-ED3D6C2C95A7}` | 3          |
+| `HSEN`  | EnergyManager (Lastverschiebung, Strompreis)  | `{9536CCA2-1C32-1B76-763E-6B72B7D14554}` | 3          |
 
 ## Audio-Bridges (Splitter, type 2)
 

@@ -600,7 +600,8 @@ abstract class EntityModule extends \IPSModule
     protected function armGateIdent(): string
     {
         $m = ['Licht' => 'ArmLight', 'Heizung' => 'ArmHeating', 'Beschattung' => 'ArmShading',
-              'Bewässerung' => 'ArmIrrigation', 'Audio' => 'ArmAudio', 'Pool' => 'ArmPool', 'Mäher' => 'ArmMower'];
+              'Bewässerung' => 'ArmIrrigation', 'Audio' => 'ArmAudio', 'Pool' => 'ArmPool', 'Mäher' => 'ArmMower',
+              'Energie' => 'ArmEnergy'];
         return $m[$this->entityLabel()] ?? '';
     }
 
