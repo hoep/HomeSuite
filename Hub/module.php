@@ -1206,7 +1206,7 @@ class HomeSuiteHub extends EntityModule
         return $bleibt;
     }
 
-    private function applyScene(array $scene, bool $ein = true): array
+    private function applyScene(array $scene, bool $ein = true, string $grund = 'Szene von Hand'): array
     {
         $applied = 0; $skipped = 0; $pending = [];
         $set = function (int $iid, string $ident, $val) {
@@ -1231,6 +1231,15 @@ class HomeSuiteHub extends EntityModule
             if ($on && (int) ($m['color'] ?? -1) >= 0) { $set($iid, 'Color', (int) $m['color']); }
             $applied++;
         }
+        // Eine Szene ist EINE Entscheidung, auch wenn sie vierzig Leuchten anfasst -
+        // ein Eintrag je Lampe waere im Gesamtlog unlesbar. Szenen laufen ausserdem
+        // NICHT ueber autoSetDevice, waeren hier also sonst gar nicht sichtbar.
+        $this->entscheidungMerken(
+            'Szene „' . (string) ($scene['name'] ?? ($scene['id'] ?? '?')) . '" ' . ($ein ? 'an' : 'aus'),
+            $grund,
+            ['geschaltet' => $applied] + ($skipped > 0 ? ['uebersprungen' => $skipped] : []),
+            true
+        );
         // Schaltbare Variablen: RequestAction, wenn die Variable eine Aktion hat, sonst
         // SetValue. Der Wert wird auf den Typ der Variablen gecastet - der Editor kennt
         // nur Text, ein Integer-Ziel bekaeme sonst "1" statt 1.
@@ -1639,7 +1648,8 @@ class HomeSuiteHub extends EntityModule
                 if ($sc) {
                     // Richtung kommt aus der Regel: eine Szene kann angewandt ODER
                     // ausgeschaltet werden. Fehlt die Angabe, gilt wie bisher "ein".
-                    $r = $this->applyScene($sc, (bool) ($act['ein'] ?? true));
+                    $rn = trim((string) ($act['name'] ?? '')) !== '' ? (string) $act['name'] : 'Zeitregel';
+                    $r = $this->applyScene($sc, (bool) ($act['ein'] ?? true), 'Regel "' . $rn . '"');
                     // Ein Schaltbefehl kann verpuffen. Die Kante feuert nur einmal, also
                     // wird das Ergebnis in den naechsten Durchgaengen nachgeprueft.
                     foreach ((array) ($r['pending'] ?? []) as $p) {

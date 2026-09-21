@@ -1438,6 +1438,15 @@ class PoolController extends EntityModule
             $this->writeRt($rt);
             $this->SendDebug('HSPC.circ', 'Filterzeit gesetzt: ' . $opt . ' min ab '
                 . sprintf('%02d:%02d', intdiv($start, 60), $start % 60), 0);
+            // Die Umwaelzautomatik ist die einzige Stelle, an der der Pool von sich aus
+            // etwas aendert - und sie tut es hoechstens stuendlich. Genau deshalb gehoert
+            // sie ins Protokoll: wer spaeter fragt, warum die Pumpe laenger lief, findet
+            // hier die Wassertemperatur, aus der die Dauer gerechnet wurde.
+            $w = ['filterzeit_min' => $opt,
+                  'fenster_ab' => sprintf('%02d:%02d', intdiv($start, 60), $start % 60)];
+            $t = @$this->GetValue('TruePoolTemp');
+            if (is_numeric($t)) { $w['wassertemperatur_c'] = round((float) $t, 1); }
+            $this->entscheidungMerken('Filterzeit ' . $opt . ' min', 'Umwälzautomatik', $w, true);
         }
     }
 
@@ -1498,6 +1507,10 @@ class PoolController extends EntityModule
     {
         if (!(bool) $this->cfgVal('armed', false)) {
             $this->SendDebug('HSPC.shadow', $what . ' (Schatten-Modus: nicht real ausgefuehrt)', 0);
+            // Nur der SCHATTENFALL wird protokolliert, nicht jeder erlaubte Schreibvorgang:
+            // die neun Aufrufer schreiben teils in Folge, und ein Eintrag je Schreibbefehl
+            // waere Rauschen. Interessant ist, was das Gate VERHINDERT hat.
+            $this->entscheidungMerken($what, 'Schatten-Modus - nicht ausgeführt', [], false);
             return false;
         }
         return true;
