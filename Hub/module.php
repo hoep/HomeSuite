@@ -1764,11 +1764,21 @@ class HomeSuiteHub extends EntityModule
         if (isset($rule['rampMin'])) { $args['rampMin'] = (int) $rule['rampMin']; }
 
         $r = json_decode((string) @\HSAU_Manage($az, json_encode(['op' => 'wake', 'args' => $args])), true);
+        // Der Wecker ist die einzige AUTOMATISCHE Entscheidung im Audiobereich - alles
+        // andere dort ist nutzergetrieben und gehoert nicht in ein Entscheidungsprotokoll.
+        // Der Fehlschlag wird ausdruecklich mitgeschrieben: ein Wecker, der nicht geweckt
+        // hat, ist die Art von Vorfall, die man am naechsten Morgen erklaert haben will.
+        $zone  = (string) (@\IPS_GetName($az) ?: ('Zone ' . $az));
+        $wname = trim((string) ($rule['name'] ?? '')) !== '' ? (string) $rule['name'] : 'Wecker';
+        $werte = ['zone' => $zone, 'quelle' => $kind . ' ' . $id];
+        if (isset($rule['volume'])) { $werte['lautstaerke'] = (int) $rule['volume']; }
         if (!is_array($r) || empty($r['ok'])) {
             $this->LogMessage('Wecken fehlgeschlagen (Zone ' . $az . ', ' . $kind . ' ' . $id . '): '
                 . substr((string) json_encode($r), 0, 120), KL_WARNING);
+            $this->entscheidungMerken('Wecken FEHLGESCHLAGEN - ' . $zone, 'Regel „' . $wname . '"', $werte, true);
             return;
         }
+        $this->entscheidungMerken('Wecken - ' . $zone, 'Regel „' . $wname . '"', $werte, true);
 
         // Selbsttaetiges Ausschalten: der Wecker soll nicht bis zum Abend spielen.
         // Dafuer gibt es den Sleep-Timer der Zone - kein zweiter Mechanismus, und er
@@ -2330,7 +2340,10 @@ class HomeSuiteHub extends EntityModule
     /** Modulname -> Domaenenname fuer den Filter im Log. */
     private const DOMAENEN = [
         'HeatingZone' => 'Heizung', 'IrrigationCircuit' => 'Bewässerung', 'ClimateZone' => 'Klima',
-        'ShadingDevice' => 'Beschattung', 'LightDevice' => 'Licht', 'Hub' => 'Licht-Automatik',
+        'ShadingDevice' => 'Beschattung', 'LightDevice' => 'Licht',
+        // Der Hub meldet sich als "HomeSuite Hub". Er protokolliert Lichtautomatik,
+        // Szenen UND Wecker - deshalb der uebergreifende Name, nicht "Licht-Automatik".
+        'Hub' => 'Automatik', 'HomeSuite Hub' => 'Automatik',
         'PoolController' => 'Pool', 'MowerDevice' => 'Mäher', 'AudioZone' => 'Audio',
         'SecurityCenter' => 'Wächter', 'GardenaDevice' => 'Gardena', 'DeviceHealth' => 'Geräte',
     ];
