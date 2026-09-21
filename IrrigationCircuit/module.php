@@ -52,6 +52,9 @@ class IrrigationCircuit extends EntityModule
     private const DEF_FC_THRESH_MM  = 3.0;
     private const DEF_FC_MIN_PROB   = 60;  // Prozent
     private const DEF_SUM_THRESH_MM = 4.0; // Wasserbilanz gefallen+erwartet
+    private const DEF_SEASON_FROM   = 4;   // Saison April ...
+    private const DEF_SEASON_TO     = 10;  // ... bis Oktober
+    private const DEF_FROST_MIN_C   = 3.0; // Nachttiefstwert, darunter nicht bewaessern
 
     private const TIMER_REFRESH = 'Refresh';   // zyklisch: Reflect + Watchdog
     private const TIMER_RUNSTOP = 'RunStop';    // Ein-Schuss: getimtes Schliessen (switch-Modus)
@@ -462,6 +465,82 @@ class IrrigationCircuit extends EntityModule
     }
 
     /** Konfiguration der Regenvorhersage. */
+    /**
+     * Saisonfenster (Monate) und Frostschutz.
+     *
+     * Die Kaelteregel blockBelowC misst den AUGENBLICK. Fuer den Winter reicht das nicht,
+     * und zwar aus drei Gruenden, die alle real sind: ein milder Oktoberabend mit 12 Grad
+     * laesst die Bewaesserung durch, obwohl es nachts auf minus drei geht und das Wasser
+     * dann in Leitung und Ventil steht; faellt die Temperaturquelle aus, sperrt
+     * ruleBlockBelow ausdruecklich NICHT (null heisst "nicht sperren"), eine tote Variable
+     * im Januar oeffnet also das Ventil; und ein Februartag mit 11 Grad Nachmittagssonne
+     * waere aus Sicht der Momentanmessung ein Bewaesserungstag.
+     *
+     * Deshalb zwei getrennte Schranken mit ABSICHTLICH verschiedener Verlaesslichkeit:
+     *
+     * - Das SAISONFENSTER braucht keine Messwerte, nur den Kalender. Es kann nicht
+     *   ausfallen und ist damit der harte Schutz fuer die Kernmonate.
+     * - Der FROSTSCHUTZ liest den vorhergesagten Nachttiefstwert und faengt die
+     *   Uebergangszeit ab. Fehlt die Vorhersage, sperrt er nicht - sonst legte eine tote
+     *   Wetterquelle die ganze Saison still. Diese Luecke deckt das Saisonfenster ab.
+     */
+    private function seasonCfg(): array
+    {
+        $c = $this->cfg();
+        $f = (isset($c['season']) && is_array($c['season'])) ? $c['season'] : [];
+        $m = fn($v, $d) => max(1, min(12, (int) ($v ?? $d)));
+        return [
+            'enabled'   => (bool) ($f['enabled'] ?? false),
+            'fromMonth' => $m($f['fromMonth'] ?? null, self::DEF_SEASON_FROM),
+            'toMonth'   => $m($f['toMonth'] ?? null, self::DEF_SEASON_TO),
+        ];
+    }
+
+    private function frostCfg(): array
+    {
+        $c = $this->cfg();
+        $f = (isset($c['frost']) && is_array($c['frost'])) ? $c['frost'] : [];
+        return [
+            'enabled'     => (bool) ($f['enabled'] ?? false),
+            'minTempC'    => (float) ($f['minTempC'] ?? self::DEF_FROST_MIN_C),
+            'horizonDays' => max(0, min(6, (int) ($f['horizonDays'] ?? 1))),
+        ];
+    }
+
+    /** Laeuft die Saison im Monat $m? Fenster darf ueber den Jahreswechsel gehen. */
+    private function inSeason(int $monat): bool
+    {
+        $s = $this->seasonCfg();
+        $a = (int) $s['fromMonth'];
+        $b = (int) $s['toMonth'];
+        return ($a <= $b) ? ($monat >= $a && $monat <= $b) : ($monat >= $a || $monat <= $b);
+    }
+
+    /**
+     * Niedrigster vorhergesagter Nachttiefstwert im Horizont, oder null.
+     *
+     * Quelle ist derselbe Vorhersage-Container wie beim Regen (rainFc.srcId); dort stehen
+     * die Tagestiefstwerte als TagN_TMin. Eine Variable mit JSON taugt hier nicht, deshalb
+     * nur der Container-Fall.
+     */
+    private function frostMin(): ?float
+    {
+        $id = (int) $this->rainFcCfg()['srcId'];
+        if ($id <= 0 || !function_exists('IPS_ObjectExists') || !@\IPS_ObjectExists($id)) { return null; }
+        $typ = (int) (@\IPS_GetObject($id)['ObjectType'] ?? -1);
+        if ($typ !== 0 && $typ !== 1) { return null; }
+        $h = (int) $this->frostCfg()['horizonDays'];
+        $min = null;
+        foreach (@\IPS_GetChildrenIDs($id) ?: [] as $c) {
+            if (!preg_match('/^Tag(\d+)_TMin$/', (string) @\IPS_GetName($c), $m)) { continue; }
+            if (((int) $m[1] - 1) > $h) { continue; }          // Tag1 = heute
+            $v = @\GetValue($c);
+            if (!is_numeric($v)) { continue; }
+            $min = ($min === null) ? (float) $v : min($min, (float) $v);
+        }
+        return $min;
+    }
+
     /** Konfig der Wasserbilanz (gefallen + erwartet gegen EINE Schwelle). */
     private function rainSumCfg(): array
     {
@@ -641,6 +720,20 @@ class IrrigationCircuit extends EntityModule
      */
     private function gateBlock(): ?string
     {
+        // Saison zuerst: braucht keine Messwerte und kann deshalb nicht ausfallen.
+        $se = $this->seasonCfg();
+        if ($se['enabled'] && !$this->inSeason((int) date('n'))) {
+            $M = ['','Januar','Februar','Maerz','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'];
+            return 'ausserhalb der Saison (' . $M[$se['fromMonth']] . ' bis ' . $M[$se['toMonth']] . ')';
+        }
+        // Frostnacht: fangt die Uebergangszeit, in der die Saison noch laeuft.
+        $fr = $this->frostCfg();
+        if ($fr['enabled']) {
+            $fm = $this->frostMin();
+            if ($fm !== null && $fm < (float) $fr['minTempC']) {
+                return 'Frost erwartet (' . rtrim(rtrim(number_format($fm, 1, ',', ''), '0'), ',') . ' C)';
+            }
+        }
         $t = $this->tempCfg();
         if ($this->ruleBlockBelow($t, $this->tempNow())) {
             return 'Kaelte (< ' . rtrim(rtrim(number_format((float) $t['blockBelowC'], 1, ',', ''), '0'), ',') . ' C)';
@@ -707,6 +800,8 @@ class IrrigationCircuit extends EntityModule
         }
         $b = $this->rainBalance();
         if (is_array($b)) { $w['wasserbilanz_mm'] = round((float) $b['mm'], 1); }
+        $fm = $this->frostMin();
+        if ($fm !== null) { $w['nachttief_c'] = round($fm, 1); }
         return $w;
     }
 
@@ -1118,6 +1213,20 @@ class IrrigationCircuit extends EntityModule
                 'minProbPct'  => (float) ($f['minProbPct'] ?? self::DEF_FC_MIN_PROB),
             ];
         }
+        if (isset($args['season']) && is_array($args['season'])) {
+            $patch['season'] = [
+                'enabled'   => (bool) ($args['season']['enabled'] ?? false),
+                'fromMonth' => max(1, min(12, (int) ($args['season']['fromMonth'] ?? self::DEF_SEASON_FROM))),
+                'toMonth'   => max(1, min(12, (int) ($args['season']['toMonth'] ?? self::DEF_SEASON_TO))),
+            ];
+        }
+        if (isset($args['frost']) && is_array($args['frost'])) {
+            $patch['frost'] = [
+                'enabled'     => (bool) ($args['frost']['enabled'] ?? false),
+                'minTempC'    => (float) ($args['frost']['minTempC'] ?? self::DEF_FROST_MIN_C),
+                'horizonDays' => max(0, min(6, (int) ($args['frost']['horizonDays'] ?? 1))),
+            ];
+        }
         if (isset($args['rainSum']) && is_array($args['rainSum'])) {
             $patch['rainSum'] = [
                 'enabled'     => (bool) ($args['rainSum']['enabled'] ?? false),
@@ -1162,6 +1271,10 @@ class IrrigationCircuit extends EntityModule
             'rainFcCfg'      => $this->rainFcCfg(),
             'rainBalance'    => $this->rainBalance(),
             'rainSumCfg'     => $this->rainSumCfg(),
+            'seasonCfg'      => $this->seasonCfg(),
+            'inSeason'       => $this->inSeason((int) date('n')),
+            'frostCfg'       => $this->frostCfg(),
+            'frostMinC'      => $this->frostMin(),
             'effectiveSec'   => $this->effectiveSeconds(),
             'effectiveMin'   => round($this->effectiveSeconds() / 60, 1),
             'gate'           => ['blocked' => $this->gateBlock() !== null, 'reason' => $this->gateBlock()],
