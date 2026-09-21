@@ -2377,6 +2377,11 @@ class HomeSuiteHub extends EntityModule
                 && (string) (@\IPS_GetInstance($eltern)['ModuleInfo']['ModuleID'] ?? '') === self::GUID_HSSP) {
                 $raum = (string) @\IPS_GetName($eltern);
             }
+            // Ein Raumname allein ist mehrdeutig: "Schlafzimmer" gibt es an mehreren
+            // Standorten. standortVon() laeuft die Elternkette hoch bis zur HSSP-Instanz
+            // der Art "Haus" - Bennogasse, Hausleitnerweg, BellaDuna, BellaVista.
+            $sid = $this->standortVon($iid);
+            $ort = $sid > 0 ? (string) @\IPS_GetName($sid) : '';
             // Domaene aus dem Modulnamen: der Raum allein reicht zum Filtern nicht, denn in
             // einem Raum entscheiden Heizung, Licht und Beschattung nebeneinander.
             $mod = (string) (@\IPS_GetInstance($iid)['ModuleInfo']['ModuleName'] ?? '');
@@ -2388,6 +2393,7 @@ class HomeSuiteHub extends EntityModule
                     'iid'    => (int) $iid,
                     'geraet' => $name,
                     'raum'   => $raum,
+                    'ort'    => $ort,
                     'domaene' => $domaene,
                     'was'    => (string) ($e['was'] ?? ''),
                     'warum'  => (string) ($e['warum'] ?? ''),
@@ -2432,6 +2438,10 @@ class HomeSuiteHub extends EntityModule
                 'iid'     => (int) ($e['id'] ?? 0),
                 'geraet'  => (string) ($e['room'] ?? ''),
                 'raum'    => (string) ($e['room'] ?? ''),
+                'ort'     => (function (int $z): string {
+                    $h = $z > 0 ? $this->standortVon($z) : 0;
+                    return $h > 0 ? (string) @\IPS_GetName($h) : '';
+                })((int) ($e['id'] ?? 0)),
                 'domaene' => 'Beschattung',
                 'was'     => $was,
                 'warum'   => (string) ($e['why'] ?? '')
