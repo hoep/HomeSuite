@@ -504,6 +504,8 @@ class HomeSuiteHub extends EntityModule
             'label' => 'Beschattungs-Log leeren (alle Zonen oder entityId)']);
         $m->addManagementAction(['op' => 'shadeLog', 'verb' => 'shadeLog', 'target' => 'hub',
             'label' => 'Beschattungs-Log (alle Raeume) lesen', 'destructive' => false, 'fields' => []]);
+        $m->addManagementAction(['op' => 'decisionLog', 'verb' => 'decisionLog', 'target' => 'hub',
+            'label' => 'Entscheidungen aller Domaenen lesen', 'destructive' => false, 'fields' => []]);
         foreach ([['mediaProviders', 'Provider auflisten'], ['mediaBrowse', 'Bibliothek browsen'],
                   ['mediaSearch', 'Bibliothek suchen'], ['mediaResolve', 'Inhalt aufloesen'],
                   ['mediaTracks', 'Sammlung in Titelliste aufloesen'],
@@ -947,6 +949,9 @@ class HomeSuiteHub extends EntityModule
 
             case 'spotifyAuthUrl':
                 return $this->mgmtSpotifyAuthUrl();
+
+            case 'decisionLog':
+                return $this->mgmtDecisionLog($args);
 
             case 'shadeLog':
                 return $this->mgmtShadeLog($args);
@@ -2298,6 +2303,57 @@ class HomeSuiteHub extends EntityModule
             if (is_array($r) && !empty($r['ok'])) { $zonen++; $n += (int) ($r['cleared'] ?? 0); }
         }
         return ['ok' => true, 'zones' => $zonen, 'cleared' => $n];
+    }
+
+    /**
+     * Entscheidungen ALLER Domaenen einsammeln, neueste zuerst.
+     *
+     * Seit 21.09.2026 fuehrt jede Entitaet einen Ringpuffer in der Variablen
+     * 'Entscheidungen' (EntityModule::entscheidungMerken). Einzeln im Objektbaum
+     * nachzusehen hilft niemandem - die Frage lautet ja "was hat das Haus heute
+     * entschieden", nicht "was hat Kreis 3 entschieden".
+     *
+     * Gesucht wird ueber die KINDER der Instanzen, nicht ueber
+     * IPS_GetObjectIDByIdent: das schreibt auch hinter @ eine Warnung ins Meldungslog,
+     * und bei ein paar hundert Instanzen waere das eine Warnung je Aufruf.
+     */
+    private function mgmtDecisionLog(array $args): array
+    {
+        $limit = max(1, min(1000, (int) ($args['limit'] ?? 300)));
+        $out   = [];
+        foreach (@\IPS_GetInstanceList() ?: [] as $iid) {
+            $vid = 0;
+            foreach (@\IPS_GetChildrenIDs($iid) ?: [] as $c) {
+                $o = @\IPS_GetObject($c);
+                if (($o['ObjectType'] ?? -1) === 2 && ($o['ObjectIdent'] ?? '') === 'Entscheidungen') {
+                    $vid = (int) $c;
+                    break;
+                }
+            }
+            if ($vid <= 0) { continue; }
+            $log = json_decode((string) @\GetValue($vid), true);
+            if (!is_array($log)) { continue; }
+            // Der Anzeigename soll den Raum nennen, nicht die Domaene: 28 Instanzen
+            // heissen "Heizung (Heizung)", das unterscheidet nichts.
+            $name = (string) @\IPS_GetName($iid);
+            $eltern = (int) @\IPS_GetParent($iid);
+            $raum = $eltern > 0 ? (string) @\IPS_GetName($eltern) : '';
+            foreach ($log as $e) {
+                if (!is_array($e)) { continue; }
+                $out[] = [
+                    't'      => (int) ($e['t'] ?? 0),
+                    'iid'    => (int) $iid,
+                    'geraet' => $name,
+                    'raum'   => $raum,
+                    'was'    => (string) ($e['was'] ?? ''),
+                    'warum'  => (string) ($e['warum'] ?? ''),
+                    'real'   => (int) ($e['real'] ?? 1),
+                    'werte'  => is_array($e['werte'] ?? null) ? $e['werte'] : null,
+                ];
+            }
+        }
+        usort($out, static fn($a, $b) => $b['t'] <=> $a['t']);
+        return ['ok' => true, 'count' => count($out), 'rows' => array_slice($out, 0, $limit)];
     }
 
     private function mgmtShadeLog(array $args): array

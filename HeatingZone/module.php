@@ -1282,6 +1282,15 @@ class HeatingZone extends EntityModule
         if ($newVal === null) {
             return;
         }
+        // VM_UPDATE kommt in IP-Symcon AUCH, wenn sich der Wert nicht geaendert hat -
+        // Data[1] ist die Aenderungs-Flanke. Die CCU meldet ihre Sollwerte zyklisch nach;
+        // am 21.09.2026 trugen Esszimmer und Schlafzimmer dadurch alle zwei Minuten einen
+        // "Handeingriff 12 C" ein, waehrend der Wert seit dem Vortag unveraendert stand
+        // (aktualisiert 08:28, geaendert 09:14 am Tag davor). Ein Eingriff ist eine
+        // AENDERUNG; eine Wiederholung ist keiner.
+        if (isset($Data[1]) && !$Data[1]) {
+            return;
+        }
         // Self-Write-Unterdrueckung: kurz nach eigenem setSetpoint denselben Wert
         // ignorieren (das war das Modul, kein Mensch).
         $selfTs  = (int) ($rt['selfWriteTs'] ?? 0);
