@@ -39,9 +39,25 @@ class EnergyManager extends EntityModule
 
     /** Vorgaben, bewusst zurueckhaltend: lieber nichts verschieben als falsch verschieben. */
     private const DEF_INTERVAL_S   = 300;   // 5 Minuten - Preise gelten stundenweise
-    private const DEF_SURPLUS_W    = 800;   // ab so viel Ueberschuss lohnt eine Last
-    private const DEF_PRICE_CT     = 0.0;   // 0 = Preisregel aus (erst einschalten, wenn geprueft)
+    private const DEF_SURPLUS_W    = 0.0;   // 0 = Ueberschussregel aus - siehe unten, es gibt hier keinen
+    private const DEF_PRICE_CT     = 0.0;   // 0 = feste Preisschwelle aus
+    private const DEF_RANKTOP      = 0;     // 0 = Rangregel aus; sonst "unter den N guenstigsten Stunden"
+    private const DEF_MAXGRID_W    = 0.0;   // 0 = kein Deckel auf den Zukauf
     private const DEF_MINRUN_MIN   = 30;    // kuerzere Laeufe kosten mehr, als sie bringen
+
+    /*
+     * WARUM die Ueberschussregel ab Werk AUS ist.
+     *
+     * Gemessen ueber 14 Tage (50 000 Punkte): die Bilanz aus Erzeugung minus Verbrauch lag
+     * bei einem Mittel von -1070 W, im Hoechstfall bei +314 W - in 99 % der Zeit NEGATIV.
+     * Diese Anlage verbraucht fast immer mehr, als sie erzeugt; die PV deckt einen Teil,
+     * eingespeist wird praktisch nie. Eine Regel "starte ab 800 W Ueberschuss" haette hier
+     * niemals ausgeloest.
+     *
+     * Der Hebel ist deshalb der PREIS: die Spanne der naechsten 24 Stunden betrug zuletzt
+     * 36,8 bis 55,7 ct/kWh - ein Drittel Unterschied. Wer eine Last in die guenstigen
+     * Stunden legt, spart real, auch ohne eine einzige Wattstunde Ueberschuss.
+     */
 
     protected function entityLabel(): string { return 'Energie'; }
 
@@ -56,8 +72,16 @@ class EnergyManager extends EntityModule
                 ['ident' => 'Automatic', 'type' => ControlContract::T_SWITCH, 'role' => 'energy:automatic',
                  'label' => 'Lastverschiebung', 'varType' => 0, 'profile' => '~Switch', 'actionable' => true],
                 // --- Anzeige: woraus entschieden wird ---
+                ['ident' => 'Production', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:production',
+                 'label' => 'Erzeugung', 'varType' => 2, 'profile' => '~Watt', 'unit' => ' W', 'actionable' => false],
+                ['ident' => 'Consumption', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:consumption',
+                 'label' => 'Verbrauch', 'varType' => 2, 'profile' => '~Watt', 'unit' => ' W', 'actionable' => false],
+                ['ident' => 'Grid', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:grid',
+                 'label' => 'Zukauf', 'varType' => 2, 'profile' => '~Watt', 'unit' => ' W', 'actionable' => false],
+                ['ident' => 'SelfRate', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:selfrate',
+                 'label' => 'Eigendeckung', 'varType' => 2, 'profile' => '~Intensity.1', 'unit' => ' %', 'actionable' => false],
                 ['ident' => 'Surplus', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:surplus',
-                 'label' => 'Ueberschuss', 'varType' => 2, 'unit' => ' W', 'actionable' => false],
+                 'label' => 'Bilanz', 'varType' => 2, 'profile' => '~Watt', 'unit' => ' W', 'actionable' => false],
                 ['ident' => 'Price', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:price',
                  'label' => 'Strompreis', 'varType' => 2, 'unit' => ' ct/kWh', 'actionable' => false],
                 ['ident' => 'PriceRank', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:pricerank',
@@ -77,8 +101,10 @@ class EnergyManager extends EntityModule
 
             'managementActions' => [
                 ['op' => 'getConfig',    'label' => 'Konfiguration lesen (Diagnose)'],
-                ['op' => 'configureSources', 'label' => 'Quellen binden (Ueberschuss/Preis)'],
-                ['op' => 'setRules',     'label' => 'Schwellen setzen (Ueberschuss/Preis/Mindestlauf)'],
+                ['op' => 'configureSources', 'label' => 'Quellen binden (Bilanz/Preis)'],
+                ['op' => 'setBalance',   'label' => 'Erzeuger / Verbraucher / Zukauf festlegen'],
+                ['op' => 'getBalance',   'label' => 'Energiebilanz lesen'],
+                ['op' => 'setRules',     'label' => 'Schwellen setzen (Preis/Rang/Zukauf-Deckel)'],
                 ['op' => 'listLoads',    'label' => 'Verschiebbare Lasten lesen'],
                 ['op' => 'setLoads',     'label' => 'Verschiebbare Lasten setzen'],
                 ['op' => 'computeProbe', 'label' => 'Was wuerde jetzt geschehen? (Trockenlauf)'],
@@ -88,6 +114,7 @@ class EnergyManager extends EntityModule
             'capabilities' => [
                 'armed'   => (bool) $this->cfgVal('armed', false),
                 'sources' => $this->quellen(),
+                'balance' => $this->bilanz(),
             ],
         ];
     }
@@ -130,8 +157,10 @@ class EnergyManager extends EntityModule
                 @$this->UnregisterMessage((int) $sid, 10603);
             }
         }
-        foreach (['SurplusVarId', 'PriceVarId'] as $prop) {
-            $vid = (int) $this->ReadPropertyInteger($prop);
+        $ids = $this->bilanzVarIds();
+        foreach (['SurplusVarId', 'PriceVarId'] as $prop) { $ids[] = (int) $this->ReadPropertyInteger($prop); }
+        foreach (array_unique($ids) as $vid) {
+            $vid = (int) $vid;
             if ($vid > 0 && @\IPS_VariableExists($vid)) { @$this->RegisterMessage($vid, 10603); }
         }
     }
@@ -197,6 +226,9 @@ class EnergyManager extends EntityModule
         foreach ($this->quellen() as $vid) {
             if ((int) $vid > 0 && @\IPS_ObjectExists((int) $vid)) { @$this->RegisterReference((int) $vid); }
         }
+        foreach ($this->bilanzVarIds() as $vid) {
+            if ($vid > 0 && @\IPS_ObjectExists($vid)) { @$this->RegisterReference($vid); }
+        }
         foreach ($this->lasten() as $l) {
             if ((int) $l['instanz'] > 0 && @\IPS_ObjectExists((int) $l['instanz'])) {
                 @$this->RegisterReference((int) $l['instanz']);
@@ -218,6 +250,89 @@ class EnergyManager extends EntityModule
         ];
     }
 
+    /**
+     * Die konfigurierte Zuordnung: wer erzeugt, wer verbraucht, wo wird zugekauft.
+     *
+     * Bewusst LISTEN und nicht je eine Variable: hier speisen zwei Wechselrichter (PV1, PV2)
+     * in zwei Ebenen ein, und ein Haus kann morgen einen dritten bekommen. Was gezaehlt
+     * wird, gehoert in die Konfiguration, nicht in den Code.
+     */
+    private function bilanzCfg(): array
+    {
+        $c = $this->cfg();
+        $b = (isset($c['balance']) && is_array($c['balance'])) ? $c['balance'] : [];
+        $liste = static function ($roh): array {
+            $out = [];
+            foreach ((array) $roh as $e) {
+                if (is_array($e)) { $vid = (int) ($e['vid'] ?? 0); $name = (string) ($e['name'] ?? ''); }
+                else              { $vid = (int) $e;                $name = ''; }
+                if ($vid <= 0) { continue; }
+                if ($name === '') { $name = (string) @\IPS_GetName($vid); }
+                $out[] = ['vid' => $vid, 'name' => $name];
+            }
+            return $out;
+        };
+        return [
+            'erzeuger'    => $liste($b['erzeuger'] ?? []),
+            'verbraucher' => $liste($b['verbraucher'] ?? []),
+            'zukaufVid'   => (int) ($b['zukaufVid'] ?? 0),
+        ];
+    }
+
+    /** Alle Variablen der Bilanz - fuer den Loeschschutz und die Anmeldung. */
+    private function bilanzVarIds(): array
+    {
+        $b = $this->bilanzCfg();
+        $ids = array_merge(array_column($b['erzeuger'], 'vid'), array_column($b['verbraucher'], 'vid'));
+        if ($b['zukaufVid'] > 0) { $ids[] = $b['zukaufVid']; }
+        return array_values(array_unique(array_map('intval', $ids)));
+    }
+
+    /**
+     * Die Lage in Watt: Erzeugung, Verbrauch, Zukauf, Bilanz, Eigendeckung.
+     *
+     * Zwei Wege, und der erste gewinnt:
+     *  1. aus den konfigurierten Listen - dann sind alle vier Zahlen belegt und erklaerbar;
+     *  2. ersatzweise aus der gebundenen Bilanz-Variablen (frueher "Ueberschuss") - dann
+     *     kennt das Modul nur die Differenz, nicht ihre Bestandteile.
+     *
+     * Ist der Zukauf eigens gemessen, hat die MESSUNG Vorrang vor der Rechnung: ein Zaehler
+     * weiss mehr als eine Differenz zweier Schaetzungen.
+     */
+    private function bilanz(): array
+    {
+        $b = $this->bilanzCfg();
+        $summe = function (array $liste): ?float {
+            $s = null;
+            foreach ($liste as $e) {
+                $v = $this->zahlVon((int) $e['vid']);
+                if ($v === null) { continue; }
+                $s = ($s ?? 0.0) + $v;
+            }
+            return $s;
+        };
+        $prod = $summe($b['erzeuger']);
+        $verb = $summe($b['verbraucher']);
+        $quelle = 'listen';
+
+        $bil = ($prod !== null && $verb !== null) ? ($prod - $verb) : null;
+        if ($bil === null) {
+            $bil = $this->zahlVon((int) $this->ReadPropertyInteger('SurplusVarId'));
+            $quelle = ($bil === null) ? '-' : 'bilanzvariable';
+        }
+
+        $zukauf = $this->zahlVon($b['zukaufVid']);
+        if ($zukauf === null && $bil !== null) { $zukauf = max(0.0, -$bil); }
+
+        $deckung = ($verb !== null && $verb > 0 && $prod !== null)
+            ? min(100.0, 100.0 * $prod / $verb) : null;
+
+        return ['produktion' => $prod, 'verbrauch' => $verb, 'zukauf' => $zukauf,
+                'bilanz' => $bil, 'deckung' => $deckung, 'quelle' => $quelle,
+                'erzeuger' => $b['erzeuger'], 'verbraucher' => $b['verbraucher'],
+                'zukaufVid' => $b['zukaufVid']];
+    }
+
     private function zahlVon(int $vid): ?float
     {
         if ($vid <= 0 || !@\IPS_VariableExists($vid)) { return null; }
@@ -225,8 +340,8 @@ class EnergyManager extends EntityModule
         return is_numeric($v) ? (float) $v : null;
     }
 
-    /** Aktueller Ueberschuss in Watt (positiv = mehr Erzeugung als Verbrauch). */
-    private function ueberschuss(): ?float { return $this->zahlVon((int) $this->ReadPropertyInteger('SurplusVarId')); }
+    /** Bilanz in Watt (positiv = mehr Erzeugung als Verbrauch). Hier praktisch immer negativ. */
+    private function ueberschuss(): ?float { return $this->bilanz()['bilanz']; }
 
     /** Aktueller Strompreis, so wie ihn die gebundene Quelle fuehrt. */
     private function preis(): ?float { return $this->zahlVon((int) $this->ReadPropertyInteger('PriceVarId')); }
@@ -295,6 +410,8 @@ class EnergyManager extends EntityModule
         return [
             'surplusW'   => (float) ($r['surplusW'] ?? self::DEF_SURPLUS_W),
             'priceCt'    => (float) ($r['priceCt'] ?? self::DEF_PRICE_CT),
+            'rankTop'    => max(0, (int) ($r['rankTop'] ?? self::DEF_RANKTOP)),
+            'maxGridW'   => (float) ($r['maxGridW'] ?? self::DEF_MAXGRID_W),
             'minRunMin'  => max(1, (int) ($r['minRunMin'] ?? self::DEF_MINRUN_MIN)),
         ];
     }
@@ -358,8 +475,12 @@ class EnergyManager extends EntityModule
     /** Nur Anzeige auffrischen - ohne zu entscheiden. */
     private function spiegeln(): void
     {
-        $u = $this->ueberschuss();
-        if ($u !== null) { $this->setReflect('Surplus', round($u, 0)); }
+        $b = $this->bilanz();
+        if ($b['produktion'] !== null) { $this->setReflect('Production',  round($b['produktion'], 0)); }
+        if ($b['verbrauch']  !== null) { $this->setReflect('Consumption', round($b['verbrauch'], 0)); }
+        if ($b['zukauf']     !== null) { $this->setReflect('Grid',        round($b['zukauf'], 0)); }
+        if ($b['deckung']    !== null) { $this->setReflect('SelfRate',    round($b['deckung'], 1)); }
+        if ($b['bilanz']     !== null) { $this->setReflect('Surplus',     round($b['bilanz'], 0)); }
         $p = $this->preis();
         if ($p !== null) { $this->setReflect('Price', round($p, 2)); }
         $pr = $this->preisRang();
@@ -411,27 +532,66 @@ class EnergyManager extends EntityModule
     private function bewerten(): array
     {
         $rg  = $this->regeln();
-        $u   = $this->ueberschuss();
+        $b   = $this->bilanz();
+        $u   = $b['bilanz'];
         $p   = $this->preis();
         $pr  = $this->preisRang();
         $std = (int) date('G');
 
-        // "Guenstig" ist zweierlei, und beides zaehlt: genug eigener Strom ODER ein
-        // niedriger Marktpreis. Das erste spart Einspeisung, das zweite spart Geld.
-        $ueberschussOk = ($u !== null && $u >= $rg['surplusW']);
-        $preisOk       = ($rg['priceCt'] > 0 && $p !== null && $p <= $rg['priceCt']);
-        $guenstig      = $ueberschussOk || $preisOk;
+        /*
+         * Drei Wege, guenstig zu sein - jeder einzeln abschaltbar (Schwelle 0 = aus):
+         *
+         *  - PREISSCHWELLE: der Preis liegt unter einem festen Wert in ct/kWh. Klar, aber
+         *    starr: an einem teuren Tag loest sie nie aus, an einem billigen dauernd.
+         *  - PREISRANG: die laufende Stunde gehoert zu den N guenstigsten der naechsten 24.
+         *    Das ist die verlaessliche Regel, weil sie relativ misst - sie findet jeden Tag
+         *    seine billigen Stunden, egal auf welchem Niveau er liegt.
+         *  - UEBERSCHUSS: die Bilanz ist positiv genug. Hier ab Werk aus; siehe die
+         *    Begruendung bei den Vorgaben oben.
+         *
+         * Ist keine Regel eingeschaltet, geschieht NICHTS. Ein Energiemanager, der ohne
+         * gesetzte Schwelle munter schaltet, waere nicht vorsichtig, sondern unberechenbar.
+         */
+        $preisOk = ($rg['priceCt'] > 0 && $p !== null && $p <= $rg['priceCt']);
+        $rangOk  = ($rg['rankTop'] > 0 && $pr['rang'] !== null && $pr['rang'] <= $rg['rankTop']);
+        $ueberschussOk = ($rg['surplusW'] > 0 && $u !== null && $u >= $rg['surplusW']);
+        $regelAn = ($rg['priceCt'] > 0 || $rg['rankTop'] > 0 || $rg['surplusW'] > 0);
+        $guenstig = $regelAn && ($preisOk || $rangOk || $ueberschussOk);
 
         $grund = [];
+        if ($preisOk)       { $grund[] = 'Preis ' . round((float) $p, 1) . ' ct unter Schwelle ' . round($rg['priceCt'], 1); }
+        if ($rangOk)        { $grund[] = 'Preisrang ' . $pr['rang'] . '/' . $pr['anzahl'] . ' (Top ' . $rg['rankTop'] . ')'; }
         if ($ueberschussOk) { $grund[] = 'Überschuss ' . round((float) $u) . ' W'; }
-        if ($preisOk)       { $grund[] = 'Preis ' . round((float) $p, 1) . ' unter Schwelle'; }
         if ($grund === []) {
-            $grund[] = ($u === null) ? 'kein Überschusswert' : ('Überschuss ' . round((float) $u) . ' W zu gering');
+            if (!$regelAn) {
+                $grund[] = 'keine Regel eingeschaltet';
+            } else {
+                if ($rg['priceCt'] > 0) {
+                    $grund[] = ($p === null) ? 'kein Preiswert'
+                        : ('Preis ' . round((float) $p, 1) . ' ct über Schwelle ' . round($rg['priceCt'], 1));
+                }
+                if ($rg['rankTop'] > 0) {
+                    $grund[] = ($pr['rang'] === null) ? 'keine Preisvorhersage'
+                        : ('Preisrang ' . $pr['rang'] . '/' . $pr['anzahl'] . ' schlechter als Top ' . $rg['rankTop']);
+                }
+                if ($rg['surplusW'] > 0) {
+                    $grund[] = ($u === null) ? 'keine Bilanz'
+                        : ('Bilanz ' . round((float) $u) . ' W unter ' . round($rg['surplusW']) . ' W');
+                }
+            }
         }
-        if ($pr['rang'] !== null) { $grund[] = 'Preisrang ' . $pr['rang'] . '/' . $pr['anzahl']; }
         $grundText = implode(', ', $grund);
 
-        $schalten = []; $laufend = 0; $rest = ($u ?? 0.0);
+        /*
+         * Der Zukauf-Deckel begrenzt die SUMME, nicht den einzelnen Verbraucher: was schon
+         * aus dem Netz kommt, plus was in diesem Durchgang dazukaeme, muss darunter bleiben.
+         * Dadurch startet in einer billigen Stunde nicht alles gleichzeitig - die wichtigste
+         * Last zuerst (prio), der Rest wartet auf den naechsten Takt.
+         */
+        $zukauf = $b['zukauf'];
+        $dazu = 0.0;
+
+        $schalten = []; $laufend = 0;
         foreach ($this->lasten() as $l) {
             if (!$l['enabled']) { continue; }
             $an = $this->laeuft($l);
@@ -443,9 +603,13 @@ class EnergyManager extends EntityModule
                 // Energieregel eine laufende Bewaesserung mitten im Lauf abwuergen.
                 continue;
             }
-            if ($guenstig && $an === false && ($rest >= $l['watt'] || $preisOk)) {
+            if ($guenstig && $an === false) {
+                if ($rg['maxGridW'] > 0 && $zukauf !== null
+                    && ($zukauf + $dazu + $l['watt']) > $rg['maxGridW']) {
+                    continue;   // Deckel erreicht - diese Last wartet
+                }
                 $schalten[] = ['last' => $l, 'ein' => true, 'grund' => $grundText];
-                $rest -= $l['watt'];
+                $dazu += (float) $l['watt'];
             } elseif (!$guenstig && $an === true) {
                 $schalten[] = ['last' => $l, 'ein' => false, 'grund' => $grundText];
             }
@@ -453,7 +617,8 @@ class EnergyManager extends EntityModule
 
         return ['guenstig' => $guenstig, 'laufend' => $laufend, 'schalten' => $schalten,
                 'text' => ($guenstig ? 'günstig: ' : 'nicht günstig: ') . $grundText,
-                'ueberschuss' => $u, 'preis' => $p, 'rang' => $pr['rang'], 'regeln' => $rg];
+                'ueberschuss' => $u, 'bilanz' => $b, 'preis' => $p, 'rang' => $pr['rang'],
+                'regeln' => $rg];
     }
 
     /** Eine Last schalten - oder im Schatten nur vermerken, was geschehen waere. */
@@ -462,7 +627,8 @@ class EnergyManager extends EntityModule
         $vid = $this->lastVarId($l);
         $name = $l['name'] !== '' ? $l['name'] : ((string) @\IPS_GetName((int) $l['instanz']));
         $werte = ['last' => $name, 'watt' => $l['watt']];
-        if ($e['ueberschuss'] !== null) { $werte['ueberschuss_w'] = round((float) $e['ueberschuss']); }
+        if (($e['bilanz']['zukauf'] ?? null) !== null) { $werte['zukauf_w'] = round((float) $e['bilanz']['zukauf']); }
+        if ($e['ueberschuss'] !== null) { $werte['bilanz_w'] = round((float) $e['ueberschuss']); }
         if ($e['preis'] !== null)       { $werte['preis'] = round((float) $e['preis'], 2); }
         if ($e['rang'] !== null)        { $werte['preisrang'] = $e['rang']; }
 
@@ -501,11 +667,32 @@ class EnergyManager extends EntityModule
                 @\IPS_ApplyChanges($this->InstanceID);
                 return ['ok' => true, 'sources' => $this->quellen()];
             }
+            case 'setBalance': {
+                $b = $this->bilanzCfg();
+                foreach (['erzeuger', 'verbraucher'] as $k) {
+                    if (!array_key_exists($k, $args)) { continue; }
+                    $neu = [];
+                    foreach ((array) $args[$k] as $e) {
+                        $vid = is_array($e) ? (int) ($e['vid'] ?? 0) : (int) $e;
+                        if ($vid <= 0 || !@\IPS_VariableExists($vid)) { continue; }
+                        $neu[] = ['vid' => $vid,
+                                  'name' => (string) (is_array($e) ? ($e['name'] ?? '') : '')];
+                    }
+                    $b[$k] = $neu;
+                }
+                if (array_key_exists('zukaufVid', $args)) { $b['zukaufVid'] = (int) $args['zukaufVid']; }
+                $this->store()->patch('config', ['balance' => $b]);
+                @\IPS_ApplyChanges($this->InstanceID);   // Anmeldung und Loeschschutz nachziehen
+                return ['ok' => true, 'balance' => $this->bilanz()];
+            }
+            case 'getBalance':
+                return ['ok' => true, 'balance' => $this->bilanz(), 'rules' => $this->regeln()];
             case 'setRules': {
                 $r = $this->regeln();
-                foreach (['surplusW', 'priceCt'] as $k) {
+                foreach (['surplusW', 'priceCt', 'maxGridW'] as $k) {
                     if (array_key_exists($k, $args)) { $r[$k] = (float) $args[$k]; }
                 }
+                if (array_key_exists('rankTop', $args))   { $r['rankTop']   = max(0, (int) $args['rankTop']); }
                 if (array_key_exists('minRunMin', $args)) { $r['minRunMin'] = max(1, (int) $args['minRunMin']); }
                 $this->store()->patch('config', ['rules' => $r]);
                 return ['ok' => true, 'rules' => $this->regeln()];
@@ -528,7 +715,11 @@ class EnergyManager extends EntityModule
                                 : (string) @\IPS_GetName((int) $s['last']['instanz']))
                               . ($s['ein'] ? ' EIN' : ' AUS');
                 }
+                $b = $e['bilanz'];
                 return ['ok' => true, 'armed' => $this->armed(), 'guenstig' => $e['guenstig'],
+                        'erzeugung_w' => $b['produktion'], 'verbrauch_w' => $b['verbrauch'],
+                        'zukauf_w' => $b['zukauf'], 'eigendeckung_pct' => $b['deckung'],
+                        'bilanzquelle' => $b['quelle'],
                         'ueberschuss_w' => $e['ueberschuss'], 'preis' => $e['preis'],
                         'preisrang' => $e['rang'], 'regeln' => $e['regeln'],
                         'laufend' => $e['laufend'], 'wuerde' => $wuerde, 'begruendung' => $e['text'],
@@ -551,5 +742,9 @@ class EnergyManager extends EntityModule
 
     public function Refresh(): void { $this->Tick(); }
     public function GetSurplus(): float { return (float) ($this->ueberschuss() ?? 0.0); }
+    /** Aktueller Netzbezug in Watt - die Zahl, die diese Anlage wirklich beschreibt. */
+    public function GetGrid(): float { return (float) ($this->bilanz()['zukauf'] ?? 0.0); }
+    /** Anteil des Verbrauchs, den die eigene Erzeugung gerade deckt (Prozent). */
+    public function GetSelfRate(): float { return (float) ($this->bilanz()['deckung'] ?? 0.0); }
     public function IsCheap(): bool { return (bool) $this->bewerten()['guenstig']; }
 }
