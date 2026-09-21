@@ -734,7 +734,27 @@ abstract class EntityModule extends \IPSModule
                 $d = json_decode((string) @GetValue($vid), true);
                 if (is_array($d)) { $log = $d; }
             }
-            $log[] = $e;
+            // Wiederholungen ZUSAMMENFASSEN statt stapeln. Am 21.09.2026 schickte ein
+            // externes Skript dem Maeher alle fuenf Minuten denselben Befehl "Maehen",
+            // waehrend er in der Ladestation stand - nach vier Stunden bestuenden 50
+            // Eintraege aus einer einzigen Zeile, und im Gesamtlog waere nichts anderes
+            // mehr zu sehen gewesen. Der letzte Eintrag wird stattdessen fortgeschrieben:
+            // neue Zeit, Zaehler hoch. Die Haeufigkeit bleibt damit sichtbar, ohne den
+            // Puffer zu verstopfen - und genau die Haeufigkeit ist bei so einem Fall die
+            // interessante Information.
+            $letzt = $log ? $log[count($log) - 1] : null;
+            $gleich = is_array($letzt)
+                && (string) ($letzt['was'] ?? '')   === $was
+                && (string) ($letzt['warum'] ?? '') === $warum
+                && (int) ($letzt['real'] ?? 1)      === ($real ? 1 : 0)
+                && (($letzt['ok'] ?? null) === ($erfolg === null ? null : ($erfolg ? 1 : 0)));
+            if ($gleich) {
+                $e['n'] = (int) ($letzt['n'] ?? 1) + 1;
+                $e['seit'] = (int) ($letzt['seit'] ?? ($letzt['t'] ?? time()));
+                $log[count($log) - 1] = $e;
+            } else {
+                $log[] = $e;
+            }
             if (count($log) > static::ENTSCHEID_MAX) {
                 $log = array_slice($log, -static::ENTSCHEID_MAX);
             }

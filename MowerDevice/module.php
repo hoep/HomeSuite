@@ -419,13 +419,13 @@ class MowerDevice extends EntityModule
         if ($ft !== '' && $ft !== 'Keine Meldung') { $werte['geraetefehler'] = $ft; }
         if (!$this->armed()) {
             $this->SendDebug('HSMW.shadow', 'WUERDE ' . $what . ' (nicht scharf)', 0);
-            $this->entscheidungMerken($was, 'Befehl - nicht scharf', $werte, false);
+            $this->entscheidungMerken($was, 'Bedienbefehl', $werte, false);
             return;
         }
         try {
             $ok = (bool) $fn($d);
             $this->SendDebug('HSMW.cmd', $what . ' -> ' . ($ok ? 'ok' : 'FEHLER'), 0);
-            $this->entscheidungMerken($was, $ok ? 'Befehl ausgeführt' : 'Befehl vom Gerät abgelehnt', $werte, true, $ok);
+            $this->entscheidungMerken($was, $ok ? 'Bedienbefehl' : 'vom Gerät abgelehnt', $werte, true, $ok);
         } catch (\Throwable $e) {
             $this->SendDebug('HSMW.cmd', $what . ' Exception: ' . $e->getMessage(), 0);
             $this->entscheidungMerken($was, 'Befehl fehlgeschlagen: ' . $e->getMessage(), $werte, true, false);

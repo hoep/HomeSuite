@@ -2393,6 +2393,8 @@ class HomeSuiteHub extends EntityModule
                     'warum'  => (string) ($e['warum'] ?? ''),
                     'real'   => (int) ($e['real'] ?? 1),
                     'ok'     => array_key_exists('ok', (array) $e) ? (int) $e['ok'] : null,
+                    'n'      => (int) ($e['n'] ?? 1),
+                    'seit'   => (int) ($e['seit'] ?? ($e['t'] ?? 0)),
                     'werte'  => is_array($e['werte'] ?? null) ? $e['werte'] : null,
                 ];
             }
@@ -2404,11 +2406,27 @@ class HomeSuiteHub extends EntityModule
         // erprobt und der shadelog-Modus liest es unveraendert - hier zusammenfuehren.
         foreach (($this->mgmtShadeLog(['limit' => $limit])['entries'] ?? []) as $e) {
             if (!is_array($e)) { continue; }
+            // Zahlen in Handlungen uebersetzen. Die Konvention steht in IShutter:
+            // 0 = offen/oben, 100 = zu/unten. "auf 0 % (von 100 %)" ist fuer einen
+            // Menschen keine Aussage - "oeffnen" ist eine.
             $von = $e['from'] ?? null;
             $bis = $e['to'] ?? null;
-            $was = ($bis === null || (int) $bis < 0)
-                ? 'gestoppt'
-                : ('auf ' . (int) $bis . ' %' . (($von !== null && (int) $von >= 0) ? ' (von ' . (int) $von . ' %)' : ''));
+            $vonI = ($von !== null && (int) $von >= 0) ? (int) $von : null;
+            if ($bis === null || (int) $bis < 0) {
+                $was = 'gestoppt';
+            } else {
+                $bisI = (int) $bis;
+                if ($bisI <= 0) {
+                    $was = 'öffnen';
+                } elseif ($bisI >= 100) {
+                    $was = 'schließen';
+                } elseif ($vonI === null) {
+                    $was = 'auf ' . $bisI . ' % fahren';
+                } else {
+                    // Groesser heisst weiter zu, kleiner heisst weiter auf.
+                    $was = ($bisI > $vonI ? 'schließen auf ' : 'öffnen auf ') . $bisI . ' %';
+                }
+            }
             $out[] = [
                 't'       => (int) ($e['t'] ?? 0),
                 'iid'     => (int) ($e['id'] ?? 0),
@@ -2419,7 +2437,9 @@ class HomeSuiteHub extends EntityModule
                 'warum'   => (string) ($e['why'] ?? '')
                              . (((string) ($e['src'] ?? '')) === 'manuell' ? ' (manuell)' : ''),
                 'real'    => (int) (!empty($e['armed'])),
-                'werte'   => null,
+                // Die Ausgangsposition gehoert in die Werte, nicht in die Zeile: sie
+                // erklaert die Fahrt, aber niemand liest eine Tabelle wegen ihr.
+                'werte'   => ($vonI !== null) ? ['von_prozent' => $vonI] : null,
             ];
         }
         usort($out, static fn($a, $b) => $b['t'] <=> $a['t']);

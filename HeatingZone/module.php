@@ -1350,7 +1350,7 @@ class HeatingZone extends EntityModule
         // obwohl das Fenster vielleicht in zwei Minuten wieder zu ist.
         if ($this->fensterOffen() === true) {
             $this->SendDebug('HSHT.override', 'Sollwert ' . $newVal . ' bei offenem Fenster -> kein Hold', 0);
-            $this->heizMerken($newVal, 'Fenster offen (Geraeteabsenkung)', null);
+            $this->heizMerken($newVal, 'Fenster offen (Geräteabsenkung)', null);
             return;
         }
         $geplant = $this->desiredSetpoint($this->intVal('Mode'));
