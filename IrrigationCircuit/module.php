@@ -51,6 +51,7 @@ class IrrigationCircuit extends EntityModule
     private const DEF_FC_HORIZON_D  = 1;   // heute + 1 Tag
     private const DEF_FC_THRESH_MM  = 3.0;
     private const DEF_FC_MIN_PROB   = 60;  // Prozent
+    private const DEF_SUM_THRESH_MM = 4.0; // Wasserbilanz gefallen+erwartet
 
     private const TIMER_REFRESH = 'Refresh';   // zyklisch: Reflect + Watchdog
     private const TIMER_RUNSTOP = 'RunStop';    // Ein-Schuss: getimtes Schliessen (switch-Modus)
@@ -461,6 +462,57 @@ class IrrigationCircuit extends EntityModule
     }
 
     /** Konfiguration der Regenvorhersage. */
+    /** Konfig der Wasserbilanz (gefallen + erwartet gegen EINE Schwelle). */
+    private function rainSumCfg(): array
+    {
+        $c = $this->cfg();
+        $f = (isset($c['rainSum']) && is_array($c['rainSum'])) ? $c['rainSum'] : [];
+        return [
+            'enabled'     => (bool) ($f['enabled'] ?? false),
+            'thresholdMm' => (float) ($f['thresholdMm'] ?? self::DEF_SUM_THRESH_MM),
+        ];
+    }
+
+    /**
+     * Wasserbilanz in mm: was heute schon gefallen ist, plus was noch erwartet wird.
+     *
+     * NICHT einfach addieren - das waere doppelt gezaehlt. Die Vorhersage fuer HEUTE ist
+     * eine Tagesprognose und enthaelt bereits den bisher gefallenen Regen; gemessen am
+     * 21.09.2026: 5,84 mm gefallen, Prognose Tag 1 sagte 3,45 mm fuer denselben Tag. Stumpf
+     * summiert waeren das 9,3 mm gewesen, tatsaechlich sind es hoechstens 5,84 plus das,
+     * was der Tag noch bringt. Deshalb fuer heute der GROESSERE der beiden Werte, und nur
+     * die FOLGETAGE kommen additiv dazu.
+     *
+     * Folgetage zaehlen nur mit, wenn ihre Wahrscheinlichkeit die Schwelle aus der
+     * Vorhersage-Regel erreicht - eine Menge mit 20 % Wahrscheinlichkeit ist keine
+     * Wassergabe, auf die man verzichten darf.
+     *
+     * @return array{mm: float, gefallen: float, heute: float, folgetage: float}|null
+     */
+    private function rainBalance(): ?array
+    {
+        $gefallen = (float) ($this->rainNow() ?? 0.0);
+        $fc       = $this->rainFcRead();
+        $minProb  = (float) $this->rainFcCfg()['minProbPct'];
+
+        $heuteFc = 0.0; $folge = 0.0; $haveFc = false;
+        if (is_array($fc) && is_array($fc['tage'] ?? null)) {
+            $haveFc = true;
+            foreach ($fc['tage'] as $i => $t) {
+                $mm = (float) ($t['mm'] ?? 0.0);
+                $p  = $t['prob'] ?? null;
+                if ($i === 0) { $heuteFc = $mm; continue; }          // heute: kein Prob-Filter
+                if ($p !== null && (float) $p < $minProb) { continue; }
+                $folge += $mm;
+            }
+        }
+        if ($this->rainNow() === null && !$haveFc) { return null; }   // keine Quelle -> nie sperren
+
+        $heute = max($gefallen, $heuteFc);
+        return ['mm' => $heute + $folge, 'gefallen' => $gefallen,
+                'heute' => $heute, 'folgetage' => $folge];
+    }
+
     private function rainFcCfg(): array
     {
         $c = $this->cfg();
@@ -602,6 +654,18 @@ class IrrigationCircuit extends EntityModule
                 return 'Regen ' . $rain . ' mm (>= ' . $thr . ')';
             }
         }
+        // Wasserbilanz: faengt den Mittelbereich, den die beiden Einzelschwellen
+        // durchlassen - 1,5 mm gefallen plus 2,5 mm erwartet sind zusammen 4 mm und
+        // damit eine Wassergabe, obwohl keine der beiden Schranken allein faellt.
+        $sum = $this->rainSumCfg();
+        if ($sum['enabled']) {
+            $b = $this->rainBalance();
+            if ($b !== null && $b['mm'] >= $sum['thresholdMm']) {
+                return 'Wasserbilanz ' . round($b['mm'], 1) . ' mm (>= ' . $sum['thresholdMm'] . ')'
+                     . ' - gefallen ' . round($b['gefallen'], 1)
+                     . ($b['folgetage'] > 0 ? ', erwartet ' . round($b['folgetage'], 1) : '');
+            }
+        }
         $f = $this->rainFcCfg();
         if ($f['enabled']) {
             $fc = $this->rainFcRead();
@@ -641,6 +705,8 @@ class IrrigationCircuit extends EntityModule
             $w['regen_erwartet_mm'] = round((float) $fc['mm'], 1);
             if (($fc['prob'] ?? null) !== null) { $w['regen_wkt_pct'] = round((float) $fc['prob']); }
         }
+        $b = $this->rainBalance();
+        if (is_array($b)) { $w['wasserbilanz_mm'] = round((float) $b['mm'], 1); }
         return $w;
     }
 
@@ -1052,6 +1118,12 @@ class IrrigationCircuit extends EntityModule
                 'minProbPct'  => (float) ($f['minProbPct'] ?? self::DEF_FC_MIN_PROB),
             ];
         }
+        if (isset($args['rainSum']) && is_array($args['rainSum'])) {
+            $patch['rainSum'] = [
+                'enabled'     => (bool) ($args['rainSum']['enabled'] ?? false),
+                'thresholdMm' => (float) ($args['rainSum']['thresholdMm'] ?? self::DEF_SUM_THRESH_MM),
+            ];
+        }
         if (isset($args['evap']) && is_array($args['evap'])) {
             $patch['evap'] = [
                 'enabled'         => (bool) ($args['evap']['enabled'] ?? false),
@@ -1088,6 +1160,8 @@ class IrrigationCircuit extends EntityModule
             'rainNow'        => $this->rainNow(),
             'rainFc'         => $this->rainFcRead(),
             'rainFcCfg'      => $this->rainFcCfg(),
+            'rainBalance'    => $this->rainBalance(),
+            'rainSumCfg'     => $this->rainSumCfg(),
             'effectiveSec'   => $this->effectiveSeconds(),
             'effectiveMin'   => round($this->effectiveSeconds() / 60, 1),
             'gate'           => ['blocked' => $this->gateBlock() !== null, 'reason' => $this->gateBlock()],
