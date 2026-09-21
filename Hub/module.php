@@ -1238,7 +1238,7 @@ class HomeSuiteHub extends EntityModule
             'Szene „' . (string) ($scene['name'] ?? ($scene['id'] ?? '?')) . '" ' . ($ein ? 'an' : 'aus'),
             $grund,
             ['geschaltet' => $applied] + ($skipped > 0 ? ['uebersprungen' => $skipped] : []),
-            true
+            true, null, 'Licht'
         );
         // Schaltbare Variablen: RequestAction, wenn die Variable eine Aktion hat, sonst
         // SetValue. Der Wert wird auf den Typ der Variablen gecastet - der Editor kennt
@@ -1584,7 +1584,7 @@ class HomeSuiteHub extends EntityModule
                 $grund,
                 ['leuchte' => $iid] + ($on && $level >= 0 ? ['helligkeit' => $level] : [])
                                     + ($on && $cct > 0 ? ['farbtemperatur_k' => $cct] : []),
-                true
+                true, null, 'Licht'
             );
         }
         $this->setDeviceVar($iid, 'Power', $on);
@@ -1775,10 +1775,10 @@ class HomeSuiteHub extends EntityModule
         if (!is_array($r) || empty($r['ok'])) {
             $this->LogMessage('Wecken fehlgeschlagen (Zone ' . $az . ', ' . $kind . ' ' . $id . '): '
                 . substr((string) json_encode($r), 0, 120), KL_WARNING);
-            $this->entscheidungMerken('Wecken - ' . $zone, 'Regel „' . $wname . '"', $werte, true, false);
+            $this->entscheidungMerken('Wecken - ' . $zone, 'Regel „' . $wname . '"', $werte, true, false, 'Audio');
             return;
         }
-        $this->entscheidungMerken('Wecken - ' . $zone, 'Regel „' . $wname . '"', $werte, true);
+        $this->entscheidungMerken('Wecken - ' . $zone, 'Regel „' . $wname . '"', $werte, true, null, 'Audio');
 
         // Selbsttaetiges Ausschalten: der Wecker soll nicht bis zum Abend spielen.
         // Dafuer gibt es den Sleep-Timer der Zone - kein zweiter Mechanismus, und er
@@ -2343,7 +2343,9 @@ class HomeSuiteHub extends EntityModule
         'ShadingDevice' => 'Beschattung', 'LightDevice' => 'Licht',
         // Der Hub meldet sich als "HomeSuite Hub". Er protokolliert Lichtautomatik,
         // Szenen UND Wecker - deshalb der uebergreifende Name, nicht "Licht-Automatik".
-        'Hub' => 'Automatik', 'HomeSuite Hub' => 'Automatik',
+        // Rueckfall, falls eine Hub-Entscheidung ihre Domaene NICHT selbst nennt. Sollte
+        // nicht vorkommen - erscheint "Hub" im Log, fehlt irgendwo die Angabe.
+        'Hub' => 'Hub', 'HomeSuite Hub' => 'Hub',
         'PoolController' => 'Pool', 'MowerDevice' => 'Mäher', 'AudioZone' => 'Audio',
         'SecurityCenter' => 'Wächter', 'GardenaDevice' => 'Gardena', 'DeviceHealth' => 'Geräte',
     ];
@@ -2385,7 +2387,7 @@ class HomeSuiteHub extends EntityModule
             // Domaene aus dem Modulnamen: der Raum allein reicht zum Filtern nicht, denn in
             // einem Raum entscheiden Heizung, Licht und Beschattung nebeneinander.
             $mod = (string) (@\IPS_GetInstance($iid)['ModuleInfo']['ModuleName'] ?? '');
-            $domaene = self::DOMAENEN[$mod] ?? ($mod !== '' ? $mod : 'Sonstiges');
+            $modDom = self::DOMAENEN[$mod] ?? ($mod !== '' ? $mod : 'Sonstiges');
             foreach ($log as $e) {
                 if (!is_array($e)) { continue; }
                 $out[] = [
@@ -2394,7 +2396,8 @@ class HomeSuiteHub extends EntityModule
                     'geraet' => $name,
                     'raum'   => $raum,
                     'ort'    => $ort,
-                    'domaene' => $domaene,
+                    // Nennt die Entscheidung ihre Domaene selbst, gilt sie - sonst das Modul.
+                    'domaene' => (string) ($e['dom'] ?? $modDom),
                     'was'    => (string) ($e['was'] ?? ''),
                     'warum'  => (string) ($e['warum'] ?? ''),
                     'real'   => (int) ($e['real'] ?? 1),

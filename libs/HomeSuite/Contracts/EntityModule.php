@@ -721,10 +721,15 @@ abstract class EntityModule extends \IPSModule
      * derselben Zeile.
      */
     protected function entscheidungMerken(string $was, string $warum, array $werte = [], bool $real = true,
-                                          ?bool $erfolg = null): void
+                                          ?bool $erfolg = null, ?string $domaene = null): void
     {
         try {
             $e = ['t' => time(), 'was' => $was, 'warum' => $warum, 'real' => $real ? 1 : 0];
+            // Die Domaene gehoert zur ENTSCHEIDUNG, nicht zum Modul. Der Hub etwa fuehrt
+            // Lichtautomatik, Szenen UND den Wecker - ein Modulname taugt dort nicht als
+            // Domaene, und ein Sammelbegriff wie "Automatik" sagt dem Leser nichts.
+            // Ohne Angabe bleibt die Zuordnung ueber den Modulnamen im Hub die Vorgabe.
+            if ($domaene !== null && $domaene !== '') { $e['dom'] = $domaene; }
             if ($erfolg !== null) { $e['ok'] = $erfolg ? 1 : 0; }
             if ($werte !== []) { $e['werte'] = $werte; }
 
