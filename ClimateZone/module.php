@@ -891,6 +891,38 @@ class ClimateZone extends EntityModule
      * So sieht man im Schatten-Modus und bei Handbetrieb-Vorrang trotzdem, was
      * der Plan gerade vorhaette - ohne dass etwas geschaltet wird.
      */
+    /**
+     * Eine Plan-Entscheidung festhalten - aber nur, wenn sie sich geaendert hat.
+     *
+     * planTick() laeuft im Minutentakt. Ein Eintrag je Takt haette den Ringpuffer in
+     * einer knappen Stunde gefuellt und damit wertlos gemacht: interessant ist der
+     * WECHSEL, nicht die Wiederholung. Verglichen wird ueber eine Signatur aus Modus,
+     * Sollwert und Scharfzustand; der Vergleichswert liegt im Laufzeit-Status, ueberlebt
+     * also einen Reload nicht - dann gibt es einen Eintrag zuviel, und das ist die
+     * harmlosere Richtung.
+     */
+    private function planMerken(array $soll, bool $real): void
+    {
+        $ziel = ($soll['target'] === null) ? '-' : (string) round((float) $soll['target'], 1);
+        $sig  = $soll['mode'] . '|' . $ziel . '|' . ($real ? '1' : '0');
+        $rt   = $this->readRt();
+        if ((string) ($rt['lastPlanSig'] ?? '') === $sig) {
+            return;
+        }
+        $rt['lastPlanSig'] = $sig;
+        $this->writeRt($rt);
+
+        $was = ($soll['mode'] === 'off')
+            ? 'ausschalten'
+            : ($soll['mode'] . ($ziel === '-' ? '' : ' auf ' . $ziel . ' C'));
+        $w = ['modus' => $soll['mode']];
+        if ($soll['target'] !== null) { $w['soll_c'] = round((float) $soll['target'], 1); }
+        $ist = $this->wertVon('Target', null);
+        if (is_numeric($ist)) { $w['ist_soll_c'] = round((float) $ist, 1); }
+        $w['geraet_an'] = (bool) $this->wertVon('Power', false);
+        $this->entscheidungMerken($was, 'Zeitplan', $w, $real);
+    }
+
     private function planTick(): void
     {
         $jetzt = time();
@@ -910,6 +942,7 @@ class ClimateZone extends EntityModule
         if (!(bool) $this->cfgVal('armed', false)) {
             $this->SendDebug('HSAC.plan', 'Schatten-Modus: ' . $soll['mode']
                 . ' ' . ($soll['target'] === null ? '-' : $soll['target']) . ' nicht gesendet', 0);
+            $this->planMerken($soll, false);
             return;
         }
         $drv = $this->driver();
@@ -923,6 +956,7 @@ class ClimateZone extends EntityModule
         $istModus = self::MODI[(int) $this->wertVon('Mode', 0)] ?? 'auto';
         $istZiel  = (float) $this->wertVon('Target', 0.0);
 
+        $this->planMerken($soll, true);
         if ($soll['mode'] === 'off') {
             if ($istAn) {
                 $drv->setPower(false);
