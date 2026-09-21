@@ -398,23 +398,37 @@ class MowerDevice extends EntityModule
             $vid = @$this->GetIDForIdent($ident);
             return ($vid !== false && $vid > 0) ? (string) @\GetValueFormatted($vid) : '';
         };
-        $grund = 'Betriebsart ' . ($fmt('AutoMode') ?: '?');
-        $werte = ['akku_pct' => (int) $this->GetControlValue('Battery'),
+        // Die Betriebsart ist KONTEXT, nicht Ursache. Sie als Grund zu nennen ("Betriebsart
+        // Logik - Befehl fehlgeschlagen") liest sich, als haette die Logik-Automatik den
+        // Befehl ausgeloest - tatsaechlich weiss das Modul den Ausloeser nicht, weil die
+        // Regen-Autologik in externen Skripten liegt. Also: Grund = was mit dem Befehl
+        // geschah, Betriebsart in die Werte.
+        $klartext = ['Start' => 'Mähen', 'Park' => 'Parken', 'Pause' => 'Pause',
+                     'Resume' => 'Weiterfahren', 'ConfirmError' => 'Fehler quittieren',
+                     'CuttingHeight' => 'Schnitthöhe', 'Headlight' => 'Scheinwerfer'];
+        $was   = $klartext[$what] ?? $what;
+        $werte = ['betriebsart' => $fmt('AutoMode') ?: '?',
+                  'akku_pct' => (int) $this->GetControlValue('Battery'),
                   'aktivitaet' => $fmt('Activity')];
         $bereich = (string) @$this->GetControlValue('Mission');
         if ($bereich !== '') { $werte['bereich'] = $bereich; }
+        // Bei einem Fehlschlag ist der anliegende Geraetefehler die eigentliche Erklaerung:
+        // 'Fehler quittieren' scheitert zuverlaessig, solange der Fehler besteht - am
+        // 21.09.2026 an Righty mit Code 110 'Kollisionssensor defekt' gesehen.
+        $ft = (string) @$this->GetControlValue('ErrorText');
+        if ($ft !== '' && $ft !== 'Keine Meldung') { $werte['geraetefehler'] = $ft; }
         if (!$this->armed()) {
             $this->SendDebug('HSMW.shadow', 'WUERDE ' . $what . ' (nicht scharf)', 0);
-            $this->entscheidungMerken($what, $grund, $werte, false);
+            $this->entscheidungMerken($was, 'Befehl - nicht scharf', $werte, false);
             return;
         }
         try {
             $ok = (bool) $fn($d);
             $this->SendDebug('HSMW.cmd', $what . ' -> ' . ($ok ? 'ok' : 'FEHLER'), 0);
-            $this->entscheidungMerken($what, $ok ? $grund : ($grund . ' - Befehl fehlgeschlagen'), $werte, true);
+            $this->entscheidungMerken($was, $ok ? 'Befehl ausgeführt' : 'Befehl vom Gerät abgelehnt', $werte, true, $ok);
         } catch (\Throwable $e) {
             $this->SendDebug('HSMW.cmd', $what . ' Exception: ' . $e->getMessage(), 0);
-            $this->entscheidungMerken($what, $grund . ' - Fehler: ' . $e->getMessage(), $werte, true);
+            $this->entscheidungMerken($was, 'Befehl fehlgeschlagen: ' . $e->getMessage(), $werte, true, false);
         }
         // Ist-Zustand nach dem Kommando bald nachziehen.
         $this->SetTimerInterval(self::TIMER_REFRESH, 3000);

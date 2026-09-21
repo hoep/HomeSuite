@@ -1775,7 +1775,7 @@ class HomeSuiteHub extends EntityModule
         if (!is_array($r) || empty($r['ok'])) {
             $this->LogMessage('Wecken fehlgeschlagen (Zone ' . $az . ', ' . $kind . ' ' . $id . '): '
                 . substr((string) json_encode($r), 0, 120), KL_WARNING);
-            $this->entscheidungMerken('Wecken FEHLGESCHLAGEN - ' . $zone, 'Regel „' . $wname . '"', $werte, true);
+            $this->entscheidungMerken('Wecken - ' . $zone, 'Regel „' . $wname . '"', $werte, true, false);
             return;
         }
         $this->entscheidungMerken('Wecken - ' . $zone, 'Regel „' . $wname . '"', $werte, true);
@@ -2367,8 +2367,16 @@ class HomeSuiteHub extends EntityModule
             // Der Anzeigename soll den Raum nennen, nicht die Domaene: 28 Instanzen
             // heissen "Heizung (Heizung)", das unterscheidet nichts.
             $name = (string) @\IPS_GetName($iid);
+            // Raum nur, wenn die Instanz WIRKLICH unter einem Raum haengt. Hub und Maeher
+            // sitzen direkt unter der HomeSuite-Wurzel - dort stand deshalb "HomeSuite" als
+            // Raum, und das ist Unsinn. Ein Raum ist eine HSSP-Instanz (Space); alles
+            // andere bleibt leer, dann zeigt die Tabelle den Geraetenamen.
             $eltern = (int) @\IPS_GetParent($iid);
-            $raum = $eltern > 0 ? (string) @\IPS_GetName($eltern) : '';
+            $raum = '';
+            if ($eltern > 0 && @\IPS_InstanceExists($eltern)
+                && (string) (@\IPS_GetInstance($eltern)['ModuleInfo']['ModuleID'] ?? '') === self::GUID_HSSP) {
+                $raum = (string) @\IPS_GetName($eltern);
+            }
             // Domaene aus dem Modulnamen: der Raum allein reicht zum Filtern nicht, denn in
             // einem Raum entscheiden Heizung, Licht und Beschattung nebeneinander.
             $mod = (string) (@\IPS_GetInstance($iid)['ModuleInfo']['ModuleName'] ?? '');
@@ -2384,6 +2392,7 @@ class HomeSuiteHub extends EntityModule
                     'was'    => (string) ($e['was'] ?? ''),
                     'warum'  => (string) ($e['warum'] ?? ''),
                     'real'   => (int) ($e['real'] ?? 1),
+                    'ok'     => array_key_exists('ok', (array) $e) ? (int) $e['ok'] : null,
                     'werte'  => is_array($e['werte'] ?? null) ? $e['werte'] : null,
                 ];
             }

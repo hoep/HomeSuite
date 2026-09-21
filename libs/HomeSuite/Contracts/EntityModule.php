@@ -713,11 +713,19 @@ abstract class EntityModule extends \IPSModule
      * @param string $warum  der Grund ("Zeitfenster 06:00, Regenschranke frei")
      * @param array  $werte  Eingangsgroessen, auf denen die Entscheidung beruht
      * @param bool   $real   true = wirklich ausgefuehrt, false = nur berechnet (Schatten)
+     * @param ?bool  $erfolg true/false = der Befehl hat geklappt bzw. nicht; null = keine Aussage
+     *
+     * Der dritte Zustand ist noetig, weil "ausgefuehrt" und "geklappt" zweierlei sind: ein
+     * an das Geraet geschickter Befehl kann abgelehnt werden. Ohne ihn stand im Log
+     * "ausgefuehrt" neben dem Grund "Befehl vom Geraet abgelehnt" - ein Widerspruch in
+     * derselben Zeile.
      */
-    protected function entscheidungMerken(string $was, string $warum, array $werte = [], bool $real = true): void
+    protected function entscheidungMerken(string $was, string $warum, array $werte = [], bool $real = true,
+                                          ?bool $erfolg = null): void
     {
         try {
             $e = ['t' => time(), 'was' => $was, 'warum' => $warum, 'real' => $real ? 1 : 0];
+            if ($erfolg !== null) { $e['ok'] = $erfolg ? 1 : 0; }
             if ($werte !== []) { $e['werte'] = $werte; }
 
             $vid = @$this->GetIDForIdent('Entscheidungen');
@@ -736,7 +744,8 @@ abstract class EntityModule extends \IPSModule
             // ohne JSON aufzuklappen. Der Schattenmodus wird ausdruecklich benannt,
             // sonst liest sich eine berechnete Entscheidung wie eine ausgefuehrte.
             @$this->RegisterVariableString('AutoGrund', 'Entscheidung wegen', '', 97);
-            @$this->SetValue('AutoGrund', ($real ? '' : '[Schatten] ') . $was . ' - ' . $warum);
+            @$this->SetValue('AutoGrund',
+                ($real ? (($erfolg === false) ? '[fehlgeschlagen] ' : '') : '[Schatten] ') . $was . ' - ' . $warum);
         } catch (\Throwable $e) {
             // Ein Protokoll darf den Betrieb nie stoeren.
         }
