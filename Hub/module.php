@@ -2317,6 +2317,14 @@ class HomeSuiteHub extends EntityModule
      * IPS_GetObjectIDByIdent: das schreibt auch hinter @ eine Warnung ins Meldungslog,
      * und bei ein paar hundert Instanzen waere das eine Warnung je Aufruf.
      */
+    /** Modulname -> Domaenenname fuer den Filter im Log. */
+    private const DOMAENEN = [
+        'HeatingZone' => 'Heizung', 'IrrigationCircuit' => 'Bewässerung', 'ClimateZone' => 'Klima',
+        'ShadingDevice' => 'Beschattung', 'LightDevice' => 'Licht', 'Hub' => 'Licht-Automatik',
+        'PoolController' => 'Pool', 'MowerDevice' => 'Mäher', 'AudioZone' => 'Audio',
+        'SecurityCenter' => 'Wächter', 'GardenaDevice' => 'Gardena', 'DeviceHealth' => 'Geräte',
+    ];
+
     private function mgmtDecisionLog(array $args): array
     {
         $limit = max(1, min(1000, (int) ($args['limit'] ?? 300)));
@@ -2338,6 +2346,10 @@ class HomeSuiteHub extends EntityModule
             $name = (string) @\IPS_GetName($iid);
             $eltern = (int) @\IPS_GetParent($iid);
             $raum = $eltern > 0 ? (string) @\IPS_GetName($eltern) : '';
+            // Domaene aus dem Modulnamen: der Raum allein reicht zum Filtern nicht, denn in
+            // einem Raum entscheiden Heizung, Licht und Beschattung nebeneinander.
+            $mod = (string) (@\IPS_GetInstance($iid)['ModuleInfo']['ModuleName'] ?? '');
+            $domaene = self::DOMAENEN[$mod] ?? ($mod !== '' ? $mod : 'Sonstiges');
             foreach ($log as $e) {
                 if (!is_array($e)) { continue; }
                 $out[] = [
@@ -2345,6 +2357,7 @@ class HomeSuiteHub extends EntityModule
                     'iid'    => (int) $iid,
                     'geraet' => $name,
                     'raum'   => $raum,
+                    'domaene' => $domaene,
                     'was'    => (string) ($e['was'] ?? ''),
                     'warum'  => (string) ($e['warum'] ?? ''),
                     'real'   => (int) ($e['real'] ?? 1),
