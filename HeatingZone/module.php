@@ -772,10 +772,39 @@ class HeatingZone extends EntityModule
         $this->writeRt($rt);
 
         $w = ['soll_c' => round($soll, 1), 'modus' => $this->intVal('Mode')];
+        $fo = $this->fensterOffen();
+        if ($fo !== null) { $w['fenster_offen'] = $fo; }
         if ($istVorher !== null) { $w['geraet_vorher_c'] = round($istVorher, 1); }
         $ist = $this->wertOderNull('ActualTemp');
         if ($ist !== null) { $w['ist_c'] = round($ist, 1); }
         $this->entscheidungMerken('Sollwert ' . round($soll, 1) . ' C', $grund, $w, true);
+    }
+
+    /**
+     * Meldet das Thermostat "Fenster offen"?
+     *
+     * HomeMatic-Wandthermostate senken bei offenem Fenster selbsttaetig auf einen festen
+     * Wert ab - an dieser Anlage 12 Grad - und setzen dabei WINDOW_OPEN_REPORTING. Das ist
+     * WEDER ein Handeingriff NOCH der Frostschutz des Plans, sieht aber von aussen aus wie
+     * ein fremder Sollwert. Nachgewiesen 21.09.2026: genau die beiden Zonen, die 12 Grad
+     * meldeten (Schlafzimmer Bennogasse, Esszimmer), hatten den Flag auf An, alle uebrigen
+     * auf Aus.
+     *
+     * Der Flag liegt auf DEMSELBEN Kanal wie die Sollwert-Variable. Gesucht wird ueber die
+     * Kinder, nicht ueber IPS_GetObjectIDByIdent - das schreibt auch hinter @ eine Warnung.
+     */
+    private function fensterOffen(): ?bool
+    {
+        $target = (int) $this->cfg()['targetId'];
+        if ($target <= 0) { return null; }
+        foreach (@\IPS_GetChildrenIDs($target) ?: [] as $c) {
+            $o = @\IPS_GetObject($c);
+            if (($o['ObjectType'] ?? -1) !== 2) { continue; }
+            if (($o['ObjectIdent'] ?? '') !== 'WINDOW_OPEN_REPORTING') { continue; }
+            $v = @\GetValue($c);
+            return is_bool($v) ? $v : (bool) $v;
+        }
+        return null;
     }
 
     /** Zahlenwert einer eigenen Statusvariablen, sonst null. */
@@ -1314,6 +1343,14 @@ class HeatingZone extends EntityModule
         // Sekunden verpassen als jedes Mal 28 Fehleintraege erzeugen.
         if ((time() - (int) ($rt['applyTs'] ?? 0)) < self::SETTLE_SECONDS) {
             $this->SendDebug('HSHT.override', 'Sollwert ' . $newVal . ' im Einschwing-Fenster -> ignoriert', 0);
+            return;
+        }
+        // Fenster offen: das Geraet senkt selbst ab. Kein Eingriff, und vor allem KEIN
+        // Hold - der wuerde das Nachfuehren bis zur naechsten Slot-Grenze aussetzen,
+        // obwohl das Fenster vielleicht in zwei Minuten wieder zu ist.
+        if ($this->fensterOffen() === true) {
+            $this->SendDebug('HSHT.override', 'Sollwert ' . $newVal . ' bei offenem Fenster -> kein Hold', 0);
+            $this->heizMerken($newVal, 'Fenster offen (Geraeteabsenkung)', null);
             return;
         }
         $geplant = $this->desiredSetpoint($this->intVal('Mode'));
