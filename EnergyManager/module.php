@@ -365,8 +365,15 @@ class EnergyManager extends EntityModule
         $pr = $this->preisRang();
         if ($pr['rang'] !== null) { $this->setReflect('PriceRank', (int) $pr['rang']); }
         if (is_array($pr['beste'])) {
-            $this->setReflect('CheapWindow', date('H:i', $pr['beste']['start']) . '–'
-                . date('H:i', $pr['beste']['end']) . '  ' . round($pr['beste']['price'], 1));
+            // Der Tag MUSS dazu, sobald das Fenster nicht heute liegt: die Vorhersage reicht
+            // 24 Stunden, und "14:00-15:00" sah um 17:20 Uhr aus wie heute Nachmittag -
+            // gemeint war der naechste Tag. Eine Uhrzeit ohne Tag ist hier eine Falle.
+            $b = $pr['beste'];
+            $heute = date('Y-m-d') === date('Y-m-d', $b['start']);
+            $this->setReflect('CheapWindow',
+                ($heute ? '' : date('D ', $b['start']))
+                . date('H:i', $b['start']) . '–' . date('H:i', $b['end'])
+                . '  ' . round($b['price'], 1));
         }
     }
 
