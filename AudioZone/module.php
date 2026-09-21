@@ -611,9 +611,18 @@ class AudioZone extends EntityModule
     {
         // Der Wochenplan unterliegt der Ruhezeit-Absenkung: er ist Dauerbeschallung,
         // kein Weckruf. Beim Wecken (mgmtWake) gilt das ausdruecklich NICHT.
-        $target = $this->ruleVolumeCap($sc, max(0, min(100, (int) $sc['volume'])));
+        $roh    = max(0, min(100, (int) $sc['volume']));
+        $target = $this->ruleVolumeCap($sc, $roh);
         $kind = $sc['sourceKind'];
         $sid  = ($sc['sourceId'] !== '') ? $sc['sourceId'] : (string) $slotVal;
+        // Der Wochenplan der Zone entscheidet eigenstaendig - er ist NICHT der Wecker
+        // (den fuehrt der Hub) und laeuft auch nicht ueber autoSetDevice. Ohne Eintrag
+        // hier bliebe unerklaerlich, warum morgens Musik lief.
+        $w = ['quelle' => $kind . ' ' . $sid, 'lautstaerke' => $target];
+        if ($target < $roh) { $w['ruhezeit_absenkung_von'] = $roh; }
+        if ((int) $sc['rampMin'] > 0) { $w['rampe_min'] = (int) $sc['rampMin']; }
+        $this->entscheidungMerken('Wiedergabe starten', 'Wochenplan', $w,
+            (bool) $this->cfgVal('armed', false));
         $this->quelleStarten($kind, $sid, $target, (int) $sc['rampMin'], 'HSAU.sched');
     }
 
@@ -759,6 +768,9 @@ class AudioZone extends EntityModule
     {
         $this->SetTimerInterval(self::TIMER_RAMP, 0);
         $drv = $this->driver();
+        $this->entscheidungMerken('Wiedergabe beenden', 'Wochenplan',
+            !empty($sc['powerOffEnd']) ? ['auch_ausschalten' => true] : [],
+            $drv instanceof IAudioRenderer && (bool) $this->cfgVal('armed', false));
         if (!$drv instanceof IAudioRenderer || !(bool) $this->cfgVal('armed', false)) {
             $this->SendDebug('HSAU.sched', 'Schatten: WUERDE stoppen', 0);
             return;
@@ -834,7 +846,9 @@ class AudioZone extends EntityModule
         unset($rt['sleepUntil']);
         $this->writeRt($rt);
         $drv = $this->driver();
-        if ($drv instanceof IAudioRenderer && (bool) $this->cfgVal('armed', false)) {
+        $scharf = $drv instanceof IAudioRenderer && (bool) $this->cfgVal('armed', false);
+        $this->entscheidungMerken('Wiedergabe beenden', 'Sleep-Timer abgelaufen', [], $scharf);
+        if ($scharf) {
             $drv->stop();
             $this->applyPower(false, $drv);
         } else {
