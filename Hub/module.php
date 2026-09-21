@@ -1538,10 +1538,40 @@ class HomeSuiteHub extends EntityModule
         return true;
     }
 
-    private function autoSetDevice(int $iid, bool $on, int $level = -1, int $cct = 0): void
+    /**
+     * Von der Lichtautomatik geschaltet - mit Begruendung.
+     *
+     * Die Automatik sitzt im Hub, nicht im LightDevice: Bewegung, Circadian, Szenen und
+     * Zeitregeln entscheiden ZONENUEBERGREIFEND. Wer im Protokoll einer einzelnen Leuchte
+     * nachsaehe, warum sie anging, faende deshalb nichts - der Eintrag gehoert hierher.
+     *
+     * $grund nennt die Regel, die geschaltet hat (Name aus der Konfig), damit im Protokoll
+     * "Bewegung Gang" steht und nicht bloss "Automatik".
+     */
+    private function autoSetDevice(int $iid, bool $on, int $level = -1, int $cct = 0, string $grund = 'Lichtautomatik'): void
     {
         if (!@\IPS_InstanceExists($iid)) {
             return;
+        }
+        // Entdopplung je Leuchte: die Circadian-Regel faehrt Helligkeit und Farbtemperatur
+        // im Takt nach. Ohne diesen Riegel stuende dasselbe Schalten hundertfach im
+        // Protokoll, und der Ringpuffer waere voll, bevor ein echtes Ereignis darin
+        // auftaucht. Verglichen wird das GANZE Ergebnis, ein Helligkeitswechsel zaehlt
+        // also weiterhin - nur die Wiederholung nicht.
+        $sig = $iid . '|' . ($on ? 1 : 0) . '|' . $level . '|' . $cct . '|' . $grund;
+        $rt  = $this->readRt();
+        $seen = is_array($rt['lightSig'] ?? null) ? $rt['lightSig'] : [];
+        if ((string) ($seen[$iid] ?? '') !== $sig) {
+            $seen[$iid] = $sig;
+            $rt['lightSig'] = $seen;
+            $this->writeRt($rt);
+            $this->entscheidungMerken(
+                (@\IPS_GetName($iid) ?: ('Leuchte ' . $iid)) . ' ' . ($on ? 'ein' : 'aus'),
+                $grund,
+                ['leuchte' => $iid] + ($on && $level >= 0 ? ['helligkeit' => $level] : [])
+                                    + ($on && $cct > 0 ? ['farbtemperatur_k' => $cct] : []),
+                true
+            );
         }
         $this->setDeviceVar($iid, 'Power', $on);
         if ($on && $level >= 0) {
@@ -1634,7 +1664,7 @@ class HomeSuiteHub extends EntityModule
                 $iid = (int) $iid;
                 if ($iid > 0 && $this->deviceOn($iid)) {
                     $wantLevel = !empty($r['level']) ? (int) $t['level'] : -1;
-                    $this->autoSetDevice($iid, true, $wantLevel, (int) $t['cct']);
+                    $this->autoSetDevice($iid, true, $wantLevel, (int) $t['cct'], 'Circadian');
                 }
             }
         }
@@ -1650,7 +1680,7 @@ class HomeSuiteHub extends EntityModule
             $last = (int) ($st[$lastKey] ?? 0);
             $sim = \Hoep\HomeSuite\Engines\LightAutomation::presenceSim($r, $away, $nowMin, $last, $now, count($devs));
             if ($sim['fire']) {
-                $this->autoSetDevice($devs[$sim['index']], (bool) $sim['on']);
+                $this->autoSetDevice($devs[$sim['index']], (bool) $sim['on'], -1, 0, 'Anwesenheit simulieren');
                 $st[$lastKey] = $now;
             }
         }
@@ -1666,7 +1696,7 @@ class HomeSuiteHub extends EntityModule
             $res = \Hoep\HomeSuite\Engines\LightAutomation::motion($r, $sensorOn, null, $hold, $now);
             if ($res['action'] === 'off') {
                 foreach ((array) ($r['devices'] ?? []) as $iid) {
-                    $this->autoSetDevice((int) $iid, false);
+                    $this->autoSetDevice((int) $iid, false, -1, 0, 'Bewegung abgelaufen');
                 }
             }
             $st[$holdKey] = $res['holdUntil'];
@@ -1765,8 +1795,9 @@ class HomeSuiteHub extends EntityModule
             $holdKey = 'motHold_' . $ri;
             $res = \Hoep\HomeSuite\Engines\LightAutomation::motion($r, $sensorOn, $lux, (int) ($st[$holdKey] ?? 0), $now);
             if ($res['action'] === 'on') {
+                $rn = trim((string) ($r['name'] ?? '')) !== '' ? (string) $r['name'] : 'Bewegung';
                 foreach ((array) ($r['devices'] ?? []) as $iid) {
-                    $this->autoSetDevice((int) $iid, true, (int) ($r['level'] ?? -1));
+                    $this->autoSetDevice((int) $iid, true, (int) ($r['level'] ?? -1), 0, 'Regel "' . $rn . '"');
                 }
                 $st[$holdKey] = $res['holdUntil'];
                 $changed = true;

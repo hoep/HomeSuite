@@ -743,6 +743,39 @@ class HeatingZone extends EntityModule
      * Modus). Im device-Modus fuehrt das GERAET den Plan selbst — dann nur
      * sicherstellen, dass das aktuelle Wochenprogramm gepusht ist.
      */
+    /**
+     * Sollwert-Entscheidung festhalten - nur bei Wechsel von Wert ODER Grund.
+     *
+     * reconcile() schreibt auch periodisch als Failsafe (REASSERT_SECONDS). Ohne Dedupe
+     * stuende im Protokoll alle paar Minuten dieselbe Zeile, und der Ringpuffer waere
+     * voll, bevor der erste interessante Wechsel darin auftaucht.
+     */
+    private function heizMerken(float $soll, string $grund, ?float $istVorher): void
+    {
+        $sig = round($soll, 1) . '|' . $grund;
+        $rt  = $this->readRt();
+        if ((string) ($rt['lastHeizSig'] ?? '') === $sig) {
+            return;
+        }
+        $rt['lastHeizSig'] = $sig;
+        $this->writeRt($rt);
+
+        $w = ['soll_c' => round($soll, 1), 'modus' => $this->intVal('Mode')];
+        if ($istVorher !== null) { $w['geraet_vorher_c'] = round($istVorher, 1); }
+        $ist = $this->wertOderNull('ActualTemp');
+        if ($ist !== null) { $w['ist_c'] = round($ist, 1); }
+        $this->entscheidungMerken('Sollwert ' . round($soll, 1) . ' C', $grund, $w, true);
+    }
+
+    /** Zahlenwert einer eigenen Statusvariablen, sonst null. */
+    private function wertOderNull(string $ident): ?float
+    {
+        $vid = @$this->GetIDForIdent($ident);
+        if ($vid === false || $vid <= 0) { return null; }
+        $v = @\GetValue($vid);
+        return is_numeric($v) ? (float) $v : null;
+    }
+
     private function reconcile(IThermostat $drv): void
     {
         if (!$this->armed()) {
@@ -789,6 +822,10 @@ class HeatingZone extends EntityModule
         }
 
         if ($drv->setSetpoint($desired)) {
+            // Warum geschrieben wurde, ist die eigentliche Information: eine Abweichung
+            // heisst, dass etwas dagegengehalten hat (Drift, konkurrierender Regler,
+            // abgelaufener Hold); eine Auffrischung ist bloss das Failsafe-Intervall.
+            $this->heizMerken($desired, $drift ? 'Sollwert wich ab' : 'Auffrischung', $actual);
             $this->SetValue('Setpoint', $desired);   // Modul-Sollwert spiegeln
             $rt['lastSet']      = $desired;
             $rt['lastAssertTs'] = time();
@@ -1244,6 +1281,10 @@ class HeatingZone extends EntityModule
         // Externer Eingriff -> Override bis zur naechsten Slot-Grenze halten.
         $this->manualHold('Setpoint', $this->secondsToNextBoundary($this->activeVariant()));
         $this->SendDebug('HSHT.override', 'Externer Sollwert ' . $newVal . ' erkannt -> Hold bis Slot-Grenze', 0);
+        // Ein Griff ans Thermostat ist die Entscheidung eines MENSCHEN - die gehoert
+        // sichtbar ins Protokoll, sonst wundert man sich spaeter, warum der Plan nicht griff.
+        $this->entscheidungMerken('Sollwert ' . round($newVal, 1) . ' C', 'Handeingriff am Geraet',
+            ['soll_c' => round($newVal, 1), 'hold_bis_slotgrenze' => true], true);
     }
 
     /** Sekunden bis zur naechsten Slot-Grenze der aktiven Variante (Default 1 h). */
