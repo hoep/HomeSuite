@@ -44,6 +44,38 @@ class EnergyManager extends EntityModule
     private const DEF_RANKTOP      = 0;     // 0 = Rangregel aus; sonst "unter den N guenstigsten Stunden"
     private const DEF_MAXGRID_W    = 0.0;   // 0 = kein Deckel auf den Zukauf
     private const DEF_MINRUN_MIN   = 30;    // kuerzere Laeufe kosten mehr, als sie bringen
+    private const DEF_MINSAVE_CT   = 0.0;   // 0 = Ersparnisregel aus; sonst Mindestertrag je Lauf in ct
+    private const DEF_FIXPRICE_CT  = 0.0;   // >0 = Festtarif in ct/kWh; dann gibt es nichts zu verschieben
+
+    /*
+     * WARUM hier in Kilowattstunden und Cent gerechnet wird und nicht in Watt.
+     *
+     * Bezahlt wird ARBEIT, nicht Leistung. Ob 36 oder 52 ct/kWh gelten, sagt fuer sich
+     * genommen nichts darueber, ob sich das Verschieben einer Last lohnt - das entscheidet
+     * erst, WIE VIELE Kilowattstunden diese Last in dieser Stunde zieht:
+     *
+     *     Ersparnis [ct] = Leistung [kW] x Laufdauer [h] x Preisunterschied [ct/kWh]
+     *
+     * Eine 2-kW-Last, zwei Stunden lang, bei 15 ct Unterschied bringt 60 ct. Eine 50-W-Last
+     * bringt unter denselben Bedingungen 1,5 ct - das ist die Schaltung nicht wert. Genau
+     * diesen Unterschied kann eine Regel auf Watt-Schwellen nicht sehen, und deshalb traegt
+     * jede Last hier ihre erwartete Laufdauer, und jede Entscheidung nennt ihren Ertrag.
+     *
+     * Die Leistungswerte bleiben als ANZEIGE erhalten - sie zeigen die Lage. Entschieden
+     * wird nach Geld.
+     *
+     * UND WORAN SICH ALLES ENTSCHEIDET: am Tarif.
+     *
+     * Bei einem FESTTARIF kostet jede Kilowattstunde rund um die Uhr gleich viel. Dann gibt
+     * es keinen Preisunterschied, keine Ersparnis und folglich nichts zu verschieben - egal
+     * wie gut die Marktpreise aussehen, an dieser Rechnung aendern sie nichts. Ist
+     * fixedPriceCt gesetzt, bleiben alle Verschieberegeln deshalb WIRKUNGSLOS, und das
+     * Modul tut das, was dann noch Wert hat: es rechnet die Lage und die Kosten mit.
+     *
+     * Die Marktpreisquelle darf trotzdem gebunden bleiben - als Beobachtung. Sie beantwortet
+     * die Frage, ob sich ein variabler Tarif ueberhaupt lohnen WUERDE, und an dem Tag, an
+     * dem einer abgeschlossen wird, genuegt es, fixedPriceCt auf 0 zu setzen.
+     */
 
     /*
      * WARUM die Ueberschussregel ab Werk AUS ist.
@@ -78,6 +110,14 @@ class EnergyManager extends EntityModule
                  'label' => 'Verbrauch', 'varType' => 2, 'profile' => '~Watt', 'unit' => ' W', 'actionable' => false],
                 ['ident' => 'Grid', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:grid',
                  'label' => 'Zukauf', 'varType' => 2, 'profile' => '~Watt', 'unit' => ' W', 'actionable' => false],
+                ['ident' => 'ProductionKwh', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:productionkwh',
+                 'label' => 'Erzeugung heute', 'varType' => 2, 'profile' => '~Electricity', 'unit' => ' kWh', 'actionable' => false],
+                ['ident' => 'GridKwh', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:gridkwh',
+                 'label' => 'Zukauf heute', 'varType' => 2, 'profile' => '~Electricity', 'unit' => ' kWh', 'actionable' => false],
+                ['ident' => 'GridCostToday', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:gridcost',
+                 'label' => 'Zukauf heute (Kosten)', 'varType' => 2, 'unit' => ' EUR', 'actionable' => false],
+                ['ident' => 'SavedToday', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:savedtoday',
+                 'label' => 'Verschiebung brachte heute', 'varType' => 2, 'unit' => ' ct', 'actionable' => false],
                 ['ident' => 'SelfRate', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:selfrate',
                  'label' => 'Eigendeckung', 'varType' => 2, 'profile' => '~Intensity.1', 'unit' => ' %', 'actionable' => false],
                 ['ident' => 'Surplus', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:surplus',
@@ -104,7 +144,7 @@ class EnergyManager extends EntityModule
                 ['op' => 'configureSources', 'label' => 'Quellen binden (Bilanz/Preis)'],
                 ['op' => 'setBalance',   'label' => 'Erzeuger / Verbraucher / Zukauf festlegen'],
                 ['op' => 'getBalance',   'label' => 'Energiebilanz lesen'],
-                ['op' => 'setRules',     'label' => 'Schwellen setzen (Preis/Rang/Zukauf-Deckel)'],
+                ['op' => 'setRules',     'label' => 'Schwellen setzen (Preis/Rang/Mindestertrag)'],
                 ['op' => 'listLoads',    'label' => 'Verschiebbare Lasten lesen'],
                 ['op' => 'setLoads',     'label' => 'Verschiebbare Lasten setzen'],
                 ['op' => 'computeProbe', 'label' => 'Was wuerde jetzt geschehen? (Trockenlauf)'],
@@ -276,6 +316,9 @@ class EnergyManager extends EntityModule
             'erzeuger'    => $liste($b['erzeuger'] ?? []),
             'verbraucher' => $liste($b['verbraucher'] ?? []),
             'zukaufVid'   => (int) ($b['zukaufVid'] ?? 0),
+            // Tageszaehler in kWh - das ist die Groesse, die auf der Rechnung steht.
+            'erzeugungKwhVid' => (int) ($b['erzeugungKwhVid'] ?? 0),
+            'zukaufKwhVid'    => (int) ($b['zukaufKwhVid'] ?? 0),
         ];
     }
 
@@ -284,7 +327,9 @@ class EnergyManager extends EntityModule
     {
         $b = $this->bilanzCfg();
         $ids = array_merge(array_column($b['erzeuger'], 'vid'), array_column($b['verbraucher'], 'vid'));
-        if ($b['zukaufVid'] > 0) { $ids[] = $b['zukaufVid']; }
+        foreach (['zukaufVid', 'erzeugungKwhVid', 'zukaufKwhVid'] as $k) {
+            if ($b[$k] > 0) { $ids[] = $b[$k]; }
+        }
         return array_values(array_unique(array_map('intval', $ids)));
     }
 
@@ -329,6 +374,8 @@ class EnergyManager extends EntityModule
 
         return ['produktion' => $prod, 'verbrauch' => $verb, 'zukauf' => $zukauf,
                 'bilanz' => $bil, 'deckung' => $deckung, 'quelle' => $quelle,
+                'erzeugungKwh' => $this->zahlVon($b['erzeugungKwhVid']),
+                'zukaufKwh'    => $this->zahlVon($b['zukaufKwhVid']),
                 'erzeuger' => $b['erzeuger'], 'verbraucher' => $b['verbraucher'],
                 'zukaufVid' => $b['zukaufVid']];
     }
@@ -343,8 +390,24 @@ class EnergyManager extends EntityModule
     /** Bilanz in Watt (positiv = mehr Erzeugung als Verbrauch). Hier praktisch immer negativ. */
     private function ueberschuss(): ?float { return $this->bilanz()['bilanz']; }
 
-    /** Aktueller Strompreis, so wie ihn die gebundene Quelle fuehrt. */
-    private function preis(): ?float { return $this->zahlVon((int) $this->ReadPropertyInteger('PriceVarId')); }
+    /**
+     * Der Preis, der fuer DIESEN Haushalt gilt, in ct/kWh.
+     *
+     * Ein gesetzter Festtarif gewinnt gegen jede Marktquelle: bezahlt wird, was im Vertrag
+     * steht, nicht was die Boerse meldet.
+     */
+    private function preis(): ?float
+    {
+        $fest = (float) $this->regeln()['fixedPriceCt'];
+        if ($fest > 0) { return $fest; }
+        return $this->zahlVon((int) $this->ReadPropertyInteger('PriceVarId'));
+    }
+
+    /** Der Marktpreis - reine Beobachtung, auch wenn ein Festtarif gilt. */
+    private function marktpreis(): ?float { return $this->zahlVon((int) $this->ReadPropertyInteger('PriceVarId')); }
+
+    /** Gilt ein Festtarif? Dann ist Verschieben sinnlos. */
+    private function festtarif(): bool { return (float) $this->regeln()['fixedPriceCt'] > 0; }
 
     /**
      * Preisvorhersage als Liste [{start,end,price}], nach Zeit sortiert.
@@ -413,6 +476,8 @@ class EnergyManager extends EntityModule
             'rankTop'    => max(0, (int) ($r['rankTop'] ?? self::DEF_RANKTOP)),
             'maxGridW'   => (float) ($r['maxGridW'] ?? self::DEF_MAXGRID_W),
             'minRunMin'  => max(1, (int) ($r['minRunMin'] ?? self::DEF_MINRUN_MIN)),
+            'minSaveCt'  => (float) ($r['minSaveCt'] ?? self::DEF_MINSAVE_CT),
+            'fixedPriceCt' => (float) ($r['fixedPriceCt'] ?? self::DEF_FIXPRICE_CT),
         ];
     }
 
@@ -436,6 +501,9 @@ class EnergyManager extends EntityModule
                 'instanz'  => (int) ($e['instanz'] ?? 0),
                 'ident'    => (string) ($e['ident'] ?? ''),
                 'watt'     => (int) ($e['watt'] ?? 0),
+                // Erwartete Laufdauer in Minuten. Ohne sie laesst sich kein Ertrag rechnen;
+                // fehlt sie, gilt der Mindestlauf als vorsichtige Untergrenze.
+                'runMin'   => max(1, (int) ($e['runMin'] ?? 0)),
                 'prio'     => (int) ($e['prio'] ?? 50),
                 'fromHour' => max(0, min(23, (int) ($e['fromHour'] ?? 0))),
                 'toHour'   => max(0, min(24, (int) ($e['toHour'] ?? 24))),
@@ -481,6 +549,18 @@ class EnergyManager extends EntityModule
         if ($b['zukauf']     !== null) { $this->setReflect('Grid',        round($b['zukauf'], 0)); }
         if ($b['deckung']    !== null) { $this->setReflect('SelfRate',    round($b['deckung'], 1)); }
         if ($b['bilanz']     !== null) { $this->setReflect('Surplus',     round($b['bilanz'], 0)); }
+        if ($b['erzeugungKwh'] !== null) { $this->setReflect('ProductionKwh', round($b['erzeugungKwh'], 2)); }
+        if ($b['zukaufKwh']    !== null) { $this->setReflect('GridKwh',       round($b['zukaufKwh'], 2)); }
+        /*
+         * Was der heutige Zukauf kostet - die Zahl, die am Monatsende zaehlt.
+         *
+         * NUR mit gesetztem Festtarif. Den Marktpreis hier einzusetzen waere die
+         * gefaehrlichste Art von Fehler: eine praezise aussehende Zahl, die niemandes
+         * Rechnung beschreibt. Ohne hinterlegten Tarif bleibt die Anzeige leer.
+         */
+        $fix = (float) $this->regeln()['fixedPriceCt'];
+        $this->setReflect('GridCostToday',
+            ($b['zukaufKwh'] !== null && $fix > 0) ? round($b['zukaufKwh'] * $fix / 100.0, 2) : 0.0);
         $p = $this->preis();
         if ($p !== null) { $this->setReflect('Price', round($p, 2)); }
         $pr = $this->preisRang();
@@ -552,18 +632,27 @@ class EnergyManager extends EntityModule
          * Ist keine Regel eingeschaltet, geschieht NICHTS. Ein Energiemanager, der ohne
          * gesetzte Schwelle munter schaltet, waere nicht vorsichtig, sondern unberechenbar.
          */
-        $preisOk = ($rg['priceCt'] > 0 && $p !== null && $p <= $rg['priceCt']);
-        $rangOk  = ($rg['rankTop'] > 0 && $pr['rang'] !== null && $pr['rang'] <= $rg['rankTop']);
+        $fest = $this->festtarif();
+
+        // Bei Festtarif kosten alle Stunden gleich viel. Preisschwelle und Preisrang sind
+        // dann keine Regeln mehr, sondern Selbstbetrug - sie werden gar nicht erst geprueft.
+        $preisOk = (!$fest && $rg['priceCt'] > 0 && $p !== null && $p <= $rg['priceCt']);
+        $rangOk  = (!$fest && $rg['rankTop'] > 0 && $pr['rang'] !== null && $pr['rang'] <= $rg['rankTop']);
         $ueberschussOk = ($rg['surplusW'] > 0 && $u !== null && $u >= $rg['surplusW']);
-        $regelAn = ($rg['priceCt'] > 0 || $rg['rankTop'] > 0 || $rg['surplusW'] > 0);
+        $regelAn = ((!$fest && ($rg['priceCt'] > 0 || $rg['rankTop'] > 0)) || $rg['surplusW'] > 0);
         $guenstig = $regelAn && ($preisOk || $rangOk || $ueberschussOk);
 
         $grund = [];
+        if ($fest && $rg['surplusW'] <= 0) {
+            $grund[] = 'Festtarif ' . round($rg['fixedPriceCt'], 1) . ' ct/kWh - Verschieben bringt nichts';
+        }
         if ($preisOk)       { $grund[] = 'Preis ' . round((float) $p, 1) . ' ct unter Schwelle ' . round($rg['priceCt'], 1); }
         if ($rangOk)        { $grund[] = 'Preisrang ' . $pr['rang'] . '/' . $pr['anzahl'] . ' (Top ' . $rg['rankTop'] . ')'; }
         if ($ueberschussOk) { $grund[] = 'Überschuss ' . round((float) $u) . ' W'; }
         if ($grund === []) {
-            if (!$regelAn) {
+            if ($fest && $rg['surplusW'] <= 0) {
+                // Begruendung steht schon oben.
+            } elseif (!$regelAn) {
                 $grund[] = 'keine Regel eingeschaltet';
             } else {
                 if ($rg['priceCt'] > 0) {
@@ -608,7 +697,14 @@ class EnergyManager extends EntityModule
                     && ($zukauf + $dazu + $l['watt']) > $rg['maxGridW']) {
                     continue;   // Deckel erreicht - diese Last wartet
                 }
-                $schalten[] = ['last' => $l, 'ein' => true, 'grund' => $grundText];
+                // Lohnt sich dieser Lauf ueberhaupt? Gerechnet wird in Arbeit und Geld.
+                $ertrag = $this->ertrag($l, $p, $pr);
+                if ($rg['minSaveCt'] > 0 && $ertrag !== null && $ertrag < $rg['minSaveCt']) {
+                    continue;   // zu wenige Kilowattstunden, als dass es sich lohnte
+                }
+                $g = $grundText;
+                if ($ertrag !== null) { $g .= ', Ertrag ' . round($ertrag, 1) . ' ct'; }
+                $schalten[] = ['last' => $l, 'ein' => true, 'grund' => $g, 'ertrag' => $ertrag];
                 $dazu += (float) $l['watt'];
             } elseif (!$guenstig && $an === true) {
                 $schalten[] = ['last' => $l, 'ein' => false, 'grund' => $grundText];
@@ -616,9 +712,40 @@ class EnergyManager extends EntityModule
         }
 
         return ['guenstig' => $guenstig, 'laufend' => $laufend, 'schalten' => $schalten,
+                'festtarif' => $fest,
                 'text' => ($guenstig ? 'günstig: ' : 'nicht günstig: ') . $grundText,
                 'ueberschuss' => $u, 'bilanz' => $b, 'preis' => $p, 'rang' => $pr['rang'],
                 'regeln' => $rg];
+    }
+
+    /**
+     * Was bringt es, diese Last JETZT laufen zu lassen statt zum Mittelwert des Tages?
+     *
+     *     Ertrag [ct] = Leistung [kW] x Laufdauer [h] x (Vergleichspreis - Jetztpreis)
+     *
+     * Vergleichsmass ist der MEDIAN der naechsten 24 Stunden, nicht der teuerste Wert: der
+     * Median beschreibt, was ein Lauf zu beliebiger Zeit im Mittel kosten wuerde, und genau
+     * dagegen wird verschoben. Gegen den Hoechstpreis zu rechnen wuerde jede Verschiebung
+     * schoenrechnen.
+     *
+     * Ohne Preisvorhersage gibt es kein Vergleichsmass - dann null statt einer erfundenen
+     * Zahl.
+     */
+    private function ertrag(array $l, ?float $jetzt, array $pr): ?float
+    {
+        if ($jetzt === null || $this->festtarif()) { return null; }
+        $fc = $this->vorhersage();
+        $now = time();
+        $preise = [];
+        foreach ($fc as $e) {
+            if ($e['end'] > $now && $e['start'] < $now + 86400) { $preise[] = $e['price']; }
+        }
+        if (count($preise) < 4) { return null; }
+        sort($preise);
+        $median = $preise[intdiv(count($preise), 2)];
+        $dauer = max(1, (int) ($l['runMin'] > 0 ? $l['runMin'] : $this->regeln()['minRunMin']));
+        $kwh = ((float) $l['watt'] / 1000.0) * ($dauer / 60.0);
+        return $kwh * ($median - $jetzt);
     }
 
     /** Eine Last schalten - oder im Schatten nur vermerken, was geschehen waere. */
@@ -627,6 +754,8 @@ class EnergyManager extends EntityModule
         $vid = $this->lastVarId($l);
         $name = $l['name'] !== '' ? $l['name'] : ((string) @\IPS_GetName((int) $l['instanz']));
         $werte = ['last' => $name, 'watt' => $l['watt']];
+        $dauer = (int) ($l['runMin'] > 0 ? $l['runMin'] : $this->regeln()['minRunMin']);
+        $werte['kwh'] = round(((float) $l['watt'] / 1000.0) * ($dauer / 60.0), 3);
         if (($e['bilanz']['zukauf'] ?? null) !== null) { $werte['zukauf_w'] = round((float) $e['bilanz']['zukauf']); }
         if ($e['ueberschuss'] !== null) { $werte['bilanz_w'] = round((float) $e['ueberschuss']); }
         if ($e['preis'] !== null)       { $werte['preis'] = round((float) $e['preis'], 2); }
@@ -680,7 +809,9 @@ class EnergyManager extends EntityModule
                     }
                     $b[$k] = $neu;
                 }
-                if (array_key_exists('zukaufVid', $args)) { $b['zukaufVid'] = (int) $args['zukaufVid']; }
+                foreach (['zukaufVid', 'erzeugungKwhVid', 'zukaufKwhVid'] as $k) {
+                    if (array_key_exists($k, $args)) { $b[$k] = (int) $args[$k]; }
+                }
                 $this->store()->patch('config', ['balance' => $b]);
                 @\IPS_ApplyChanges($this->InstanceID);   // Anmeldung und Loeschschutz nachziehen
                 return ['ok' => true, 'balance' => $this->bilanz()];
@@ -689,7 +820,7 @@ class EnergyManager extends EntityModule
                 return ['ok' => true, 'balance' => $this->bilanz(), 'rules' => $this->regeln()];
             case 'setRules': {
                 $r = $this->regeln();
-                foreach (['surplusW', 'priceCt', 'maxGridW'] as $k) {
+                foreach (['surplusW', 'priceCt', 'maxGridW', 'minSaveCt', 'fixedPriceCt'] as $k) {
                     if (array_key_exists($k, $args)) { $r[$k] = (float) $args[$k]; }
                 }
                 if (array_key_exists('rankTop', $args))   { $r['rankTop']   = max(0, (int) $args['rankTop']); }
@@ -719,6 +850,8 @@ class EnergyManager extends EntityModule
                 return ['ok' => true, 'armed' => $this->armed(), 'guenstig' => $e['guenstig'],
                         'erzeugung_w' => $b['produktion'], 'verbrauch_w' => $b['verbrauch'],
                         'zukauf_w' => $b['zukauf'], 'eigendeckung_pct' => $b['deckung'],
+                        'erzeugung_kwh_heute' => $b['erzeugungKwh'], 'zukauf_kwh_heute' => $b['zukaufKwh'],
+                        'festtarif' => $e['festtarif'], 'marktpreis' => $this->marktpreis(),
                         'bilanzquelle' => $b['quelle'],
                         'ueberschuss_w' => $e['ueberschuss'], 'preis' => $e['preis'],
                         'preisrang' => $e['rang'], 'regeln' => $e['regeln'],
