@@ -2365,6 +2365,31 @@ class HomeSuiteHub extends EntityModule
                 ];
             }
         }
+        // Beschattung fuehrt ihr Protokoll seit jeher SELBST (Attribut DecisionLog, gelesen
+        // ueber getLog je Zone) und nicht in der Variablen 'Entscheidungen'. Die Schleife
+        // oben sieht davon nichts, und ausgerechnet die Domaene mit den meisten
+        // Entscheidungen fehlte im Gesamtlog. Statt 17 Zonen umzubauen - das Format ist
+        // erprobt und der shadelog-Modus liest es unveraendert - hier zusammenfuehren.
+        foreach (($this->mgmtShadeLog(['limit' => $limit])['entries'] ?? []) as $e) {
+            if (!is_array($e)) { continue; }
+            $von = $e['from'] ?? null;
+            $bis = $e['to'] ?? null;
+            $was = ($bis === null || (int) $bis < 0)
+                ? 'gestoppt'
+                : ('auf ' . (int) $bis . ' %' . (($von !== null && (int) $von >= 0) ? ' (von ' . (int) $von . ' %)' : ''));
+            $out[] = [
+                't'       => (int) ($e['t'] ?? 0),
+                'iid'     => (int) ($e['id'] ?? 0),
+                'geraet'  => (string) ($e['room'] ?? ''),
+                'raum'    => (string) ($e['room'] ?? ''),
+                'domaene' => 'Beschattung',
+                'was'     => $was,
+                'warum'   => (string) ($e['why'] ?? '')
+                             . (((string) ($e['src'] ?? '')) === 'manuell' ? ' (manuell)' : ''),
+                'real'    => (int) (!empty($e['armed'])),
+                'werte'   => null,
+            ];
+        }
         usort($out, static fn($a, $b) => $b['t'] <=> $a['t']);
         return ['ok' => true, 'count' => count($out), 'rows' => array_slice($out, 0, $limit)];
     }

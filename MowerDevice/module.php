@@ -390,15 +390,31 @@ class MowerDevice extends EntityModule
             $this->SendDebug('HSMW.cmd', $what . ': kein Treiber', 0);
             return;
         }
+        // Wer den Befehl ausgeloest hat, weiss das Modul nicht: die Regen-Autologik des
+        // Maehers liegt in externen Skripten (AutoMode 3 'Logik'), das Modul fuehrt nur aus.
+        // Deshalb nennt das Protokoll die BETRIEBSART als Grund - daran erkennt man, ob ein
+        // Mensch, der Zeitplan des Geraets oder die Autologik dahinterstand.
+        $fmt = function (string $ident): string {
+            $vid = @$this->GetIDForIdent($ident);
+            return ($vid !== false && $vid > 0) ? (string) @\GetValueFormatted($vid) : '';
+        };
+        $grund = 'Betriebsart ' . ($fmt('AutoMode') ?: '?');
+        $werte = ['akku_pct' => (int) $this->GetControlValue('Battery'),
+                  'aktivitaet' => $fmt('Activity')];
+        $bereich = (string) @$this->GetControlValue('Mission');
+        if ($bereich !== '') { $werte['bereich'] = $bereich; }
         if (!$this->armed()) {
             $this->SendDebug('HSMW.shadow', 'WUERDE ' . $what . ' (nicht scharf)', 0);
+            $this->entscheidungMerken($what, $grund, $werte, false);
             return;
         }
         try {
             $ok = (bool) $fn($d);
             $this->SendDebug('HSMW.cmd', $what . ' -> ' . ($ok ? 'ok' : 'FEHLER'), 0);
+            $this->entscheidungMerken($what, $ok ? $grund : ($grund . ' - Befehl fehlgeschlagen'), $werte, true);
         } catch (\Throwable $e) {
             $this->SendDebug('HSMW.cmd', $what . ' Exception: ' . $e->getMessage(), 0);
+            $this->entscheidungMerken($what, $grund . ' - Fehler: ' . $e->getMessage(), $werte, true);
         }
         // Ist-Zustand nach dem Kommando bald nachziehen.
         $this->SetTimerInterval(self::TIMER_REFRESH, 3000);
