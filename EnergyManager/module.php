@@ -847,6 +847,15 @@ class EnergyManager extends EntityModule
                 foreach (['zaehler', 'tarife', 'zonen'] as $k) {
                     if (isset($args[$k]) && is_array($args[$k])) { $cur[$k] = array_values($args[$k]); }
                 }
+                if (isset($args['entgelte']) && is_array($args['entgelte'])) {
+                    // Wer einen Wert von der Rechnung eintraegt, hebt damit auch den
+                    // Schaetzungs-Vermerk auf - sonst bliebe eine genaue Zahl als unsicher
+                    // markiert.
+                    $cur['entgelte'] = array_merge($cur['entgelte'] ?? [], $args['entgelte']);
+                    if (!array_key_exists('geschaetzt', $args['entgelte'])) {
+                        $cur['entgelte']['geschaetzt'] = false;
+                    }
+                }
                 if (isset($args['tage']))     { $cur['tage'] = max(7, (int) $args['tage']); }
                 if (isset($args['istTarif'])) { $cur['istTarif'] = (string) $args['istTarif']; }
                 $this->store()->patch('config', ['sim' => $cur]);
@@ -901,16 +910,100 @@ class EnergyManager extends EntityModule
     // und uebergeben.
     // ==================================================================
 
-    /** Vorgabetarife: gemessen aus den Preisblaettern, Stand 22.09.2026, brutto. */
+    /**
+     * Vorgabetarife, brutto, Stand 22.09.2026.
+     *
+     * Quelle ist jeweils das Preisblatt des Anbieters oder eine Tarifuebersicht; `stand`
+     * traegt das Datum, damit der Vergleich altert statt stillschweigend falsch zu werden.
+     * Nur bundesweit oder in Oberoesterreich erhaeltliche Tarife - Wien Energie etwa
+     * beliefert Wien, Niederoesterreich und das Burgenland und faellt deshalb heraus.
+     *
+     * Neukundenjahre stehen als EIGENER Eintrag daneben, nicht als Fussnote: ein Bonus
+     * verschiebt die Rangfolge erheblich und laeuft nach zwoelf Monaten aus. Voltino zeigt
+     * es: im ersten Jahr Platz zwei, danach Platz zehn.
+     */
     private const SIM_TARIFE = [
-        ['id' => 'loyal',    'name' => 'Energie AG Ökostrom Loyal',   'ct' => 14.90, 'grundEur' => 4.62],
-        ['id' => 'feelgood', 'name' => 'Energie AG Feel Good',        'ct' => 12.00, 'grundEur' => 5.28],
-        ['id' => 'komfort',  'name' => 'Energie AG Ökostrom Komfort', 'ct' => 19.46, 'grundEur' => 4.62],
-        ['id' => 'direkt',   'name' => 'Energie AG Ökostrom Direkt',  'ct' => 19.56, 'grundEur' => 7.26],
-        ['id' => 'voltino',  'name' => 'Voltino Fix 26 (Neukunde)',   'ct' => 14.11, 'grundEur' => 4.34],
-        ['id' => 'voltino2', 'name' => 'Voltino Fix 26 (danach)',     'ct' => 19.08, 'grundEur' => 5.88],
+        // --- Energie AG Oberoesterreich ---
+        ['id' => 'feelgood', 'name' => 'Energie AG Feel Good',        'ct' => 12.00, 'grundEur' => 5.28,
+         'bindung' => '12 Monate', 'stand' => '2026-09-22', 'quelle' => 'energieag.at/privat/strom/standard-tarife/festpreis'],
+        ['id' => 'loyal',    'name' => 'Energie AG Ökostrom Loyal',   'ct' => 14.90, 'grundEur' => 4.62,
+         'hinweis' => 'Preiserhöhung vertraglich ausgeschlossen', 'stand' => '2026-09-22', 'quelle' => 'Preisblatt Ökostrom Loyal'],
         ['id' => 'smart',    'name' => 'Energie AG Ökostrom Smart',   'grundEur' => 5.18,
-         'zonen' => ['Sun' => 5.00, 'Day' => 17.04, 'Night' => 13.22, 'Weekend' => 13.05]],
+         'zonen' => ['Sun' => 5.00, 'Day' => 17.04, 'Night' => 13.22, 'Weekend' => 13.05],
+         'bindung' => '12 Monate, Smart Meter', 'stand' => '2026-09-22', 'quelle' => 'Preisblatt Ökostrom Smart'],
+        ['id' => 'komfort',  'name' => 'Energie AG Ökostrom Komfort', 'ct' => 19.46, 'grundEur' => 4.62,
+         'stand' => '2026-09-22', 'quelle' => 'tarife.at'],
+        ['id' => 'direkt',   'name' => 'Energie AG Ökostrom Direkt',  'ct' => 19.56, 'grundEur' => 7.26,
+         'bindung' => '12 Monate', 'stand' => '2026-09-22', 'quelle' => 'Preisblatt Ökostrom Direkt'],
+        // --- Voltino (Wels Strom) ---
+        ['id' => 'voltino1', 'name' => 'Voltino Fix 26 (Neukundenjahr)', 'ct' => 14.11, 'grundEur' => 4.34,
+         'hinweis' => 'nur Jahr 1', 'stand' => '2026-09-22', 'quelle' => 'Preisblatt VOLTINO Fix 26'],
+        ['id' => 'voltino2', 'name' => 'Voltino Fix 26 (ab Jahr 2)',     'ct' => 19.08, 'grundEur' => 5.88,
+         'hinweis' => 'Arbeitspreis ändert sich quartalsweise', 'stand' => '2026-09-22', 'quelle' => 'Preisblatt VOLTINO Fix 26'],
+        // --- Verbund ---
+        ['id' => 'verbund1', 'name' => 'Verbund V-Strom Österreich (Jahr 1)', 'ct' => 11.40, 'grundEur' => 4.79,
+         'bindung' => '12 Monate', 'hinweis' => '3,6 ct Rabatt im ersten Jahr', 'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        ['id' => 'verbund2', 'name' => 'Verbund V-Strom Österreich',        'ct' => 15.00, 'grundEur' => 4.79,
+         'bindung' => '12 Monate', 'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        ['id' => 'verbund3', 'name' => 'Verbund V-Strom Classic',           'ct' => 19.67, 'grundEur' => 5.64,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        ['id' => 'verbundspot', 'name' => 'Verbund V-Strom SPOT', 'typ' => 'spot', 'aufschlagCt' => 1.68, 'grundEur' => 4.79,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        // --- oekostrom AG ---
+        ['id' => 'oekofix',  'name' => 'oekostrom oeko Fix',  'ct' => 15.48, 'grundEur' => 6.00,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        ['id' => 'oekofair', 'name' => 'oekostrom oeko Fair', 'ct' => 18.48, 'grundEur' => 4.80,
+         'bindung' => '12 Monate', 'hinweis' => '4 Freimonate im ersten Jahr', 'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        ['id' => 'oekoflow', 'name' => 'oekostrom oeko Flow',  'ct' => 20.54, 'grundEur' => 3.00,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        ['id' => 'oekospot', 'name' => 'oekostrom oeko Spot+', 'typ' => 'spot', 'aufschlagCt' => 1.80, 'grundEur' => 2.16,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        // --- Pullstrom ---
+        ['id' => 'pull1', 'name' => 'Pullstrom Classic S (Jahr 1)', 'ct' => 12.78, 'grundEur' => 4.90,
+         'hinweis' => '95 Gratistage, danach 17,28 ct', 'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        ['id' => 'pull2', 'name' => 'Pullstrom Classic S',          'ct' => 17.28, 'grundEur' => 4.90,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        ['id' => 'pullora', 'name' => 'Pullstrom Ora', 'typ' => 'spot', 'aufschlagCt' => 1.60, 'grundEur' => 2.22,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        // --- Boersentarife ---
+        ['id' => 'awattarh', 'name' => 'aWATTar HOURLY', 'typ' => 'spot', 'aufschlagCt' => 1.80, 'grundEur' => 5.75,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        ['id' => 'awattarm', 'name' => 'aWATTar Monthly', 'ct' => 20.12, 'grundEur' => 5.75,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        ['id' => 'smartc', 'name' => 'smartENERGY smartCONTROL', 'typ' => 'spot', 'aufschlagCt' => 1.44, 'grundEur' => 2.99,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+        // --- MONTANA ---
+        ['id' => 'montana1', 'name' => 'MONTANA Strom RELAX', 'ct' => 25.14, 'grundEur' => 5.04,
+         'stand' => '2026-09-22', 'quelle' => 'stromliste.at'],
+    ];
+
+    /** Wo die Boersenpreisreihe liegt (ct/kWh netto je Stunde). */
+    private const SPOT_DATEI = '/var/lib/symcon/scripts/data/spotpreise-at.json';
+
+    /**
+     * Entgelte neben dem Energiepreis - NETTO, je Zaehlpunkt wo es fix ist.
+     *
+     * Sie aendern die Rangfolge der Anbieter NICHT, weil sie fuer alle gleich sind. Sie
+     * beantworten aber die andere Frage: was steht am Ende auf der Rechnung. Genau deshalb
+     * stehen sie getrennt und werden nicht in den Anbietervergleich gemischt.
+     *
+     * Die Werte sind belegte Schaetzungen fuer das Netzgebiet Oberoesterreich 2026, KEINE
+     * abgelesenen Zahlen: Netz OOE veroeffentlicht die Aufschluesselung nicht frei. Die
+     * genauen Betraege stehen auf der Netzrechnung; bis dahin ist die Gesamtsumme eine
+     * Groessenordnung und als solche gekennzeichnet.
+     *
+     * Elektrizitaetsabgabe und Erneuerbaren-Foerderpauschale sind dagegen bundesweit
+     * festgelegt und genau: 0,10 ct/kWh (Haushalte, befristet bis Ende 2026) und
+     * 19,02 EUR je Zaehlpunkt und Jahr.
+     */
+    private const ENTGELTE = [
+        'netzArbeitCt'     => 6.50,   // Netznutzung + Netzverlust, geschaetzt
+        'netzFixEur'       => 3.50,   // Messentgelt + Pauschale je Monat, geschaetzt
+        'elAbgabeCt'       => 0.10,   // bundesweit, Haushalte 2026
+        'oekoBeitragCt'    => 0.30,   // Erneuerbaren-Foerderbeitrag, geschaetzt
+        'oekoPauschaleEur' => 19.02,  // je Zaehlpunkt und Jahr, bundesweit
+        'ustProzent'       => 20.0,
+        'geschaetzt'       => true,
     ];
 
     private function simCfg(): array
@@ -932,6 +1025,10 @@ class EnergyManager extends EntityModule
                            ? $s['zonen'] : \Hoep\HomeSuite\Engines\EnergySim::ZONEN_SMART,
             'tage'      => max(7, (int) ($s['tage'] ?? 365)),
             'istTarif'  => (string) ($s['istTarif'] ?? ''),
+            'spotDatei' => (string) ($s['spotDatei'] ?? self::SPOT_DATEI),
+            'warnTage'  => max(7, (int) ($s['warnTage'] ?? 90)),
+            'entgelte'  => array_merge(self::ENTGELTE,
+                             (isset($s['entgelte']) && is_array($s['entgelte'])) ? $s['entgelte'] : []),
         ];
     }
 
@@ -970,6 +1067,35 @@ class EnergyManager extends EntityModule
     }
 
     /**
+     * Die Boersenpreisreihe, Unixzeit der Stunde => ct/kWh netto.
+     *
+     * Kommt von aWATTar (EPEX Spot AT), liegt als Datei daneben statt im Store: 8.771
+     * Stundenpreise sind kein Konfigurationswert, und der Store wird bei jedem Schreiben
+     * ganz neu geschrieben.
+     */
+    private function spotreihe(string $datei): array
+    {
+        if ($datei === '' || !is_readable($datei)) { return []; }
+        $j = json_decode((string) @file_get_contents($datei), true);
+        $p = (is_array($j) && isset($j['preise']) && is_array($j['preise'])) ? $j['preise'] : [];
+        $out = [];
+        foreach ($p as $ts => $ct) { $out[(int) $ts] = (float) $ct; }
+        return $out;
+    }
+
+    /** Kopfdaten der Preisreihe - fuer die Frage, wie frisch sie ist. */
+    private function spotStand(string $datei): array
+    {
+        if ($datei === '' || !is_readable($datei)) { return ['vorhanden' => false]; }
+        $j = json_decode((string) @file_get_contents($datei), true);
+        if (!is_array($j)) { return ['vorhanden' => false]; }
+        return ['vorhanden' => true, 'quelle' => $j['quelle'] ?? '?',
+                'stunden' => (int) ($j['stunden'] ?? 0),
+                'abgerufen' => (string) ($j['abgerufen'] ?? ''),
+                'alter_tage' => isset($j['abgerufen']) ? (int) floor((time() - strtotime((string) $j['abgerufen'])) / 86400) : null];
+    }
+
+    /**
      * Tarifvergleich je Zaehlpunkt und in Summe.
      *
      * Der Vergleich umfasst NUR die Energie. Das Netzentgelt ist im Netzgebiet fuer alle
@@ -984,7 +1110,8 @@ class EnergyManager extends EntityModule
             return ['ok' => false, 'error' => 'keine Zaehler konfiguriert (setSim)'];
         }
         $E = \Hoep\HomeSuite\Engines\EnergySim::class;
-        $gesamtZonen = []; $proZaehler = []; $faktor = 1.0;
+        $spot = $this->spotreihe((string) $cfg['spotDatei']);
+        $gesamtZonen = []; $proZaehler = []; $faktor = 1.0; $alleStunden = [];
         foreach ($cfg['zaehler'] as $z) {
             $reihe = $this->stundenreihe((int) $z['vid'], $tage);
             if ($reihe === []) {
@@ -1000,11 +1127,30 @@ class EnergyManager extends EntityModule
                 'kwh_jahr'     => round($auf['gesamt'] * $faktor, 0),
                 'stunden'      => $auf['stunden'],
                 'zonen'        => array_map(static fn($v) => round($v, 0), $auf['zonen']),
-                'tarife'       => $E::vergleich($auf['zonen'], $cfg['tarife'], $faktor, $cfg['istTarif']),
+                'tarife'       => $E::vergleichAlle($reihe, $auf['zonen'], $cfg['tarife'], $spot, $faktor, $cfg['istTarif']),
             ];
             foreach ($auf['zonen'] as $n => $v) {
                 $gesamtZonen[$n] = ($gesamtZonen[$n] ?? 0.0) + $v;
             }
+            // Fuer die Boersenrechnung werden die Stunden beider Zaehler zusammengelegt.
+            foreach ($reihe as $h) {
+                $ts = (int) $h['ts'];
+                $alleStunden[$ts] = ['ts' => $ts, 'kwh' => (($alleStunden[$ts]['kwh'] ?? 0.0) + (float) $h['kwh'])];
+            }
+        }
+        // Entgelte einmal fuer den ganzen Haushalt, dann je Tarif die Gesamtsumme.
+        $kwhJahr = array_sum($gesamtZonen) * $faktor;
+        $entg = $this->entgelte($kwhJahr, max(1, count($cfg['zaehler'])), $cfg['entgelte']);
+        $gesamtTarife = $E::vergleichAlle(array_values($alleStunden), $gesamtZonen,
+                            $this->simTarifeDoppelt($cfg), $spot, $faktor, $cfg['istTarif']);
+        $gesamt = [];
+        foreach ($gesamtTarife as $t) {
+            if ($t['gesamt'] === null) { continue; }
+            $gesamt[] = ['name' => $t['name'], 'id' => $t['id'],
+                         'energie' => round($t['gesamt'], 2),
+                         'entgelte' => $entg['summe_brutto'],
+                         'gesamt'  => round($t['gesamt'] + $entg['summe_brutto'], 2),
+                         'je_kwh_ct' => $kwhJahr > 0 ? round(100 * ($t['gesamt'] + $entg['summe_brutto']) / $kwhJahr, 2) : null];
         }
         return ['ok' => true,
                 'zeitraum_tage'  => $tage,
@@ -1013,9 +1159,40 @@ class EnergyManager extends EntityModule
                 'gesamt' => [
                     'kwh_jahr' => round(array_sum($gesamtZonen) * $faktor, 0),
                     'zonen'    => array_map(static fn($v) => round($v * $faktor, 0), $gesamtZonen),
-                    'tarife'   => $E::vergleich($gesamtZonen, $this->simTarifeDoppelt($cfg), $faktor, $cfg['istTarif']),
+                    'tarife'   => $gesamtTarife,
                 ],
+                'entgelte'      => $entg,
+                'gesamtkosten'  => $gesamt,
+                'boersenpreise' => $this->spotStand((string) $cfg['spotDatei']),
+                'alter'   => $E::alter($cfg['tarife'], time(), (int) $cfg['warnTage']),
                 'hinweis' => 'Nur Energiekosten. Netzentgelt und Abgaben sind anbieterunabhaengig.'];
+    }
+
+    /**
+     * Was neben dem Energiepreis anfaellt - fuer den ganzen Haushalt, brutto.
+     *
+     * @param float $kwh Jahresbezug ueber alle Zaehlpunkte
+     * @param int   $n   Anzahl der Zaehlpunkte (Messentgelt und Pauschale fallen je Punkt an)
+     */
+    private function entgelte(float $kwh, int $n, array $e): array
+    {
+        $ust = 1.0 + ((float) $e['ustProzent']) / 100.0;
+        $netzArbeit = $kwh * ((float) $e['netzArbeitCt']) / 100.0;
+        $netzFix    = ((float) $e['netzFixEur']) * 12.0 * $n;
+        $elAbgabe   = $kwh * ((float) $e['elAbgabeCt']) / 100.0;
+        $oekoBeitr  = $kwh * ((float) $e['oekoBeitragCt']) / 100.0;
+        $oekoPausch = ((float) $e['oekoPauschaleEur']) * $n;
+        $netto = $netzArbeit + $netzFix + $elAbgabe + $oekoBeitr + $oekoPausch;
+        return [
+            'netz_arbeit'        => round($netzArbeit * $ust, 2),
+            'netz_fix'           => round($netzFix * $ust, 2),
+            'elektrizitaets_abgabe' => round($elAbgabe * $ust, 2),
+            'oeko_beitrag'       => round($oekoBeitr * $ust, 2),
+            'oeko_pauschale'     => round($oekoPausch * $ust, 2),
+            'summe_brutto'       => round($netto * $ust, 2),
+            'je_kwh_ct'          => $kwh > 0 ? round(100 * $netto * $ust / $kwh, 2) : 0.0,
+            'geschaetzt'         => !empty($e['geschaetzt']),
+        ];
     }
 
     /**

@@ -119,6 +119,108 @@ final class EnergySim
                 'unvollstaendig' => $offen];
     }
 
+    /**
+     * Jahreskosten eines BOERSENTARIFS.
+     *
+     * Ein Spot-Tarif hat keinen Preis, sondern eine Preisreihe - und was er kostet, haengt
+     * davon ab, WANN verbraucht wird. Deshalb wird er nicht gegen einen Mittelwert gerechnet,
+     * sondern Stunde fuer Stunde gegen den eigenen Verbrauch. Der Unterschied ist kein
+     * Detail: wer viel verbraucht, wenn der Markt teuer ist, zahlt deutlich ueber dem
+     * Jahresmittel, und ein Vergleich gegen den Mittelwert wuerde ihm einen Tarif empfehlen,
+     * der fuer ihn nie guenstig war.
+     *
+     * @param array $stunden ['ts'=>int,'kwh'=>float]
+     * @param array $spot    Unixzeit der Stunde => Boersenpreis in ct/kWh NETTO
+     * @param array $tarif   ['aufschlagCt' => Aufschlag brutto, 'grundEur', 'ustProzent']
+     */
+    public static function kostenSpot(array $stunden, array $tarif, array $spot, float $faktor = 1.0): array
+    {
+        $auf  = (float) ($tarif['aufschlagCt'] ?? 0);
+        $ust  = 1.0 + ((float) ($tarif['ustProzent'] ?? 20)) / 100.0;
+        $arbeit = 0.0; $gedeckt = 0.0; $offen = 0.0;
+        foreach ($stunden as $h) {
+            $kwh = (float) ($h['kwh'] ?? 0);
+            if ($kwh <= 0) { continue; }
+            $ts = (int) ($h['ts'] ?? 0);
+            if (!isset($spot[$ts])) { $offen += $kwh; continue; }
+            $gedeckt += $kwh;
+            $arbeit += $kwh * (((float) $spot[$ts]) * $ust + $auf) / 100.0;
+        }
+        // Stunden ohne Boersenpreis werden zum Schnitt der gedeckten bewertet - und gezaehlt,
+        // damit niemand eine Luecke fuer einen guenstigen Tarif haelt.
+        if ($offen > 0 && $gedeckt > 0) { $arbeit += $offen * ($arbeit / $gedeckt); }
+        $grund = ((float) ($tarif['grundEur'] ?? 0)) * 12.0;
+        return ['name' => (string) ($tarif['name'] ?? '?'),
+                'arbeit' => $arbeit * $faktor, 'grund' => $grund,
+                'gesamt' => $arbeit * $faktor + $grund,
+                'unvollstaendig' => [],
+                'ungedeckt_kwh' => round($offen, 0),
+                'mittelpreis_ct' => $gedeckt > 0 ? round(100 * $arbeit / $gedeckt, 2) : null];
+    }
+
+    /**
+     * Alle Tarife vergleichen, feste wie boersenabhaengige.
+     *
+     * Der Einstieg fuer Aufrufer: er entscheidet je Tarif, welche Rechnung passt, und
+     * sortiert am Ende einheitlich.
+     */
+    public static function vergleichAlle(array $stunden, array $zonen, array $tarife,
+                                         array $spot, float $faktor = 1.0, string $istId = ''): array
+    {
+        $out = [];
+        foreach ($tarife as $t) {
+            $istSpot = (($t['typ'] ?? '') === 'spot') || isset($t['aufschlagCt']);
+            if ($istSpot && $spot === []) {
+                // Ohne Preisreihe waere jede Zahl erfunden - der Tarif faellt sichtbar aus.
+                $out[] = ['id' => (string) ($t['id'] ?? ''), 'name' => (string) ($t['name'] ?? '?'),
+                          'gesamt' => null, 'arbeit' => null, 'grund' => null,
+                          'fehlt' => 'keine Boersenpreisreihe', 'unvollstaendig' => []];
+                continue;
+            }
+            $k = $istSpot ? self::kostenSpot($stunden, $t, $spot, $faktor)
+                          : self::kosten($zonen, $t, $faktor);
+            $k['id']   = (string) ($t['id'] ?? '');
+            $k['spot'] = $istSpot;
+            foreach (['stand', 'quelle', 'hinweis', 'bindung'] as $f) {
+                if (isset($t[$f])) { $k[$f] = $t[$f]; }
+            }
+            $out[] = $k;
+        }
+        $ist = null;
+        foreach ($out as $k) { if ($k['id'] === $istId && $k['gesamt'] !== null) { $ist = $k['gesamt']; } }
+        foreach ($out as &$k) {
+            $k['differenz'] = ($ist === null || $k['gesamt'] === null) ? null : round($k['gesamt'] - $ist, 2);
+        }
+        unset($k);
+        usort($out, static function ($a, $b) {
+            if ($a['gesamt'] === null) { return 1; }
+            if ($b['gesamt'] === null) { return -1; }
+            return $a['gesamt'] <=> $b['gesamt'];
+        });
+        return $out;
+    }
+
+    /**
+     * Wie alt sind die Tarifangaben?
+     *
+     * Preisblaetter aendern sich laufend. Ein Vergleich, der das verschweigt, ist nach ein
+     * paar Monaten kein Vergleich mehr, sondern eine Behauptung.
+     */
+    public static function alter(array $tarife, int $jetzt, int $warnTage = 90): array
+    {
+        $alt = []; $ohne = [];
+        foreach ($tarife as $t) {
+            $n = (string) ($t['name'] ?? '?');
+            $st = (string) ($t['stand'] ?? '');
+            if ($st === '') { $ohne[] = $n; continue; }
+            $ts = strtotime($st);
+            if ($ts === false) { $ohne[] = $n; continue; }
+            $tage = (int) floor(($jetzt - $ts) / 86400);
+            if ($tage > $warnTage) { $alt[] = ['name' => $n, 'stand' => $st, 'tage' => $tage]; }
+        }
+        return ['veraltet' => $alt, 'ohne_stand' => $ohne, 'schwelle_tage' => $warnTage];
+    }
+
     /** Mehrere Tarife vergleichen, guenstigster zuerst, mit Abstand zum Ist-Tarif. */
     public static function vergleich(array $zonen, array $tarife, float $faktor = 1.0, string $istId = ''): array
     {
