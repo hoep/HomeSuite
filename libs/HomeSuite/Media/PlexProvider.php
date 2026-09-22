@@ -837,36 +837,73 @@ final class PlexProvider implements IMediaProvider, IMediaWritable
     /**
      * Eine Aufnahme bestellen.
      *
-     * FUNKTIONIERT NICHT - und das ist gemessen, nicht vermutet.
+     * Die Form ist GEMESSEN, nicht geraten: am 22.09.2026 gegen diesen Server durchprobiert,
+     * bis ein Abonnement entstand (Schluessel 38), und danach wieder geloescht.
      *
-     * Am 22.09.2026 zweimal versucht: einmal mit den Parametern im Rumpf, einmal komplett
-     * in der Adresszeile samt vollem prefs-Satz (minVideoQuality, replaceLowerQuality,
-     * recordPartials, startOffsetMinutes, endOffsetMinutes, lineupChannel, removeDuplicates,
-     * onlyFirstRuns, comskip, oneShot) und params[airDate]. Beide Male antwortet der Server
-     * mit einem nackten HTTP 400 - ohne zu sagen, welches Feld ihm fehlt. Angelegt wurde
-     * nichts (/media/subscriptions blieb bei size 0).
+     * Zwei Fallen kosteten die meisten Versuche:
+     *  - `params` verlangt airingChannels, airingTimes, libraryType, mediaProviderID. Solange
+     *    ein anderer Name drinsteht, meldet der Server stur "Missing required query parameter
+     *    params" - er sagt nicht, welches Feld er vermisst.
+     *  - `airingChannels` will die ZAHL des Senders (Media.channelID), nicht seine Kennung.
+     *    Mit "ORF1.at" protokolliert Plex "Had trouble breaking ORF1.at".
      *
-     * Die erwartete Form laesst sich nicht erraten: es existiert keine einzige Regel auf
-     * diesem Server, an der man sie ablesen koennte. Was sie klaeren wuerde, ist EIN
-     * mitgeschnittener Aufruf der Plex-Oberflaeche beim Programmieren einer Aufnahme.
-     * Bis dahin gibt diese Methode den Fehlercode ehrlich zurueck, statt Erfolg zu melden.
+     * Und die dritte Ueberraschung: von allen Voreinstellungen, die die Plex-Oberflaeche
+     * mitschickt, akzeptiert dieser Server **nur `oneShot`**. minVideoQuality,
+     * recordPartials, startOffsetMinutes, endOffsetMinutes, startTimeslot, lineupChannel,
+     * comskipEnabled, comskipMethod, removeDuplicates, onlyFirstRuns - jede einzeln
+     * getestet, jede mit "Invalid preference ... referenced" abgewiesen. Deshalb steht hier
+     * nur oneShot; wer mehr schickt, bekommt 400.
      *
-     * @param string $programId Sendung aus der Programmzeitschrift (ratingKey)
-     * @param array  $opt       'typ' => 'single'|'series', 'section' => Zielbibliothek
+     * ABER: die Regel entsteht und bleibt wirkungslos. Der Server meldet dabei
+     * "Could not find providers for subscription", und /media/subscriptions/scheduled bleibt
+     * leer. Ursache ist derselbe Mangel, der auch die Plex-Oberflaeche scheitern laesst: fuer
+     * XMLTV-gestuetztes Live-TV fehlt der Metadaten-Agent 'tv.plex.xmltv' - er steht in
+     * keiner Agentenliste und laesst sich nicht nachinstallieren. Das ist ein bekannter
+     * Fehler des Plex-Servers, kein Fehler dieser Anbindung.
+     *
+     * @param array $hint  ['guid','title','type'=>'movie'|'show','year']
+     * @param array $opt   ['section','location','channelId','beginsAt','einmalig']
      */
-    public function createRecordingRule(string $programId, array $opt = []): array
+    public function createRecordingRule(array $hint, array $opt = []): array
     {
-        if ($programId === '') {
-            return ['ok' => false, 'grund' => 'keine Sendung angegeben'];
+        $guid = (string) ($hint['guid'] ?? '');
+        if ($guid === '') {
+            return ['ok' => false, 'grund' => 'guid der Sendung fehlt'];
         }
-        $p = array_filter([
-            'targetLibrarySectionID' => (string) ($opt['section'] ?? ''),
-            'targetSectionLocationID'=> (string) ($opt['location'] ?? ''),
-            'type'                   => ((($opt['typ'] ?? 'single') === 'series') ? 2 : 1),
-            'key'                    => $programId,
-        ], static fn($v) => $v !== '' && $v !== null);
+        $p = [
+            'targetLibrarySectionID'  => (string) ($opt['section'] ?? ''),
+            'targetSectionLocationID' => (string) ($opt['location'] ?? ''),
+            'type'                    => ((($hint['type'] ?? 'movie') === 'show') ? 2 : 1),
+            'includeGrabs'            => 1,
+            'hints[guid]'             => $guid,
+            'hints[title]'            => (string) ($hint['title'] ?? ''),
+            'hints[type]'             => (string) ($hint['type'] ?? 'movie'),
+            'hints[year]'             => (string) ($hint['year'] ?? ''),
+            'params[libraryType]'     => 1,
+            'params[mediaProviderID]' => (string) ($opt['dvr'] ?? $this->epgProviderId()),
+            'params[airingChannels]'  => (string) ($opt['channelId'] ?? ''),
+            'params[airingTimes]'     => (string) ($opt['beginsAt'] ?? ''),
+            'prefs[oneShot]'          => (($opt['einmalig'] ?? true) ? 1 : 0),
+        ];
+        if ($p['targetLibrarySectionID'] === '' || $p['params[airingChannels]'] === '') {
+            return ['ok' => false, 'grund' => 'Zielbibliothek und Sendernummer sind noetig'];
+        }
         $r = $this->send('POST', '/media/subscriptions?' . http_build_query($p));
-        return ['ok' => !empty($r['ok']), 'code' => (int) ($r['code'] ?? 0), 'ungeprueft' => true];
+        $key = (string) ($r['json']['MediaContainer']['MediaSubscription'][0]['key'] ?? '');
+        return ['ok' => !empty($r['ok']), 'code' => (int) ($r['code'] ?? 0), 'id' => $key,
+                'hinweis' => 'Die Regel entsteht, wird aber mangels Metadaten-Agent tv.plex.xmltv '
+                           . 'nicht in eine geplante Aufnahme umgesetzt (Plex-Serverfehler).'];
+    }
+
+    /** Die Nummer des EPG-Anbieters - steckt hinten im epgIdentifier, etwa ...xmltv:9 */
+    private function epgProviderId(): string
+    {
+        foreach ($this->dvrs() as $d) {
+            if (preg_match('~:(\d+)$~', (string) $d['epg_id'], $m)) {
+                return $m[1];
+            }
+        }
+        return '';
     }
 
     public function deleteRecordingRule(string $ruleId): bool

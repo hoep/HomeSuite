@@ -2575,7 +2575,7 @@ class HomeSuiteHub extends EntityModule
             case 'markWatched':   return ['ok' => $p->markWatched($id), 'fn' => $fn];
             case 'markUnwatched': return ['ok' => $p->markUnwatched($id), 'fn' => $fn];
             case 'createRecordingRule':
-                $rr = $p->createRecordingRule($id, (array) ($args['opt'] ?? []));
+                $rr = $p->createRecordingRule((array) ($args['hint'] ?? []), (array) ($args['opt'] ?? []));
                 return ['ok' => !empty($rr['ok']), 'fn' => $fn, 'result' => $rr];
             case 'deleteRecordingRule':
                 return ['ok' => $p->deleteRecordingRule($id), 'fn' => $fn];
