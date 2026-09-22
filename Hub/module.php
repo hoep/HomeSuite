@@ -512,6 +512,7 @@ class HomeSuiteHub extends EntityModule
                   ['mediaCanWrite', 'Welche Quellen koennen Playlists?'],
                   ['mediaPlaylistList', 'Beschreibbare Playlists lesen'], ['mediaPlaylistCreate', 'Playlist anlegen'], ['mediaPlaylistAdd', 'An Playlist anhaengen'],
                   ['mediaPlaylistDelete', 'Playlist loeschen'],
+                  ['plex', 'Plex: Bibliothek, Serien, Filme, Live-TV'],
                   ['getStations', 'Radiosender lesen'], ['configureStations', 'Radiosender speichern'],
                   ['testStation', 'Stream testen']] as $ma) {
             $m->addManagementAction(['op' => $ma[0], 'verb' => $ma[0], 'target' => 'hub',
@@ -965,6 +966,9 @@ class HomeSuiteHub extends EntityModule
                     $ps[] = ['id' => $id, 'label' => $p->label(), 'configured' => $p->isConfigured()];
                 }
                 return ['ok' => true, 'providers' => $ps];
+
+            case 'plex':
+                return $this->mgmtPlex($args);
 
             case 'mediaBrowse':
                 return $this->mgmtMediaBrowse($args);
@@ -2487,6 +2491,100 @@ class HomeSuiteHub extends EntityModule
         usort($all, static fn($a, $b) => ((int) ($b['t'] ?? 0)) <=> ((int) ($a['t'] ?? 0)));
         if (count($all) > $limit) { $all = array_slice($all, 0, $limit); }
         return ['ok' => true, 'count' => count($all), 'entries' => $all];
+    }
+
+    /**
+     * Zugriff auf den vollen Plex-Funktionsumfang aus Skripten heraus.
+     *
+     * Bis hierher kamen Skripte ueber die Klassenfamilie PHPPlex an Plex - mit der Folge,
+     * dass jedes Skript Adresse UND Token selbst kannte. Genau das faellt hiermit weg: die
+     * Zugangsdaten bleiben im Hub-Store, das Skript nennt nur noch die gewuenschte Funktion.
+     *
+     * Aufruf:
+     *   HSH_Manage($hub, json_encode(['op' => 'plex',
+     *                                 'args' => ['fn' => 'movies', 'limit' => 20]]));
+     *
+     * Die Liste erlaubter Funktionen ist BEWUSST eine Positivliste. Ein 'fn', das einfach
+     * als Methodenname durchgereicht wird, waere ein Hebel, um jede beliebige oeffentliche
+     * Methode des Providers aufzurufen - auch loeschende.
+     */
+    private function mgmtPlex(array $args): array
+    {
+        $providers = \Hoep\HomeSuite\Engines\MediaProviders::build($this->sourcesConfig());
+        $p = $providers['plex'] ?? null;
+        if (!$p instanceof \Hoep\HomeSuite\Media\PlexProvider) {
+            return ['ok' => false, 'error' => 'Plex ist nicht aktiv oder nicht konfiguriert'];
+        }
+
+        $fn  = (string) ($args['fn'] ?? '');
+        $id  = (string) ($args['id'] ?? '');
+        $sec = (string) ($args['section'] ?? '');
+        $q   = (string) ($args['query'] ?? '');
+        $lim = (int) ($args['limit'] ?? 0);
+        $off = (int) ($args['offset'] ?? 0);
+
+        // Lesende Funktionen
+        switch ($fn) {
+            case 'test':        return ['ok' => true, 'fn' => $fn, 'result' => $p->testConnection()];
+            case 'serverInfo':  return ['ok' => true, 'fn' => $fn, 'result' => $p->serverInfo()];
+            case 'libraries':   return ['ok' => true, 'fn' => $fn, 'result' => $p->libraries((string) ($args['art'] ?? ''))];
+            case 'movies':      return ['ok' => true, 'fn' => $fn, 'result' => $p->movies($sec, $off, $lim ?: 50)];
+            case 'shows':       return ['ok' => true, 'fn' => $fn, 'result' => $p->shows($sec, $off, $lim ?: 50)];
+            case 'artists':     return ['ok' => true, 'fn' => $fn, 'result' => $p->artists($sec, $off, $lim ?: 50)];
+            case 'seasons':     return ['ok' => true, 'fn' => $fn, 'result' => $p->seasons($id)];
+            case 'episodes':    return ['ok' => true, 'fn' => $fn, 'result' => $p->episodes($id)];
+            case 'allEpisodes': return ['ok' => true, 'fn' => $fn, 'result' => $p->allEpisodes($id)];
+            case 'albums':      return ['ok' => true, 'fn' => $fn, 'result' => $p->albumsOf($id)];
+            case 'tracks':      return ['ok' => true, 'fn' => $fn, 'result' => $p->tracksOf($id)];
+            case 'details':     return ['ok' => true, 'fn' => $fn, 'result' => $p->itemDetails($id)];
+            case 'children':    return ['ok' => true, 'fn' => $fn, 'result' => $p->children($id)];
+            case 'search':      return ['ok' => true, 'fn' => $fn, 'result' => $p->searchMovies($q) + $p->searchShows($q)];
+            case 'searchMovies':return ['ok' => true, 'fn' => $fn, 'result' => $p->searchMovies($q, $sec)];
+            case 'searchShows': return ['ok' => true, 'fn' => $fn, 'result' => $p->searchShows($q, $sec)];
+            case 'librarySearch':
+                return ['ok' => true, 'fn' => $fn, 'result' => $p->librarySearch($sec, $q, (int) ($args['typ'] ?? 0))];
+            case 'recentlyAdded':
+                return ['ok' => true, 'fn' => $fn, 'result' => $p->recentlyAdded($sec, $lim ?: 20)];
+            case 'unwatched':   return ['ok' => true, 'fn' => $fn, 'result' => $p->unwatched($sec, (int) ($args['typ'] ?? 0))];
+            case 'genres':      return ['ok' => true, 'fn' => $fn, 'result' => $p->genres($sec)];
+            case 'byGenre':     return ['ok' => true, 'fn' => $fn, 'result' => $p->moviesByGenre($q, $sec)];
+            case 'byYear':      return ['ok' => true, 'fn' => $fn, 'result' => $p->moviesByYear((int) ($args['jahr'] ?? 0), $sec)];
+            case 'mostPlayed':  return ['ok' => true, 'fn' => $fn, 'result' => $p->mostPlayed($sec, $lim ?: 25)];
+            // Live-TV (auf dieser Anlage ohne Aufnahmegeraet, liefert daher leere Listen)
+            case 'liveTv':      return ['ok' => true, 'fn' => $fn, 'result' => ['verfuegbar' => $p->liveTvAvailable()]];
+            case 'dvrs':        return ['ok' => true, 'fn' => $fn, 'result' => $p->dvrs()];
+            case 'tuners':      return ['ok' => true, 'fn' => $fn, 'result' => $p->tuners()];
+            case 'channels':    return ['ok' => true, 'fn' => $fn, 'result' => $p->channels()];
+            case 'guide':
+                return ['ok' => true, 'fn' => $fn, 'result' =>
+                    $p->guide((int) ($args['von'] ?? 0), (int) ($args['bis'] ?? 0), (string) ($args['channel'] ?? ''))];
+            case 'recordings':  return ['ok' => true, 'fn' => $fn, 'result' => $p->recordings()];
+            case 'recordingRules':     return ['ok' => true, 'fn' => $fn, 'result' => $p->recordingRules()];
+            case 'scheduledRecordings':return ['ok' => true, 'fn' => $fn, 'result' => $p->scheduledRecordings()];
+        }
+
+        // Schreibende Funktionen - getrennt, damit sie beim Lesen nicht versehentlich
+        // erreichbar sind und man sie an einer Stelle wiederfindet.
+        switch ($fn) {
+            case 'markWatched':   return ['ok' => $p->markWatched($id), 'fn' => $fn];
+            case 'markUnwatched': return ['ok' => $p->markUnwatched($id), 'fn' => $fn];
+            case 'createRecordingRule':
+                return ['ok' => $p->createRecordingRule($id, (array) ($args['opt'] ?? [])), 'fn' => $fn];
+            case 'deleteRecordingRule':
+                return ['ok' => $p->deleteRecordingRule($id), 'fn' => $fn];
+            case 'deleteScheduledRecording':
+                return ['ok' => $p->deleteScheduledRecording($id), 'fn' => $fn];
+        }
+
+        return ['ok' => false, 'error' => 'unbekannte Funktion: ' . $fn,
+                'erlaubt' => ['test', 'serverInfo', 'libraries', 'movies', 'shows', 'artists',
+                              'seasons', 'episodes', 'allEpisodes', 'albums', 'tracks', 'details',
+                              'children', 'search', 'searchMovies', 'searchShows', 'librarySearch',
+                              'recentlyAdded', 'unwatched', 'genres', 'byGenre', 'byYear',
+                              'mostPlayed', 'liveTv', 'dvrs', 'tuners', 'channels', 'guide',
+                              'recordings', 'recordingRules', 'scheduledRecordings',
+                              'markWatched', 'markUnwatched', 'createRecordingRule',
+                              'deleteRecordingRule', 'deleteScheduledRecording']];
     }
 
     private function mgmtMediaBrowse(array $args, bool $search = false): array

@@ -275,6 +275,528 @@ final class PlexProvider implements IMediaProvider, IMediaWritable
         }
         return !empty($this->send('DELETE', '/playlists/' . rawurlencode($playlistId))['ok']);
     }
+
+    // ==================================================================
+    // Vollzugriff auf die Plex-Bibliothek
+    //
+    // Bis hierher deckt der Provider ab, was die Audio-Domaene braucht: Musik suchen,
+    // abspielen, Playlists pflegen. Alles Folgende loest die alte Klassenfamilie
+    // PHPPlex/PlexAPI/PlexSeries/PlexMovies/PlexMusic/PlexLiveTV ab, die im Skriptordner
+    // lag und produktiv von nichts ausser zwei Entwicklerbeispielen benutzt wurde.
+    //
+    // Bewusste Entscheidung zur Rueckgabeform: die Bibliotheks- und Live-TV-Methoden
+    // liefern NORMALISIERTE ARRAYS, keine ContentRef. ContentRef beschreibt etwas
+    // Abspielbares mit Strom-URL - fuer eine Serienstaffel oder eine Aufnahmeregel waere
+    // das ein falsches Versprechen. Wer einen Titel abspielen will, nimmt weiter
+    // browse()/resolve().
+    // ==================================================================
+
+    /** Plex-Typnummern, wie sie in ?type= erwartet werden. */
+    public const TYP_FILM    = 1;
+    public const TYP_SERIE   = 2;
+    public const TYP_STAFFEL = 3;
+    public const TYP_FOLGE   = 4;
+    public const TYP_ARTIST  = 8;
+    public const TYP_ALBUM   = 9;
+    public const TYP_TITEL   = 10;
+
+    /** Lesen mit Parametern - get() kann nur feste Pfade. */
+    private function getP(string $path, array $params = []): array
+    {
+        if ($params !== []) {
+            $path .= (strpos($path, '?') !== false ? '&' : '?') . http_build_query($params);
+        }
+        return $this->get($path);
+    }
+
+    /** Die Metadatenliste aus einer Antwort, egal wie tief Plex sie diesmal einpackt. */
+    private function liste(array $j): array
+    {
+        $c = $j['MediaContainer'] ?? [];
+        foreach (['Metadata', 'Directory', 'Video', 'Track', 'Hub'] as $k) {
+            if (isset($c[$k]) && is_array($c[$k])) {
+                return $c[$k];
+            }
+        }
+        return [];
+    }
+
+    /**
+     * Ein Plex-Eintrag in eine flache, sprechende Form.
+     *
+     * Plex benennt dieselbe Sache je nach Typ anders: bei einer Folge steht die Serie in
+     * grandparentTitle, bei einem Titel der Interpret. Das hier einmal aufzuloesen erspart
+     * es jedem Aufrufer.
+     */
+    private function eintrag(array $m): array
+    {
+        $typ = (string) ($m['type'] ?? '');
+        $e = [
+            'id'      => (string) ($m['ratingKey'] ?? ''),
+            'typ'     => $typ,
+            'titel'   => (string) ($m['title'] ?? ''),
+            'sortier' => (string) ($m['titleSort'] ?? ($m['title'] ?? '')),
+            'jahr'    => (int) ($m['year'] ?? 0),
+            'dauer_s' => (int) round(((int) ($m['duration'] ?? 0)) / 1000),
+            'bild'    => $this->thumb((string) ($m['thumb'] ?? '')),
+            'inhalt'  => (string) ($m['summary'] ?? ''),
+            'gesehen' => ((int) ($m['viewCount'] ?? 0)) > 0,
+            'zuletzt' => (int) ($m['lastViewedAt'] ?? 0),
+            'hinzu'   => (int) ($m['addedAt'] ?? 0),
+            'schluessel' => (string) ($m['key'] ?? ''),
+        ];
+        if (isset($m['parentTitle']))      { $e['ueber']  = (string) $m['parentTitle']; }
+        if (isset($m['grandparentTitle'])) { $e['darueber'] = (string) $m['grandparentTitle']; }
+        if (isset($m['index']))            { $e['nummer'] = (int) $m['index']; }
+        if (isset($m['parentIndex']))      { $e['staffel'] = (int) $m['parentIndex']; }
+        if (isset($m['leafCount']))        { $e['anzahl'] = (int) $m['leafCount']; }
+        if (isset($m['viewedLeafCount']))  { $e['gesehen_anzahl'] = (int) $m['viewedLeafCount']; }
+        if (isset($m['rating']))           { $e['bewertung'] = (float) $m['rating']; }
+        if (isset($m['originallyAvailableAt'])) { $e['erstausstrahlung'] = (string) $m['originallyAvailableAt']; }
+        $part = $m['Media'][0]['Part'][0]['key'] ?? '';
+        if ($part !== '') { $e['datei_url'] = $this->tokUrl((string) $part); }
+        foreach (['Genre' => 'genres', 'Director' => 'regie', 'Role' => 'besetzung'] as $q => $z) {
+            if (isset($m[$q]) && is_array($m[$q])) {
+                $e[$z] = array_values(array_filter(array_map(
+                    static fn($x) => (string) ($x['tag'] ?? ''), $m[$q])));
+            }
+        }
+        return $e;
+    }
+
+    /** @return array<int,array> */
+    private function eintraege(array $j): array
+    {
+        return array_map([$this, 'eintrag'], $this->liste($j));
+    }
+
+    // ---------- Server und Bibliotheken ----------
+
+    /** Kenndaten des Servers: Name, Fassung, Maschinenkennung. */
+    public function serverInfo(): array
+    {
+        $c = $this->get('/')['MediaContainer'] ?? [];
+        return [
+            'name'      => (string) ($c['friendlyName'] ?? ''),
+            'version'   => (string) ($c['version'] ?? ''),
+            'plattform' => (string) ($c['platform'] ?? ''),
+            'kennung'   => (string) ($c['machineIdentifier'] ?? ''),
+            'transcoder_video' => !empty($c['transcoderVideo']),
+            'transcoder_audio' => !empty($c['transcoderAudio']),
+        ];
+    }
+
+    /** Erreichbarkeit pruefen, ohne eine Ausnahme zu werfen. */
+    public function testConnection(): array
+    {
+        if (!$this->isConfigured()) {
+            return ['ok' => false, 'grund' => 'Adresse oder Token fehlt'];
+        }
+        $i = $this->serverInfo();
+        return ($i['kennung'] !== '')
+            ? ['ok' => true] + $i
+            : ['ok' => false, 'grund' => 'keine Antwort vom Server'];
+    }
+
+    /**
+     * Alle Bibliotheken, wahlweise nach Art gefiltert.
+     *
+     * @param string $art '' = alle, sonst movie|show|artist|photo
+     */
+    public function libraries(string $art = ''): array
+    {
+        $out = [];
+        foreach ($this->liste($this->get('/library/sections')) as $d) {
+            $t = (string) ($d['type'] ?? '');
+            if ($art !== '' && $t !== $art) {
+                continue;
+            }
+            $out[] = [
+                'id'    => (string) ($d['key'] ?? ''),
+                'titel' => (string) ($d['title'] ?? ''),
+                'art'   => $t,
+                'agent' => (string) ($d['agent'] ?? ''),
+                'pfade' => array_values(array_map(
+                    static fn($l) => (string) ($l['path'] ?? ''), (array) ($d['Location'] ?? []))),
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * Die ID der ersten Bibliothek einer Art.
+     *
+     * Ohne Angabe raet der Aufrufer sonst - und bei zwei Filmbibliotheken raet er falsch.
+     * Deshalb gibt libraries() die vollstaendige Liste; dies hier ist nur die Abkuerzung
+     * fuer die haeufige Anlage mit genau einer Bibliothek je Art.
+     */
+    public function findLibraryId(string $art): string
+    {
+        $l = $this->libraries($art);
+        return $l ? (string) $l[0]['id'] : '';
+    }
+
+    // ---------- Allgemeiner Bibliothekszugriff ----------
+
+    /** Eintraege einer Bibliothek, mit freien Zusatzparametern. */
+    public function libraryItems(string $sectionId, array $params = [], int $offset = 0, int $limit = 0): array
+    {
+        if ($limit > 0) {
+            $params['X-Plex-Container-Start'] = $offset;
+            $params['X-Plex-Container-Size']  = $limit;
+        }
+        return $this->eintraege($this->getP('/library/sections/' . rawurlencode($sectionId) . '/all', $params));
+    }
+
+    /** Einzelner Eintrag mit allen Feldern. */
+    public function itemDetails(string $ratingKey): array
+    {
+        $l = $this->eintraege($this->get('/library/metadata/' . rawurlencode($ratingKey)));
+        return $l ? $l[0] : [];
+    }
+
+    /** Die Kinder eines Eintrags: Staffeln einer Serie, Folgen einer Staffel, Titel eines Albums. */
+    public function children(string $ratingKey): array
+    {
+        return $this->eintraege($this->get('/library/metadata/' . rawurlencode($ratingKey) . '/children'));
+    }
+
+    /** Suche innerhalb einer Bibliothek (die globale Suche steckt in search()). */
+    public function librarySearch(string $sectionId, string $query, int $typ = 0): array
+    {
+        $p = ['query' => $query];
+        if ($typ > 0) { $p['type'] = $typ; }
+        return $this->eintraege($this->getP('/library/sections/' . rawurlencode($sectionId) . '/search', $p));
+    }
+
+    /** Zuletzt hinzugekommen. */
+    public function recentlyAdded(string $sectionId, int $limit = 20): array
+    {
+        return $this->eintraege($this->getP('/library/sections/' . rawurlencode($sectionId) . '/recentlyAdded',
+            ['X-Plex-Container-Start' => 0, 'X-Plex-Container-Size' => $limit]));
+    }
+
+    /** Noch nicht Gesehenes. */
+    public function unwatched(string $sectionId, int $typ = 0): array
+    {
+        $p = ['unwatched' => 1];
+        if ($typ > 0) { $p['type'] = $typ; }
+        return $this->libraryItems($sectionId, $p);
+    }
+
+    /** Alle Genres einer Bibliothek. */
+    public function genres(string $sectionId): array
+    {
+        $out = [];
+        foreach ($this->liste($this->get('/library/sections/' . rawurlencode($sectionId) . '/genre')) as $g) {
+            $out[] = ['id' => (string) ($g['key'] ?? ''), 'titel' => (string) ($g['title'] ?? '')];
+        }
+        return $out;
+    }
+
+    // ---------- Gesehen-Status ----------
+
+    /**
+     * Als gesehen markieren.
+     *
+     * Plex nennt das scrobble, und es ist ein GET mit Parametern - nicht wie man erwarten
+     * wuerde ein PUT. Antwort ist leer; der Erfolg zeigt sich nur am HTTP-Code.
+     */
+    public function markWatched(string $ratingKey): bool
+    {
+        return $this->scrobble('/:/scrobble', $ratingKey);
+    }
+
+    public function markUnwatched(string $ratingKey): bool
+    {
+        return $this->scrobble('/:/unscrobble', $ratingKey);
+    }
+
+    private function scrobble(string $pfad, string $ratingKey): bool
+    {
+        if ($ratingKey === '') {
+            return false;
+        }
+        $r = $this->send('GET', $pfad . '?identifier=com.plexapp.plugins.library&key=' . rawurlencode($ratingKey));
+        return !empty($r['ok']);
+    }
+
+    // ---------- Filme ----------
+
+    public function movies(string $sectionId = '', int $offset = 0, int $limit = 0): array
+    {
+        $sec = $sectionId !== '' ? $sectionId : $this->findLibraryId('movie');
+        return $sec === '' ? [] : $this->libraryItems($sec, ['type' => self::TYP_FILM], $offset, $limit);
+    }
+
+    public function searchMovies(string $query, string $sectionId = ''): array
+    {
+        $sec = $sectionId !== '' ? $sectionId : $this->findLibraryId('movie');
+        return $sec === '' ? [] : $this->librarySearch($sec, $query, self::TYP_FILM);
+    }
+
+    public function moviesByYear(int $jahr, string $sectionId = ''): array
+    {
+        $sec = $sectionId !== '' ? $sectionId : $this->findLibraryId('movie');
+        return $sec === '' ? [] : $this->libraryItems($sec, ['type' => self::TYP_FILM, 'year' => $jahr]);
+    }
+
+    public function moviesByGenre(string $genre, string $sectionId = ''): array
+    {
+        $sec = $sectionId !== '' ? $sectionId : $this->findLibraryId('movie');
+        return $sec === '' ? [] : $this->libraryItems($sec, ['type' => self::TYP_FILM, 'genre' => $genre]);
+    }
+
+    // ---------- Serien ----------
+
+    public function shows(string $sectionId = '', int $offset = 0, int $limit = 0): array
+    {
+        $sec = $sectionId !== '' ? $sectionId : $this->findLibraryId('show');
+        return $sec === '' ? [] : $this->libraryItems($sec, ['type' => self::TYP_SERIE], $offset, $limit);
+    }
+
+    public function searchShows(string $query, string $sectionId = ''): array
+    {
+        $sec = $sectionId !== '' ? $sectionId : $this->findLibraryId('show');
+        return $sec === '' ? [] : $this->librarySearch($sec, $query, self::TYP_SERIE);
+    }
+
+    /** Staffeln einer Serie. */
+    public function seasons(string $showId): array
+    {
+        return $this->children($showId);
+    }
+
+    /** Folgen einer Staffel. */
+    public function episodes(string $seasonId): array
+    {
+        return $this->children($seasonId);
+    }
+
+    /**
+     * Alle Folgen einer Serie ueber alle Staffeln.
+     *
+     * Plex bietet dafuer keinen eigenen Endpunkt - also Staffel fuer Staffel. Bei langen
+     * Serien sind das entsprechend viele Abrufe; wer nur eine Staffel braucht, nimmt
+     * episodes().
+     */
+    public function allEpisodes(string $showId): array
+    {
+        $out = [];
+        foreach ($this->seasons($showId) as $st) {
+            if (($st['typ'] ?? '') !== 'season') {
+                continue;
+            }
+            foreach ($this->episodes((string) $st['id']) as $f) {
+                $out[] = $f;
+            }
+        }
+        return $out;
+    }
+
+    // ---------- Musik (ergaenzend zur Abspielseite) ----------
+
+    public function artists(string $sectionId = '', int $offset = 0, int $limit = 0): array
+    {
+        $sec = $sectionId !== '' ? $sectionId : $this->findLibraryId('artist');
+        return $sec === '' ? [] : $this->libraryItems($sec, ['type' => self::TYP_ARTIST], $offset, $limit);
+    }
+
+    public function albumsOf(string $artistId): array
+    {
+        return $this->children($artistId);
+    }
+
+    public function tracksOf(string $albumId): array
+    {
+        return $this->children($albumId);
+    }
+
+    /** Meistgespieltes - Plex sortiert dafuer nach 'plays'. */
+    public function mostPlayed(string $sectionId = '', int $limit = 25): array
+    {
+        $sec = $sectionId !== '' ? $sectionId : $this->findLibraryId('artist');
+        return $sec === '' ? [] : $this->libraryItems($sec, ['sort' => 'plays:desc'], 0, $limit);
+    }
+
+    // ---------- Live-TV und Aufnahmen ----------
+
+    /**
+     * Gibt es ueberhaupt einen Tuner?
+     *
+     * Die alte Klasse hat dafuer neun verschiedene Endpunkte durchprobiert, weil Plex sie
+     * ueber die Jahre umbenannt hat. Geblieben ist /livetv/dvrs - die uebrigen Pfade
+     * antworten auf aktuellen Fassungen nicht mehr und werden hier nicht mitgeschleppt.
+     */
+    public function liveTvAvailable(): bool
+    {
+        return $this->dvrs() !== [];
+    }
+
+    /** Die Aufnahmegeraete (DVR) des Servers. */
+    public function dvrs(): array
+    {
+        $out = [];
+        foreach ($this->liste($this->get('/livetv/dvrs')) as $d) {
+            $out[] = [
+                'id'       => (string) ($d['key'] ?? ''),
+                'uuid'     => (string) ($d['uuid'] ?? ''),
+                'sprache'  => (string) ($d['lineupTitle'] ?? ''),
+                'letzter_abgleich' => (int) ($d['epgIdentifier'] ?? 0) ?: (int) ($d['lastEpgRefreshedAt'] ?? 0),
+                'tuner'    => array_values(array_map(static fn($t) => [
+                    'id'    => (string) ($t['key'] ?? ''),
+                    'uuid'  => (string) ($t['uuid'] ?? ''),
+                    'titel' => (string) ($t['title'] ?? ''),
+                    'status'=> (string) ($t['status'] ?? ''),
+                ], (array) ($d['Device'] ?? []))),
+            ];
+        }
+        return $out;
+    }
+
+    /** Alle Tuner ueber alle Aufnahmegeraete hinweg. */
+    public function tuners(): array
+    {
+        $out = [];
+        foreach ($this->dvrs() as $d) {
+            foreach ($d['tuner'] as $t) {
+                $t['dvr'] = $d['id'];
+                $out[] = $t;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Die Senderliste.
+     *
+     * Sie haengt am Aufnahmegeraet, nicht am Server: ohne DVR gibt es keine Sender.
+     */
+    public function channels(): array
+    {
+        $out = [];
+        foreach ($this->dvrs() as $d) {
+            $j = $this->get('/livetv/dvrs/' . rawurlencode($d['id']) . '/channels');
+            foreach ($this->liste($j) as $c) {
+                $out[] = [
+                    'id'      => (string) ($c['id'] ?? ($c['key'] ?? '')),
+                    'nummer'  => (string) ($c['vcn'] ?? ($c['channelIdentifier'] ?? '')),
+                    'titel'   => (string) ($c['title'] ?? ''),
+                    'bild'    => $this->thumb((string) ($c['thumb'] ?? '')),
+                    'dvr'     => $d['id'],
+                    'aktiv'   => !isset($c['enabled']) || (bool) $c['enabled'],
+                ];
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Programmzeitschrift in einem Zeitfenster.
+     *
+     * @param int $von Unix-Zeit, 0 = jetzt
+     * @param int $bis Unix-Zeit, 0 = in vier Stunden
+     */
+    public function guide(int $von = 0, int $bis = 0, string $channelId = ''): array
+    {
+        $von = $von > 0 ? $von : time();
+        $bis = $bis > 0 ? $bis : ($von + 4 * 3600);
+        $p = ['beginsAt>' => $von, 'endsAt<' => $bis];
+        $pfad = $channelId !== ''
+            ? '/livetv/channels/' . rawurlencode($channelId) . '/guide'
+            : '/livetv/guide';
+        $out = [];
+        foreach ($this->liste($this->getP($pfad, $p)) as $g) {
+            $e = $this->eintrag($g);
+            $e['beginn'] = (int) ($g['Media'][0]['beginsAt'] ?? ($g['beginsAt'] ?? 0));
+            $e['ende']   = (int) ($g['Media'][0]['endsAt'] ?? ($g['endsAt'] ?? 0));
+            $e['sender'] = (string) ($g['Media'][0]['channelTitle'] ?? '');
+            $out[] = $e;
+        }
+        return $out;
+    }
+
+    /** Einzelne Sendung aus der Programmzeitschrift. */
+    public function programDetails(string $programId): array
+    {
+        $l = $this->eintraege($this->get('/livetv/guide/' . rawurlencode($programId)));
+        return $l ? $l[0] : [];
+    }
+
+    /** Aufnahmeregeln (Serienaufnahmen). */
+    public function recordingRules(string $dvrId = ''): array
+    {
+        $pfad = $dvrId !== ''
+            ? '/livetv/dvrs/' . rawurlencode($dvrId) . '/rules'
+            : '/livetv/dvrs/rules';
+        return $this->eintraege($this->get($pfad));
+    }
+
+    /** Geplante, noch nicht erfolgte Aufnahmen. */
+    public function scheduledRecordings(string $dvrId = ''): array
+    {
+        $pfad = $dvrId !== ''
+            ? '/livetv/dvrs/' . rawurlencode($dvrId) . '/schedules'
+            : '/livetv/dvrs/schedules';
+        return $this->eintraege($this->get($pfad));
+    }
+
+    /** Bereits erfolgte Aufnahmen. */
+    public function recordings(string $dvrId = ''): array
+    {
+        $pfad = $dvrId !== ''
+            ? '/livetv/dvrs/' . rawurlencode($dvrId) . '/recordings'
+            : '/livetv/dvrs/recordings';
+        return $this->eintraege($this->get($pfad));
+    }
+
+    /**
+     * Eine Aufnahmeregel anlegen.
+     *
+     * @param string $programId Sendung aus der Programmzeitschrift
+     * @param array  $opt       'typ' => 'single'|'series', 'dvr' => Geraet
+     */
+    public function createRecordingRule(string $programId, array $opt = []): bool
+    {
+        if ($programId === '') {
+            return false;
+        }
+        $dvr  = (string) ($opt['dvr'] ?? '');
+        $pfad = $dvr !== ''
+            ? '/livetv/dvrs/' . rawurlencode($dvr) . '/rules'
+            : '/livetv/dvrs/rules';
+        $p = [
+            'targetLibrarySectionID' => (string) ($opt['section'] ?? ''),
+            'mediaGrabOperationType' => ((($opt['typ'] ?? 'single') === 'series') ? 'series' : 'single'),
+            'key'                    => $programId,
+        ];
+        return !empty($this->send('POST', $pfad . '?' . http_build_query(array_filter($p)))['ok']);
+    }
+
+    public function deleteRecordingRule(string $ruleId, string $dvrId = ''): bool
+    {
+        $pfad = $dvrId !== ''
+            ? '/livetv/dvrs/' . rawurlencode($dvrId) . '/rules/' . rawurlencode($ruleId)
+            : '/livetv/dvrs/rules/' . rawurlencode($ruleId);
+        return !empty($this->send('DELETE', $pfad)['ok']);
+    }
+
+    public function deleteScheduledRecording(string $scheduleId, string $dvrId = ''): bool
+    {
+        $pfad = $dvrId !== ''
+            ? '/livetv/dvrs/' . rawurlencode($dvrId) . '/schedules/' . rawurlencode($scheduleId)
+            : '/livetv/dvrs/schedules/' . rawurlencode($scheduleId);
+        return !empty($this->send('DELETE', $pfad)['ok']);
+    }
+
+    /** Eine fertige Aufnahme loeschen - das ist eine Loeschung in der Bibliothek. */
+    public function deleteRecording(string $ratingKey): bool
+    {
+        if ($ratingKey === '') {
+            return false;
+        }
+        return !empty($this->send('DELETE', '/library/metadata/' . rawurlencode($ratingKey))['ok']);
+    }
 }
 
 MediaProviders::register('plex', PlexProvider::class);
