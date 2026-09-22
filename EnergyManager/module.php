@@ -146,6 +146,26 @@ class EnergyManager extends EntityModule
                  'label' => 'Tarifvergleich (Tabelle)', 'varType' => 3, 'actionable' => false],
                 ['ident' => 'SimZones', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simzones',
                  'label' => 'Zeitzonen (Tabelle)', 'varType' => 3, 'actionable' => false],
+                // Die Kennzahlen der Wertkarten brauchen BEIDE Enden der Skala, nicht nur
+                // das eigene: eine Zahl ohne Bereich sagt nicht, ob sie gut ist.
+                ['ident' => 'SimCostWorst', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simworst',
+                 'label' => 'Teuerster Tarif', 'varType' => 2, 'unit' => ' EUR', 'actionable' => false],
+                ['ident' => 'SimPriceBest', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simpricebest',
+                 'label' => 'Bester Preis', 'varType' => 2, 'unit' => ' ct', 'actionable' => false],
+                ['ident' => 'SimPriceWorst', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simpriceworst',
+                 'label' => 'Teuerster Preis', 'varType' => 2, 'unit' => ' ct', 'actionable' => false],
+                ['ident' => 'SimKwhPrev', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simkwhprev',
+                 'label' => 'Jahresbezug davor', 'varType' => 2, 'unit' => ' kWh', 'actionable' => false],
+                ['ident' => 'SimDayPct', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simdaypct',
+                 'label' => 'Anteil Tageszone', 'varType' => 2, 'unit' => ' %', 'actionable' => false],
+                ['ident' => 'SimSavingPct', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simsavingpct',
+                 'label' => 'Ersparnis als Anteil', 'varType' => 2, 'unit' => ' %', 'actionable' => false],
+                ['ident' => 'SimRankText', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simrank',
+                 'label' => 'Rang des eigenen Tarifs', 'varType' => 3, 'actionable' => false],
+                ['ident' => 'SimSavingText', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simsavingtext',
+                 'label' => 'Ersparnis (Text)', 'varType' => 3, 'actionable' => false],
+                ['ident' => 'SimSavingPctText', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simsavingpcttext',
+                 'label' => 'Ersparnis als Anteil (Text)', 'varType' => 3, 'actionable' => false],
                 // --- Simulator: der Schieberegler und sein Ergebnis ---
                 // T_SETPOINT, nicht T_SWITCH: ein Schalter zwingt den Wert auf boolesch,
                 // aus 1500 kWh wurde dabei stillschweigend eine 1.
@@ -1092,13 +1112,16 @@ class EnergyManager extends EntityModule
      *
      * @return array<int,array{ts:int,kwh:float}>
      */
-    private function stundenreihe(int $vid, int $tage): array
+    private function stundenreihe(int $vid, int $tage, int $versatzTage = 0): array
     {
         $ac = $this->archivId();
         if ($ac <= 0 || $vid <= 0 || !@\AC_GetLoggingStatus($ac, $vid)) {
             return [];
         }
-        $a = @\AC_GetAggregatedValues($ac, $vid, 0, time() - $tage * 86400, time(), 0);
+        // $versatzTage schiebt das Fenster nach hinten: 365/365 liefert das Jahr VOR
+        // dem laufenden, ohne dass der Rest der Rechnung etwas davon wissen muss.
+        $bis = time() - $versatzTage * 86400;
+        $a = @\AC_GetAggregatedValues($ac, $vid, 0, $bis - $tage * 86400, $bis, 0);
         if (!is_array($a)) {
             return [];
         }
@@ -1108,6 +1131,26 @@ class EnergyManager extends EntityModule
             $out[] = ['ts' => (int) ($h['TimeStamp'] ?? 0), 'kwh' => $w > 0 ? $w / 1000.0 : 0.0];
         }
         return $out;
+    }
+
+    /**
+     * Der Netzbezug des Jahres VOR dem laufenden, in kWh.
+     *
+     * Dient allein dem Vergleich auf der Wertkarte. Liefert null, sobald das Archiv
+     * das aeltere Fenster nicht mehr vollstaendig traegt - eine halb gefuellte
+     * Vorperiode ergaebe einen Rueckgang, den es nie gab.
+     */
+    private function bezugVorperiode(int $tage): ?float
+    {
+        $summe = 0.0; $hatte = false;
+        foreach ($this->simCfg()['zaehler'] as $z) {
+            $reihe = $this->stundenreihe((int) $z['vid'], $tage, $tage);
+            // Zwei Drittel Abdeckung ist die Grenze: darunter ist der Vergleich wertlos.
+            if (count($reihe) < (int) ($tage * 24 * 0.66)) { return null; }
+            foreach ($reihe as $h) { $summe += (float) $h['kwh']; }
+            $hatte = true;
+        }
+        return $hatte ? $summe : null;
     }
 
     /**
@@ -1350,9 +1393,54 @@ class EnergyManager extends EntityModule
             $this->setReflect('SimBestName', (string) $bester['name']);
         }
         if ($ist !== null) {
-            $this->setReflect('SimCostToday', round((float) $ist['gesamt'], 0));
-            $this->setReflect('SimSaving', round((float) $ist['gesamt'] - (float) ($bester['gesamt'] ?? 0), 0));
+            $istK = (float) $ist['gesamt'];
+            $bstK = (float) ($bester['gesamt'] ?? 0);
+            $this->setReflect('SimCostToday', round($istK, 0));
+            $this->setReflect('SimSaving', round($istK - $bstK, 0));
+            $this->setReflect('SimSavingPct', $istK > 0 ? round(100 * ($istK - $bstK) / $istK, 1) : 0.0);
+            $this->setReflect('SimSavingText',
+                '−' . number_format($istK - $bstK, 0, ',', '.') . ' €/a');
+            // Als Text, nicht als Zahl: die Plakette zeigt den Rohwert, und "13,80"
+            // ohne Prozentzeichen liest sich wie ein Geldbetrag.
+            $this->setReflect('SimSavingPctText', $istK > 0
+                ? (number_format(100 * ($istK - $bstK) / $istK, 1, ',', '.') . ' %') : '');
+            // Rang: der eigene Tarif in der nach Kosten sortierten Liste.
+            $rang = 0; $i = 0;
+            foreach ($x['gesamtkosten'] as $t) {
+                $i++;
+                if ($t['id'] === $ist['id']) { $rang = $i; break; }
+            }
+            $this->setReflect('SimRankText', $rang > 0
+                ? ('Platz ' . $rang . ' von ' . count($x['gesamtkosten'])) : '');
         }
+
+        // --- Beide Enden der Skala ---
+        //
+        // Die Wertkarten zeichnen eine Leiste von guenstigstem bis teuerstem Tarif und
+        // setzen den eigenen Stand als Punkt darauf. Dafuer braucht es das obere Ende
+        // als eigene Variable - aus der Tabelle laesst es sich nicht binden.
+        $letzter = end($x['gesamtkosten']) ?: null;
+        if ($letzter) {
+            $this->setReflect('SimCostWorst', round((float) $letzter['gesamt'], 0));
+            $this->setReflect('SimPriceWorst', round((float) $letzter['je_kwh_ct'], 2));
+        }
+        if ($bester !== null) {
+            $this->setReflect('SimPriceBest', round((float) $bester['je_kwh_ct'], 2));
+        }
+
+        // --- Anteil der teuren Tageszone ---
+        $tagKwh = (float) ($x['gesamt']['zonen']['Day'] ?? 0);
+        $this->setReflect('SimDayPct', $summe > 0 ? round(100 * $tagKwh / $summe, 1) : 0.0);
+
+        // --- Vergleich mit dem Jahr davor ---
+        //
+        // Nur setzen, wenn das Archiv die Vorperiode wirklich traegt. Eine 0 waere hier
+        // keine Angabe, sondern eine Behauptung - und die Karte zeigte "-100 %".
+        $vor = $this->bezugVorperiode((int) $this->simCfg()['tage']);
+        if ($vor !== null && $vor > 0) {
+            $this->setReflect('SimKwhPrev', round($vor, 0));
+        }
+
         $this->RefreshShift();
     }
 
