@@ -119,7 +119,7 @@ class EnergyManager extends EntityModule
                 ['ident' => 'SavedToday', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:savedtoday',
                  'label' => 'Verschiebung brachte heute', 'varType' => 2, 'unit' => ' ct', 'actionable' => false],
                 ['ident' => 'SelfRate', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:selfrate',
-                 'label' => 'Eigendeckung', 'varType' => 2, 'profile' => '~Intensity.1', 'unit' => ' %', 'actionable' => false],
+                 'label' => 'Eigendeckung', 'varType' => 2, 'profile' => '~Intensity.100', 'unit' => ' %', 'actionable' => false],
                 ['ident' => 'Surplus', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:surplus',
                  'label' => 'Bilanz', 'varType' => 2, 'profile' => '~Watt', 'unit' => ' W', 'actionable' => false],
                 ['ident' => 'Price', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:price',
