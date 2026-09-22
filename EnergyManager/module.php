@@ -166,6 +166,19 @@ class EnergyManager extends EntityModule
                  'label' => 'Ersparnis (Text)', 'varType' => 3, 'actionable' => false],
                 ['ident' => 'SimSavingPctText', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simsavingpcttext',
                  'label' => 'Ersparnis als Anteil (Text)', 'varType' => 3, 'actionable' => false],
+                // Jahresbeginn bis heute - der Vergleich, den die Energie-Seite schon zieht.
+                // Der Grosswert der Karte bleibt der rollierende Jahresbezug: er ist die
+                // Grundlage des Tarifvergleichs. YTD ist die Frage danach, nicht dieselbe.
+                ['ident' => 'SimKwhYtd', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simkwhytd',
+                 'label' => 'Bezug seit Jahresbeginn', 'varType' => 2, 'unit' => ' kWh', 'actionable' => false],
+                ['ident' => 'SimKwhYtdPrev', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simkwhytdprev',
+                 'label' => 'Bezug Vorjahr bis heute', 'varType' => 2, 'unit' => ' kWh', 'actionable' => false],
+                ['ident' => 'SimYtdText', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simytdtext',
+                 'label' => 'YTD-Vergleich (Text)', 'varType' => 3, 'actionable' => false],
+                ['ident' => 'SimYtdDelta', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simytddelta',
+                 'label' => 'YTD-Abweichung (Text)', 'varType' => 3, 'actionable' => false],
+                ['ident' => 'SimYtdState', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simytdstate',
+                 'label' => 'YTD-Abweichung (Zustand)', 'varType' => 3, 'actionable' => false],
                 // --- Simulator: der Schieberegler und sein Ergebnis ---
                 // T_SETPOINT, nicht T_SWITCH: ein Schalter zwingt den Wert auf boolesch,
                 // aus 1500 kWh wurde dabei stillschweigend eine 1.
@@ -1121,16 +1134,103 @@ class EnergyManager extends EntityModule
         // $versatzTage schiebt das Fenster nach hinten: 365/365 liefert das Jahr VOR
         // dem laufenden, ohne dass der Rest der Rechnung etwas davon wissen muss.
         $bis = time() - $versatzTage * 86400;
-        $a = @\AC_GetAggregatedValues($ac, $vid, 0, $bis - $tage * 86400, $bis, 0);
-        if (!is_array($a)) {
-            return [];
-        }
-        $out = [];
+        return $this->reiheKwh($vid, $bis - $tage * 86400, $bis)['reihe'];
+    }
+
+    /**
+     * Die Stundenreihe einer Bezugsvariablen in kWh, samt Urteil ueber ihre Brauchbarkeit.
+     *
+     * ZAEHLERVARIABLEN sind die Wahrheit - bezahlt wird nach Arbeit, nicht nach Leistung.
+     * Fuer sie liefert das Archiv im stuendlichen `Avg` bereits den VERBRAUCH der Stunde
+     * in kWh. Gegengeprueft am 22.09.2026 ueber 365 Tage: Summe der Stundenwerte
+     * 10.776 kWh gegen einen Zaehlerhub von 10.762 kWh - 0,13 % Abweichung.
+     *
+     * Eine LEISTUNGSVARIABLE (W) bleibt als Rueckfall moeglich, taugt aber nur als
+     * Naeherung: dieselbe Anlage lieferte integriert 13.339 kWh, waehrend die Zaehler
+     * 13.018 kWh auswiesen - 2,5 % zu hoch, im laufenden Jahr sogar 6,8 %.
+     *
+     * ZWEI FALLEN, beide am 22.09.2026 gemessen:
+     *
+     * 1. Der ERSTE Eintrag einer Zaehlerreihe ist der Zaehlerstand selbst, keine
+     *    Differenz. Am Beginn der Aufzeichnung (19.12.2024) steht eine Stunde mit
+     *    120.809,64 kWh. Wer sie mitzaehlt, bekommt fuer das Vorjahr 157.712 kWh.
+     *    Erkannt wird sie ohne Zauberzahl: eine einzelne Stunde kann unmoeglich mehr
+     *    verbraucht haben als das ganze Fenster, also gilt der Zaehlerhub als Obergrenze.
+     *
+     * 2. Reicht die Aufzeichnung nicht bis zum Beginn des Fensters, ist die Summe kein
+     *    Jahresverbrauch, sondern ein Rest. Deshalb das Urteil `vollstaendig`: es gibt
+     *    genau dann true, wenn zum Fensterbeginn schon ein Wert im Archiv steht.
+     */
+    private function reiheKwh(int $vid, int $von, int $bis): array
+    {
+        $leer = ['reihe' => [], 'summe' => 0.0, 'hub' => null, 'vollstaendig' => false];
+        $ac = $this->archivId();
+        if ($ac <= 0 || $vid <= 0 || $bis <= $von || !@\AC_GetLoggingStatus($ac, $vid)) { return $leer; }
+
+        $zaehler = ((int) @\AC_GetAggregationType($ac, $vid) === 1);
+        $stand = static function (int $t) use ($ac, $vid): ?float {
+            $x = @\AC_GetLoggedValues($ac, $vid, 0, $t, 1);
+            return (is_array($x) && count($x)) ? (float) $x[0]['Value'] : null;
+        };
+        $anfang = $stand($von);
+        $ende   = $stand($bis);
+        $hub = ($zaehler && $anfang !== null && $ende !== null) ? ($ende - $anfang) : null;
+
+        $a = @\AC_GetAggregatedValues($ac, $vid, 0, $von, $bis, 0);
+        if (!is_array($a)) { return $leer; }
+
+        // Lange Fenster bekommen eine Obergrenze je Stunde: eine einzelne Stunde, die
+        // mehr als ein Prozent des ganzen Fensters traegt, ist kein Verbrauch, sondern
+        // ein Sprung im Zaehlwerk. Am Zaehlpunkt DG standen so 22 Stunden mit bis zu
+        // 189,6 kWh - in einer Wohnung nicht moeglich; sie blaehten das Jahr von 2.255
+        // auf 3.995 kWh. Auf kurze Fenster ist die Regel nicht anwendbar (ein Prozent
+        // eines Tages waere weniger als eine normale Stunde), dort bleibt sie aus.
+        $grenze = ($hub !== null && $hub > 0 && ($bis - $von) >= 30 * 86400) ? ($hub * 0.01) : null;
+
+        $reihe = []; $summe = 0.0;
         foreach ($a as $h) {
-            $w = (float) ($h['Avg'] ?? 0);
-            $out[] = ['ts' => (int) ($h['TimeStamp'] ?? 0), 'kwh' => $w > 0 ? $w / 1000.0 : 0.0];
+            $v = (float) ($h['Avg'] ?? 0);
+            if ($v <= 0) { $kwh = 0.0; }
+            elseif (!$zaehler) { $kwh = $v / 1000.0; }
+            elseif ($hub !== null && $hub > 0 && $v > $hub) { continue; }   // Zaehlerstand, kein Verbrauch
+            elseif ($grenze !== null && $v > $grenze) { continue; }         // Sprung im Zaehlwerk
+            else { $kwh = $v; }
+            $reihe[] = ['ts' => (int) ($h['TimeStamp'] ?? 0), 'kwh' => $kwh];
+            $summe += $kwh;
         }
-        return $out;
+
+        // Und dann gilt der ZAEHLERHUB. Die Stundenreihe liefert nur noch die Form -
+        // wann der Strom bezogen wurde -, die Hoehe kommt vom Zaehler. Was die Filter
+        // nicht erwischt haben, faengt der Faktor ab. Er greift nur im plausiblen
+        // Bereich: weicht die Summe um mehr als die Haelfte ab, stimmt etwas
+        // Grundsaetzliches nicht, und stillschweigend zurechtzuruecken waere falsch.
+        if ($zaehler && $hub !== null && $hub > 0 && $summe > 0) {
+            $f = $hub / $summe;
+            if ($f > 0.5 && $f < 2.0) {
+                foreach ($reihe as $k => $e) { $reihe[$k]['kwh'] = $e['kwh'] * $f; }
+                $summe = $hub;
+            }
+        }
+
+        return ['reihe' => $reihe, 'summe' => $summe, 'hub' => $hub,
+                'vollstaendig' => $zaehler ? ($anfang !== null) : (count($reihe) >= (int) (($bis - $von) / 3600 * 0.66))];
+    }
+
+    /**
+     * Netzbezug in einem frei gewaehlten Fenster, in kWh - ueber alle Zaehler.
+     *
+     * Liefert null, sobald ein Zaehler das Fenster nicht zu zwei Dritteln traegt.
+     */
+    private function bezugFenster(int $von, int $bis): ?float
+    {
+        $summe = 0.0; $hatte = false;
+        foreach ($this->simCfg()['zaehler'] as $z) {
+            $r = $this->reiheKwh((int) $z['vid'], $von, $bis);
+            if (!$r['vollstaendig']) { return null; }
+            $summe += $r['summe'];
+            $hatte = true;
+        }
+        return $hatte ? $summe : null;
     }
 
     /**
@@ -1142,15 +1242,8 @@ class EnergyManager extends EntityModule
      */
     private function bezugVorperiode(int $tage): ?float
     {
-        $summe = 0.0; $hatte = false;
-        foreach ($this->simCfg()['zaehler'] as $z) {
-            $reihe = $this->stundenreihe((int) $z['vid'], $tage, $tage);
-            // Zwei Drittel Abdeckung ist die Grenze: darunter ist der Vergleich wertlos.
-            if (count($reihe) < (int) ($tage * 24 * 0.66)) { return null; }
-            foreach ($reihe as $h) { $summe += (float) $h['kwh']; }
-            $hatte = true;
-        }
-        return $hatte ? $summe : null;
+        $bis = time() - $tage * 86400;
+        return $this->bezugFenster($bis - $tage * 86400, $bis);
     }
 
     /**
@@ -1439,6 +1532,32 @@ class EnergyManager extends EntityModule
         $vor = $this->bezugVorperiode((int) $this->simCfg()['tage']);
         if ($vor !== null && $vor > 0) {
             $this->setReflect('SimKwhPrev', round($vor, 0));
+        }
+
+        // --- Seit Jahresbeginn, taggenau gegen das Vorjahr ---
+        //
+        // Dieselbe Rechnung, die die Energie-Seite serverseitig zieht (?api=cmp&stage=year):
+        // vom 1. Jaenner bis JETZT, dagegen derselbe Abschnitt des Vorjahres. Der rollierende
+        // Jahresbezug daneben ist eine ANDERE Frage und darf abweichen - im September
+        // ueberlappen sich die beiden Fenster nur zu drei Vierteln.
+        $jetzt   = time();
+        $anfang  = mktime(0, 0, 0, 1, 1, (int) date('Y', $jetzt));
+        $ytd     = $this->bezugFenster($anfang, $jetzt);
+        $ytdVor  = $this->bezugFenster(strtotime('-1 year', $anfang), strtotime('-1 year', $jetzt));
+        if ($ytd !== null) { $this->setReflect('SimKwhYtd', round($ytd, 0)); }
+        if ($ytdVor !== null) { $this->setReflect('SimKwhYtdPrev', round($ytdVor, 0)); }
+        if ($ytd !== null && $ytdVor !== null && $ytdVor > 0) {
+            $p = 100 * ($ytd - $ytdVor) / $ytdVor;
+            $this->setReflect('SimYtdText',
+                'seit 1. Jänner ' . number_format($ytd, 0, ',', '.')
+                . ' kWh gegen ' . number_format($ytdVor, 0, ',', '.') . ' kWh im Vorjahr');
+            $this->setReflect('SimYtdDelta',
+                ($p >= 0 ? '+' : '−') . number_format(abs($p), 1, ',', '.') . ' % YTD');
+            // Mehr Verbrauch ist nicht gut: die Farbe dreht, nicht das Vorzeichen.
+            // Neutralband bei zwei Prozent: Wetter und Anwesenheit allein bewegen den
+            // Jahresverbrauch um mehr als ein Prozent - das rot zu faerben, meldet
+            // Alarm, wo nichts geschehen ist.
+            $this->setReflect('SimYtdState', abs($p) < 2.0 ? 'muted' : ($p > 0 ? 'crit' : 'ok'));
         }
 
         $this->RefreshShift();
