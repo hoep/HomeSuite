@@ -854,12 +854,17 @@ final class PlexProvider implements IMediaProvider, IMediaWritable
      * getestet, jede mit "Invalid preference ... referenced" abgewiesen. Deshalb steht hier
      * nur oneShot; wer mehr schickt, bekommt 400.
      *
-     * ABER: die Regel entsteht und bleibt wirkungslos. Der Server meldet dabei
-     * "Could not find providers for subscription", und /media/subscriptions/scheduled bleibt
-     * leer. Ursache ist derselbe Mangel, der auch die Plex-Oberflaeche scheitern laesst: fuer
-     * XMLTV-gestuetztes Live-TV fehlt der Metadaten-Agent 'tv.plex.xmltv' - er steht in
-     * keiner Agentenliste und laesst sich nicht nachinstallieren. Das ist ein bekannter
-     * Fehler des Plex-Servers, kein Fehler dieser Anbindung.
+     * Und die vierte, die mich fast auf eine falsche Faehrte gefuehrt haette:
+     * `mediaProviderID` ist die **Nummer des Anbieters aus /media/providers** (hier 10) -
+     * NICHT die Zahl hinter dem epgIdentifier (dort steht :9, das ist der DVR-Schluessel).
+     * Mit der falschen Nummer entsteht die Regel zwar, bleibt aber wirkungslos: der Server
+     * meldet "Could not find providers for subscription" und plant nichts ein. Mit der
+     * richtigen wird die Aufnahme sofort beim Tuner eingeplant (grabberIdentifier
+     * tv.plex.grabbers.hdhomerun) - am 22.09.2026 so geprueft und danach wieder geloescht.
+     *
+     * Die Meldung "Unable to find metadata agent provider for identifier 'tv.plex.xmltv'"
+     * taucht dabei im Protokoll auf, ist aber HARMLOS: sie betrifft die Metadatensuche, nicht
+     * das Einplanen. Wer sie fuer die Ursache haelt, sucht an der falschen Stelle.
      *
      * @param array $hint  ['guid','title','type'=>'movie'|'show','year']
      * @param array $opt   ['section','location','channelId','beginsAt','einmalig']
@@ -880,7 +885,7 @@ final class PlexProvider implements IMediaProvider, IMediaWritable
             'hints[type]'             => (string) ($hint['type'] ?? 'movie'),
             'hints[year]'             => (string) ($hint['year'] ?? ''),
             'params[libraryType]'     => 1,
-            'params[mediaProviderID]' => (string) ($opt['dvr'] ?? $this->epgProviderId()),
+            'params[mediaProviderID]' => (string) ($opt['providerId'] ?? $this->epgProviderId()),
             'params[airingChannels]'  => (string) ($opt['channelId'] ?? ''),
             'params[airingTimes]'     => (string) ($opt['beginsAt'] ?? ''),
             'prefs[oneShot]'          => (($opt['einmalig'] ?? true) ? 1 : 0),
@@ -890,20 +895,31 @@ final class PlexProvider implements IMediaProvider, IMediaWritable
         }
         $r = $this->send('POST', '/media/subscriptions?' . http_build_query($p));
         $key = (string) ($r['json']['MediaContainer']['MediaSubscription'][0]['key'] ?? '');
-        return ['ok' => !empty($r['ok']), 'code' => (int) ($r['code'] ?? 0), 'id' => $key,
-                'hinweis' => 'Die Regel entsteht, wird aber mangels Metadaten-Agent tv.plex.xmltv '
-                           . 'nicht in eine geplante Aufnahme umgesetzt (Plex-Serverfehler).'];
+        return ['ok' => !empty($r['ok']), 'code' => (int) ($r['code'] ?? 0), 'id' => $key];
     }
 
-    /** Die Nummer des EPG-Anbieters - steckt hinten im epgIdentifier, etwa ...xmltv:9 */
+    /**
+     * Die Nummer des Live-TV-Anbieters, wie /media/providers sie fuehrt.
+     *
+     * NICHT die Zahl aus dem epgIdentifier: dort steht der DVR-Schluessel (:9), der Anbieter
+     * hat eine eigene id (10). Sie zu verwechseln kostet keine Fehlermeldung, sondern eine
+     * Regel, die stillschweigend nichts aufnimmt.
+     */
+    private ?string $provId = null;
+
     private function epgProviderId(): string
     {
-        foreach ($this->dvrs() as $d) {
-            if (preg_match('~:(\d+)$~', (string) $d['epg_id'], $m)) {
-                return $m[1];
+        if ($this->provId !== null) {
+            return $this->provId;
+        }
+        $this->provId = '';
+        foreach ((array) ($this->get('/media/providers')['MediaContainer']['MediaProvider'] ?? []) as $p) {
+            if (strpos((string) ($p['identifier'] ?? ''), 'epg') !== false && isset($p['id'])) {
+                $this->provId = (string) $p['id'];
+                break;
             }
         }
-        return '';
+        return $this->provId;
     }
 
     public function deleteRecordingRule(string $ruleId): bool
