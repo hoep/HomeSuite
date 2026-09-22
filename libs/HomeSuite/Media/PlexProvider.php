@@ -313,7 +313,7 @@ final class PlexProvider implements IMediaProvider, IMediaWritable
     private function liste(array $j): array
     {
         $c = $j['MediaContainer'] ?? [];
-        foreach (['Metadata', 'Directory', 'Video', 'Track', 'Hub'] as $k) {
+        foreach (['Metadata', 'Directory', 'Video', 'Track', 'Hub', 'Dvr', 'MediaSubscription'] as $k) {
             if (isset($c[$k]) && is_array($c[$k])) {
                 return $c[$k];
             }
@@ -620,46 +620,74 @@ final class PlexProvider implements IMediaProvider, IMediaWritable
     }
 
     // ---------- Live-TV und Aufnahmen ----------
+    //
+    // ACHTUNG, hier lagen zwei Irrtuemer, die mich erst eine Fehlmeldung gekostet haben:
+    //
+    // 1. Plex packt die Aufnahmegeraete NICHT unter 'Metadata', sondern unter 'Dvr'. Wer
+    //    das uebersieht, bekommt eine leere Liste und schliesst daraus, es gebe keinen
+    //    Tuner - obwohl einer da ist.
+    // 2. Es gibt KEINEN Endpunkt /livetv/dvrs/<id>/channels. Die Senderliste haengt am
+    //    Geraet: Dvr[].Device[].ChannelMapping. Und die Sendernamen stehen dort auch nicht,
+    //    sondern erst in der Programmzeitschrift am Media-Teil jeder Sendung.
+    //
+    // Gemessen am 22.09.2026 an dieser Anlage: ein DVR (Schluessel 9), ein Geraet - eine
+    // VU+ Ultimo 4K, die sich als Silicondust-HDHomeRun ausgibt - und 64 aktive Sender,
+    // EPG per XMLTV.
 
-    /**
-     * Gibt es ueberhaupt einen Tuner?
-     *
-     * Die alte Klasse hat dafuer neun verschiedene Endpunkte durchprobiert, weil Plex sie
-     * ueber die Jahre umbenannt hat. Geblieben ist /livetv/dvrs - die uebrigen Pfade
-     * antworten auf aktuellen Fassungen nicht mehr und werden hier nicht mitgeschleppt.
-     */
+    /** Gibt es ein Aufnahmegeraet? */
     public function liveTvAvailable(): bool
     {
         return $this->dvrs() !== [];
+    }
+
+    /** Rohdaten aller Aufnahmegeraete, einmal geholt und gemerkt. */
+    private ?array $dvrRoh = null;
+
+    private function dvrRoh(): array
+    {
+        if ($this->dvrRoh === null) {
+            $this->dvrRoh = (array) ($this->get('/livetv/dvrs')['MediaContainer']['Dvr'] ?? []);
+        }
+        return $this->dvrRoh;
     }
 
     /** Die Aufnahmegeraete (DVR) des Servers. */
     public function dvrs(): array
     {
         $out = [];
-        foreach ($this->liste($this->get('/livetv/dvrs')) as $d) {
+        foreach ($this->dvrRoh() as $d) {
             $out[] = [
-                'id'       => (string) ($d['key'] ?? ''),
-                'uuid'     => (string) ($d['uuid'] ?? ''),
-                'sprache'  => (string) ($d['lineupTitle'] ?? ''),
-                'letzter_abgleich' => (int) ($d['epgIdentifier'] ?? 0) ?: (int) ($d['lastEpgRefreshedAt'] ?? 0),
-                'tuner'    => array_values(array_map(static fn($t) => [
-                    'id'    => (string) ($t['key'] ?? ''),
-                    'uuid'  => (string) ($t['uuid'] ?? ''),
-                    'titel' => (string) ($t['title'] ?? ''),
-                    'status'=> (string) ($t['status'] ?? ''),
+                'id'        => (string) ($d['key'] ?? ''),
+                'uuid'      => (string) ($d['uuid'] ?? ''),
+                'sprache'   => (string) ($d['language'] ?? ''),
+                'land'      => (string) ($d['country'] ?? ''),
+                'epg'       => (string) ($d['lineupTitle'] ?? ''),
+                // Der EPG-Bezeichner ist der Pfad, unter dem das Programm liegt - ohne ihn
+                // findet guide() nichts.
+                'epg_id'    => (string) ($d['epgIdentifier'] ?? ''),
+                'aktualisiert' => (int) ($d['refreshedAt'] ?? 0),
+                'geraete'   => array_values(array_map(static fn($t) => [
+                    'id'      => (string) ($t['key'] ?? ''),
+                    'titel'   => (string) ($t['title'] ?? ''),
+                    'hersteller' => (string) ($t['make'] ?? ''),
+                    'modell'  => (string) ($t['model'] ?? ''),
+                    'adresse' => (string) ($t['uri'] ?? ''),
+                    'status'  => (string) ($t['status'] ?? ''),
+                    'zustand' => (string) ($t['state'] ?? ''),
+                    'tuner'   => (int) ($t['tuners'] ?? 0),
+                    'sender'  => count((array) ($t['ChannelMapping'] ?? [])),
                 ], (array) ($d['Device'] ?? []))),
             ];
         }
         return $out;
     }
 
-    /** Alle Tuner ueber alle Aufnahmegeraete hinweg. */
+    /** Alle Empfangsgeraete ueber alle Aufnahmegeraete hinweg. */
     public function tuners(): array
     {
         $out = [];
         foreach ($this->dvrs() as $d) {
-            foreach ($d['tuner'] as $t) {
+            foreach ($d['geraete'] as $t) {
                 $t['dvr'] = $d['id'];
                 $out[] = $t;
             }
@@ -670,22 +698,36 @@ final class PlexProvider implements IMediaProvider, IMediaWritable
     /**
      * Die Senderliste.
      *
-     * Sie haengt am Aufnahmegeraet, nicht am Server: ohne DVR gibt es keine Sender.
+     * Die Zuordnung liefert nur Kennungen wie 'ORF1.at'. Die lesbaren Namen stehen in der
+     * Programmzeitschrift; wer sie will, setzt $mitNamen - das kostet einen zusaetzlichen,
+     * grossen Abruf, deshalb ist es nicht die Vorgabe.
      */
-    public function channels(): array
+    public function channels(bool $mitNamen = false): array
     {
+        $namen = [];
+        if ($mitNamen) {
+            foreach ($this->guide(0, time() + 3600) as $g) {
+                $k = (string) ($g['sender_id'] ?? '');
+                if ($k !== '' && !isset($namen[$k])) {
+                    $namen[$k] = ['titel' => (string) $g['sender'], 'bild' => (string) ($g['sender_bild'] ?? '')];
+                }
+            }
+        }
         $out = [];
-        foreach ($this->dvrs() as $d) {
-            $j = $this->get('/livetv/dvrs/' . rawurlencode($d['id']) . '/channels');
-            foreach ($this->liste($j) as $c) {
-                $out[] = [
-                    'id'      => (string) ($c['id'] ?? ($c['key'] ?? '')),
-                    'nummer'  => (string) ($c['vcn'] ?? ($c['channelIdentifier'] ?? '')),
-                    'titel'   => (string) ($c['title'] ?? ''),
-                    'bild'    => $this->thumb((string) ($c['thumb'] ?? '')),
-                    'dvr'     => $d['id'],
-                    'aktiv'   => !isset($c['enabled']) || (bool) $c['enabled'],
-                ];
+        foreach ($this->dvrRoh() as $d) {
+            foreach ((array) ($d['Device'] ?? []) as $dev) {
+                foreach ((array) ($dev['ChannelMapping'] ?? []) as $c) {
+                    $key = (string) ($c['channelKey'] ?? '');
+                    $out[] = [
+                        'id'     => $key,
+                        'lineup' => (string) ($c['lineupIdentifier'] ?? ''),
+                        'aktiv'  => !empty($c['enabled']),
+                        'geraet' => (string) ($c['deviceIdentifier'] ?? ''),
+                        'dvr'    => (string) ($d['key'] ?? ''),
+                        'titel'  => $namen[$key]['titel'] ?? $key,
+                        'bild'   => $namen[$key]['bild'] ?? '',
+                    ];
+                }
             }
         }
         return $out;
@@ -694,99 +736,140 @@ final class PlexProvider implements IMediaProvider, IMediaWritable
     /**
      * Programmzeitschrift in einem Zeitfenster.
      *
-     * @param int $von Unix-Zeit, 0 = jetzt
-     * @param int $bis Unix-Zeit, 0 = in vier Stunden
+     * Plex liefert das Raster IMMER vollstaendig - bei dieser Anlage rund 3600 Sendungen -
+     * und kennt keinen Zeitfilter am Endpunkt. Gefiltert wird deshalb hier. Ein enges
+     * Fenster spart also keine Uebertragung, sondern nur Arbeit beim Aufrufer.
+     *
+     * @param int    $von     Unix-Zeit, 0 = jetzt
+     * @param int    $bis     Unix-Zeit, 0 = in vier Stunden
+     * @param string $sender  Senderkennung wie 'ORF1.at', '' = alle
      */
-    public function guide(int $von = 0, int $bis = 0, string $channelId = ''): array
+    public function guide(int $von = 0, int $bis = 0, string $sender = ''): array
     {
+        $epg = '';
+        foreach ($this->dvrs() as $d) {
+            if ($d['epg_id'] !== '') { $epg = $d['epg_id']; break; }
+        }
+        if ($epg === '') {
+            return [];
+        }
         $von = $von > 0 ? $von : time();
         $bis = $bis > 0 ? $bis : ($von + 4 * 3600);
-        $p = ['beginsAt>' => $von, 'endsAt<' => $bis];
-        $pfad = $channelId !== ''
-            ? '/livetv/channels/' . rawurlencode($channelId) . '/guide'
-            : '/livetv/guide';
+
+        $j = $this->getP('/' . $epg . '/grid', ['type' => 1, 'sort' => 'beginsAt']);
         $out = [];
-        foreach ($this->liste($this->getP($pfad, $p)) as $g) {
-            $e = $this->eintrag($g);
-            $e['beginn'] = (int) ($g['Media'][0]['beginsAt'] ?? ($g['beginsAt'] ?? 0));
-            $e['ende']   = (int) ($g['Media'][0]['endsAt'] ?? ($g['endsAt'] ?? 0));
-            $e['sender'] = (string) ($g['Media'][0]['channelTitle'] ?? '');
-            $out[] = $e;
+        foreach ($this->liste($j) as $m) {
+            $med = $m['Media'][0] ?? [];
+            $b = (int) ($med['beginsAt'] ?? 0);
+            $e = (int) ($med['endsAt'] ?? 0);
+            if ($b === 0 || $e <= $von || $b >= $bis) {
+                continue;   // ausserhalb des Fensters
+            }
+            $kanal = (string) ($med['channelIdentifier'] ?? '');
+            if ($sender !== '' && $kanal !== $sender) {
+                continue;
+            }
+            $x = $this->eintrag($m);
+            $x['beginn']      = $b;
+            $x['ende']        = $e;
+            $x['laeuft']      = !empty($med['onAir']);
+            $x['sender_id']   = $kanal;
+            $x['sender']      = (string) ($med['channelTitle'] ?? ($med['channelCallSign'] ?? $kanal));
+            $x['sender_bild'] = (string) ($med['channelThumb'] ?? '');
+            $out[] = $x;
         }
+        usort($out, static fn($a, $b2) => $a['beginn'] <=> $b2['beginn']);
         return $out;
+    }
+
+    /** Was laeuft gerade? Abkuerzung fuer guide() auf den Augenblick. */
+    public function nowPlaying(string $sender = ''): array
+    {
+        return $this->guide(time(), time() + 60, $sender);
     }
 
     /** Einzelne Sendung aus der Programmzeitschrift. */
     public function programDetails(string $programId): array
     {
-        $l = $this->eintraege($this->get('/livetv/guide/' . rawurlencode($programId)));
+        $epg = '';
+        foreach ($this->dvrs() as $d) {
+            if ($d['epg_id'] !== '') { $epg = $d['epg_id']; break; }
+        }
+        if ($epg === '' || $programId === '') {
+            return [];
+        }
+        $l = $this->eintraege($this->get('/' . $epg . '/metadata/' . rawurlencode($programId)));
         return $l ? $l[0] : [];
     }
 
-    /** Aufnahmeregeln (Serienaufnahmen). */
-    public function recordingRules(string $dvrId = ''): array
+    /**
+     * Aufnahmeregeln.
+     *
+     * Plex nennt sie Abonnements, und sie haengen NICHT am Aufnahmegeraet, sondern am
+     * Server: /media/subscriptions. Auf dieser Anlage ist derzeit keine einzige angelegt.
+     */
+    public function recordingRules(): array
     {
-        $pfad = $dvrId !== ''
-            ? '/livetv/dvrs/' . rawurlencode($dvrId) . '/rules'
-            : '/livetv/dvrs/rules';
-        return $this->eintraege($this->get($pfad));
+        return $this->eintraege($this->get('/media/subscriptions'));
     }
 
     /** Geplante, noch nicht erfolgte Aufnahmen. */
-    public function scheduledRecordings(string $dvrId = ''): array
+    public function scheduledRecordings(): array
     {
-        $pfad = $dvrId !== ''
-            ? '/livetv/dvrs/' . rawurlencode($dvrId) . '/schedules'
-            : '/livetv/dvrs/schedules';
-        return $this->eintraege($this->get($pfad));
-    }
-
-    /** Bereits erfolgte Aufnahmen. */
-    public function recordings(string $dvrId = ''): array
-    {
-        $pfad = $dvrId !== ''
-            ? '/livetv/dvrs/' . rawurlencode($dvrId) . '/recordings'
-            : '/livetv/dvrs/recordings';
-        return $this->eintraege($this->get($pfad));
+        return $this->eintraege($this->get('/media/subscriptions/scheduled'));
     }
 
     /**
-     * Eine Aufnahmeregel anlegen.
+     * Fertige Aufnahmen.
      *
-     * @param string $programId Sendung aus der Programmzeitschrift
-     * @param array  $opt       'typ' => 'single'|'series', 'dvr' => Geraet
+     * Es gibt dafuer KEINEN Live-TV-Endpunkt: Plex legt eine fertige Aufnahme als
+     * gewoehnlichen Bibliothekseintrag ab. Ohne Angabe der Bibliothek kann diese Methode
+     * daher nichts liefern - und tut lieber nichts, als zu raten, welche der Bibliotheken
+     * gemeint ist.
+     *
+     * @param string $sectionId Bibliothek, in die das Aufnahmegeraet ablegt
      */
-    public function createRecordingRule(string $programId, array $opt = []): bool
+    public function recordings(string $sectionId = '', int $limit = 50): array
+    {
+        return $sectionId === '' ? [] : $this->recentlyAdded($sectionId, $limit);
+    }
+
+    /**
+     * Eine Aufnahme bestellen.
+     *
+     * UNGEPRUEFT: auf dieser Anlage existiert keine einzige Aufnahmeregel, an der sich die
+     * erwartete Form ablesen liesse. Die Parameter folgen dem, was der Plex-Server bei
+     * /media/subscriptions dokumentiert; ob der Aufruf durchgeht, muss der erste echte
+     * Versuch zeigen. Bewusst so gekennzeichnet, statt Verlaesslichkeit vorzutaeuschen.
+     *
+     * @param string $programId Sendung aus der Programmzeitschrift (ratingKey)
+     * @param array  $opt       'typ' => 'single'|'series', 'section' => Zielbibliothek
+     */
+    public function createRecordingRule(string $programId, array $opt = []): array
     {
         if ($programId === '') {
-            return false;
+            return ['ok' => false, 'grund' => 'keine Sendung angegeben'];
         }
-        $dvr  = (string) ($opt['dvr'] ?? '');
-        $pfad = $dvr !== ''
-            ? '/livetv/dvrs/' . rawurlencode($dvr) . '/rules'
-            : '/livetv/dvrs/rules';
-        $p = [
+        $p = array_filter([
             'targetLibrarySectionID' => (string) ($opt['section'] ?? ''),
-            'mediaGrabOperationType' => ((($opt['typ'] ?? 'single') === 'series') ? 'series' : 'single'),
+            'targetSectionLocationID'=> (string) ($opt['location'] ?? ''),
+            'type'                   => ((($opt['typ'] ?? 'single') === 'series') ? 2 : 1),
             'key'                    => $programId,
-        ];
-        return !empty($this->send('POST', $pfad . '?' . http_build_query(array_filter($p)))['ok']);
+        ], static fn($v) => $v !== '' && $v !== null);
+        $r = $this->send('POST', '/media/subscriptions?' . http_build_query($p));
+        return ['ok' => !empty($r['ok']), 'code' => (int) ($r['code'] ?? 0), 'ungeprueft' => true];
     }
 
-    public function deleteRecordingRule(string $ruleId, string $dvrId = ''): bool
+    public function deleteRecordingRule(string $ruleId): bool
     {
-        $pfad = $dvrId !== ''
-            ? '/livetv/dvrs/' . rawurlencode($dvrId) . '/rules/' . rawurlencode($ruleId)
-            : '/livetv/dvrs/rules/' . rawurlencode($ruleId);
-        return !empty($this->send('DELETE', $pfad)['ok']);
+        return $ruleId !== ''
+            && !empty($this->send('DELETE', '/media/subscriptions/' . rawurlencode($ruleId))['ok']);
     }
 
-    public function deleteScheduledRecording(string $scheduleId, string $dvrId = ''): bool
+    public function deleteScheduledRecording(string $scheduleId): bool
     {
-        $pfad = $dvrId !== ''
-            ? '/livetv/dvrs/' . rawurlencode($dvrId) . '/schedules/' . rawurlencode($scheduleId)
-            : '/livetv/dvrs/schedules/' . rawurlencode($scheduleId);
-        return !empty($this->send('DELETE', $pfad)['ok']);
+        return $scheduleId !== ''
+            && !empty($this->send('DELETE', '/media/subscriptions/scheduled/' . rawurlencode($scheduleId))['ok']);
     }
 
     /** Eine fertige Aufnahme loeschen - das ist eine Loeschung in der Bibliothek. */

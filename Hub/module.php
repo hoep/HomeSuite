@@ -2554,11 +2554,17 @@ class HomeSuiteHub extends EntityModule
             case 'liveTv':      return ['ok' => true, 'fn' => $fn, 'result' => ['verfuegbar' => $p->liveTvAvailable()]];
             case 'dvrs':        return ['ok' => true, 'fn' => $fn, 'result' => $p->dvrs()];
             case 'tuners':      return ['ok' => true, 'fn' => $fn, 'result' => $p->tuners()];
-            case 'channels':    return ['ok' => true, 'fn' => $fn, 'result' => $p->channels()];
+            case 'channels':
+                return ['ok' => true, 'fn' => $fn, 'result' => $p->channels(!empty($args['namen']))];
             case 'guide':
                 return ['ok' => true, 'fn' => $fn, 'result' =>
-                    $p->guide((int) ($args['von'] ?? 0), (int) ($args['bis'] ?? 0), (string) ($args['channel'] ?? ''))];
-            case 'recordings':  return ['ok' => true, 'fn' => $fn, 'result' => $p->recordings()];
+                    $p->guide((int) ($args['von'] ?? 0), (int) ($args['bis'] ?? 0), (string) ($args['sender'] ?? ''))];
+            case 'nowPlaying':
+                return ['ok' => true, 'fn' => $fn, 'result' => $p->nowPlaying((string) ($args['sender'] ?? ''))];
+            case 'programDetails':
+                return ['ok' => true, 'fn' => $fn, 'result' => $p->programDetails($id)];
+            case 'recordings':
+                return ['ok' => true, 'fn' => $fn, 'result' => $p->recordings($sec, $lim ?: 50)];
             case 'recordingRules':     return ['ok' => true, 'fn' => $fn, 'result' => $p->recordingRules()];
             case 'scheduledRecordings':return ['ok' => true, 'fn' => $fn, 'result' => $p->scheduledRecordings()];
         }
@@ -2569,7 +2575,8 @@ class HomeSuiteHub extends EntityModule
             case 'markWatched':   return ['ok' => $p->markWatched($id), 'fn' => $fn];
             case 'markUnwatched': return ['ok' => $p->markUnwatched($id), 'fn' => $fn];
             case 'createRecordingRule':
-                return ['ok' => $p->createRecordingRule($id, (array) ($args['opt'] ?? [])), 'fn' => $fn];
+                $rr = $p->createRecordingRule($id, (array) ($args['opt'] ?? []));
+                return ['ok' => !empty($rr['ok']), 'fn' => $fn, 'result' => $rr];
             case 'deleteRecordingRule':
                 return ['ok' => $p->deleteRecordingRule($id), 'fn' => $fn];
             case 'deleteScheduledRecording':
@@ -2582,6 +2589,7 @@ class HomeSuiteHub extends EntityModule
                               'children', 'search', 'searchMovies', 'searchShows', 'librarySearch',
                               'recentlyAdded', 'unwatched', 'genres', 'byGenre', 'byYear',
                               'mostPlayed', 'liveTv', 'dvrs', 'tuners', 'channels', 'guide',
+                              'nowPlaying', 'programDetails',
                               'recordings', 'recordingRules', 'scheduledRecordings',
                               'markWatched', 'markUnwatched', 'createRecordingRule',
                               'deleteRecordingRule', 'deleteScheduledRecording']];
