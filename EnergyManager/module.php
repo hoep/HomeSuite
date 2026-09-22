@@ -131,6 +131,33 @@ class EnergyManager extends EntityModule
                 ['ident' => 'CheapWindow', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:cheapwindow',
                  'label' => 'Guenstigstes Fenster', 'varType' => 3, 'actionable' => false],
                 // --- Anzeige: was daraus folgt ---
+                // --- Simulation: was die Seite "Strompreis" anzeigt ---
+                ['ident' => 'SimCostToday', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simtoday',
+                 'label' => 'Jahreskosten heute', 'varType' => 2, 'unit' => ' EUR', 'actionable' => false],
+                ['ident' => 'SimCostBest', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simbest',
+                 'label' => 'Bester Tarif', 'varType' => 2, 'unit' => ' EUR', 'actionable' => false],
+                ['ident' => 'SimBestName', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simbestname',
+                 'label' => 'Bester Tarif (Name)', 'varType' => 3, 'actionable' => false],
+                ['ident' => 'SimSaving', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simsaving',
+                 'label' => 'Möglich pro Jahr', 'varType' => 2, 'unit' => ' EUR', 'actionable' => false],
+                ['ident' => 'SimKwh', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simkwh',
+                 'label' => 'Jahresbezug', 'varType' => 2, 'profile' => '~Electricity', 'unit' => ' kWh', 'actionable' => false],
+                ['ident' => 'SimTable', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simtable',
+                 'label' => 'Tarifvergleich (Tabelle)', 'varType' => 3, 'actionable' => false],
+                ['ident' => 'SimZones', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:simzones',
+                 'label' => 'Zeitzonen (Tabelle)', 'varType' => 3, 'actionable' => false],
+                // --- Simulator: der Schieberegler und sein Ergebnis ---
+                // T_SETPOINT, nicht T_SWITCH: ein Schalter zwingt den Wert auf boolesch,
+                // aus 1500 kWh wurde dabei stillschweigend eine 1.
+                ['ident' => 'ShiftKwh', 'type' => ControlContract::T_SETPOINT, 'role' => 'energy:shiftkwh',
+                 'label' => 'Verschieben', 'varType' => 1, 'profile' => 'HSEN.ShiftKwh',
+                 'min' => 0, 'max' => 3000, 'step' => 50, 'unit' => ' kWh', 'actionable' => true],
+                ['ident' => 'ShiftSaving', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:shiftsaving',
+                 'label' => 'Ersparnis dadurch', 'varType' => 2, 'unit' => ' EUR', 'actionable' => false],
+                ['ident' => 'ShiftNote', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:shiftnote',
+                 'label' => 'Was das bedeutet', 'varType' => 3, 'actionable' => false],
+                ['ident' => 'ShiftTable', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:shifttable',
+                 'label' => 'Verschiebung je Tarif (Tabelle)', 'varType' => 3, 'actionable' => false],
                 ['ident' => 'ActiveLoads', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:activeloads',
                  'label' => 'Verschobene Lasten', 'varType' => 1, 'actionable' => false],
                 ['ident' => 'LoadsJson', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:loads',
@@ -152,6 +179,7 @@ class EnergyManager extends EntityModule
                 ['op' => 'setSim',       'label' => 'Simulation: Zaehler und Tarife festlegen'],
                 ['op' => 'simTarife',    'label' => 'Simulation: Tarife vergleichen'],
                 ['op' => 'simVerschiebung', 'label' => 'Simulation: Was braechte Lastverschiebung?'],
+                ['op' => 'refreshSim',   'label' => 'Simulation: Anzeigen auffrischen'],
                 ['op' => 'setArmed',     'label' => 'Scharfschalten / Schatten-Modus'],
             ],
 
@@ -180,6 +208,14 @@ class EnergyManager extends EntityModule
 
     public function ApplyChanges()
     {
+        // Der Schieberegler braucht ein eigenes Profil: 0 bis 3.000 kWh in 50er-Schritten.
+        // Feiner waere Schein-Genauigkeit - die Groesse ist eine Abschaetzung, kein Messwert.
+        if (!@\IPS_VariableProfileExists('HSEN.ShiftKwh')) {
+            @\IPS_CreateVariableProfile('HSEN.ShiftKwh', 1);
+            @\IPS_SetVariableProfileText('HSEN.ShiftKwh', '', ' kWh');
+            @\IPS_SetVariableProfileValues('HSEN.ShiftKwh', 0, 3000, 50);
+            @\IPS_SetVariableProfileIcon('HSEN.ShiftKwh', 'Energy');
+        }
         parent::ApplyChanges();
         $iv = max(60, (int) $this->ReadPropertyInteger('Interval'));
         $this->SetTimerInterval(self::TIMER_TICK, $iv * 1000);
@@ -219,6 +255,11 @@ class EnergyManager extends EntityModule
 
     protected function applyControl(Control $c, $value, ActionContext $ctx): void
     {
+        if ($c->ident === 'ShiftKwh') {
+            $this->SetValue('ShiftKwh', max(0, min(3000, (int) $value)));
+            $this->RefreshShift();
+            return;
+        }
         if ($c->ident === 'Automatic' && !(bool) $value) {
             $this->entscheidungMerken('Lastverschiebung aus', 'Handbedienung', [], true, null, 'Energie');
         }
@@ -866,6 +907,9 @@ class EnergyManager extends EntityModule
                 return $this->mgmtSimTarife($args);
             case 'simVerschiebung':
                 return $this->mgmtSimVerschiebung($args);
+            case 'refreshSim':
+                $this->RefreshSim();
+                return ['ok' => true];
 
             case 'computeProbe': {
                 $e = $this->bewerten();
@@ -1238,6 +1282,104 @@ class EnergyManager extends EntityModule
         return ['ok' => true, 'von' => $von, 'nach' => $nach, 'kwh' => $kwh,
                 'ergebnis' => $out,
                 'hinweis' => 'Bei einem Festtarif ist die Ersparnis null - dann ist Verschieben wirkungslos.'];
+    }
+
+    /**
+     * Die Simulation in Anzeigevariablen spiegeln.
+     *
+     * Die LVB-Seite liest Tabellen ueber ?api=tabledata aus einer Variablen - deshalb
+     * landen Tarifvergleich und Zonen hier als Zeilen-Array, nicht als verschachteltes
+     * JSON. Erste Zeile ist die Kopfzeile, so erwartet es das Tabellen-Widget.
+     *
+     * Bewusst NICHT im Takt: die Tarifrechnung liest 8.760 Stundenwerte je Zaehlpunkt aus
+     * dem Archiv. Das dauert zwar nur Bruchteile einer Sekunde, aendert sich aber hoechstens
+     * taeglich - alle fuenf Minuten waere reine Verschwendung.
+     */
+    public function RefreshSim(): void
+    {
+        $x = $this->mgmtSimTarife([]);
+        if (empty($x['ok'])) {
+            $this->setReflect('SimTable', json_encode([['Hinweis'], [(string) ($x['error'] ?? 'Simulation nicht möglich')]]));
+            return;
+        }
+        $eur = static fn($v) => number_format((float) $v, 0, ',', '.') . ' €';
+
+        // --- Tarifvergleich ---
+        $zeilen = [['Tarif', 'Energie', 'Entgelte', 'Gesamt', 'ct/kWh', 'ggü. heute']];
+        $ist = null; $bester = null;
+        foreach ($x['gesamtkosten'] as $t) {
+            if ($bester === null) { $bester = $t; }
+            $roh = null;
+            foreach ($x['gesamt']['tarife'] as $g) { if ($g['id'] === $t['id']) { $roh = $g; break; } }
+            $diff = $roh['differenz'] ?? null;
+            if ($diff !== null && abs((float) $diff) < 0.01) { $ist = $t; }
+            $zeilen[] = [
+                $t['name'],
+                $eur($t['energie']),
+                $eur($t['entgelte']),
+                $eur($t['gesamt']),
+                number_format((float) $t['je_kwh_ct'], 2, ',', '.'),
+                $diff === null ? '' : (abs((float) $diff) < 0.01 ? 'heute'
+                    : (($diff > 0 ? '+' : '−') . number_format(abs((float) $diff), 0, ',', '.') . ' €')),
+            ];
+        }
+        $this->setReflect('SimTable', json_encode($zeilen, JSON_UNESCAPED_UNICODE));
+
+        // --- Zeitzonen ---
+        $zz = [['Zone', 'Anteil', 'kWh/Jahr']];
+        $summe = array_sum($x['gesamt']['zonen']);
+        foreach ($x['gesamt']['zonen'] as $n => $v) {
+            $zz[] = [$n, $summe > 0 ? number_format(100 * $v / $summe, 1, ',', '.') . ' %' : '—',
+                     number_format((float) $v, 0, ',', '.')];
+        }
+        $this->setReflect('SimZones', json_encode($zz, JSON_UNESCAPED_UNICODE));
+
+        // --- Kennzahlen ---
+        $this->setReflect('SimKwh', round((float) $x['gesamt']['kwh_jahr'], 0));
+        if ($bester !== null) {
+            $this->setReflect('SimCostBest', round((float) $bester['gesamt'], 0));
+            $this->setReflect('SimBestName', (string) $bester['name']);
+        }
+        if ($ist !== null) {
+            $this->setReflect('SimCostToday', round((float) $ist['gesamt'], 0));
+            $this->setReflect('SimSaving', round((float) $ist['gesamt'] - (float) ($bester['gesamt'] ?? 0), 0));
+        }
+        $this->RefreshShift();
+    }
+
+    /**
+     * Was der Schieberegler gerade bedeutet.
+     *
+     * Zeigt BEIDES: was die Verschiebung beim besten Zeitzonentarif braechte und dass sie
+     * bei einem Festtarif exakt nichts bringt. Nur den guenstigen Fall zu zeigen waere ein
+     * Versprechen, das der eigene Tarif nicht haelt.
+     */
+    public function RefreshShift(): void
+    {
+        $kwh = (int) @$this->GetValue('ShiftKwh');
+        $x = $this->mgmtSimVerschiebung(['kwh' => $kwh, 'von' => 'Day', 'nach' => 'Sun']);
+        if (empty($x['ok'])) { return; }
+
+        $zeilen = [['Tarif', 'Ersparnis', 'je kWh']];
+        $beste = 0.0;
+        foreach ($x['ergebnis'] as $e) {
+            $beste = max($beste, (float) $e['ersparnis']);
+            $zeilen[] = [$e['tarif'],
+                number_format((float) $e['ersparnis'], 0, ',', '.') . ' €',
+                ((float) $e['ersparnis'] > 0) ? number_format((float) $e['je_kwh_ct'], 2, ',', '.') . ' ct' : '—'];
+        }
+        $this->setReflect('ShiftTable', json_encode($zeilen, JSON_UNESCAPED_UNICODE));
+        $this->setReflect('ShiftSaving', round($beste, 0));
+
+        // Das Sonnenfenster umfasst Apr-Aug, taeglich 12-16 Uhr: 153 Tage x 4 h = 612 Stunden.
+        $stunden = 612;
+        $kw = $kwh > 0 ? $kwh / $stunden : 0.0;
+        $this->setReflect('ShiftNote', $kwh <= 0
+            ? 'Nichts verschoben.'
+            : sprintf('%s kWh im Sonnenfenster (%d Stunden im Jahr) bedeuten %s kW Dauerlast in jeder einzelnen Stunde.%s',
+                number_format($kwh, 0, ',', '.'), $stunden,
+                number_format($kw, 1, ',', '.'),
+                $kw > 4.0 ? ' Das ist mit Haushaltsgeräten nicht zu schaffen.' : ''));
     }
 
     /** Lasten als lesbare Spiegelvariable im Baum. */
