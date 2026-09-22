@@ -1305,28 +1305,37 @@ class EnergyManager extends EntityModule
         $eur = static fn($v) => number_format((float) $v, 0, ',', '.') . ' €';
 
         // --- Tarifvergleich ---
-        $zeilen = [['Tarif', 'Energie', 'Entgelte', 'Gesamt', 'ct/kWh', 'ggü. heute']];
-        $ist = null; $bester = null;
+        //
+        // Spaltenwahl mit Absicht: die Spalte "Status" traegt guenstiger/heute/teurer und
+        // wird vom Tabellen-Widget zu einem farbigen Chip, "Anteil" mit Prozentzeichen zu
+        // einem Balken. So entsteht die Grafik aus den Daten selbst, ohne ein weiteres
+        // Widget. Die Entgelte stehen NICHT je Zeile: sie sind fuer alle Anbieter gleich,
+        // eine Spalte mit 22 gleichen Werten traegt nichts bei.
+        $zeilen = [['Tarif', 'Status', 'Anteil', 'Energie', 'Gesamt', 'ct/kWh', 'ggü. heute']];
+        $ist = null; $bester = null; $teuerster = 0.0;
+        foreach ($x['gesamtkosten'] as $t) { $teuerster = max($teuerster, (float) $t['gesamt']); }
         foreach ($x['gesamtkosten'] as $t) {
             if ($bester === null) { $bester = $t; }
             $roh = null;
             foreach ($x['gesamt']['tarife'] as $g) { if ($g['id'] === $t['id']) { $roh = $g; break; } }
             $diff = $roh['differenz'] ?? null;
-            if ($diff !== null && abs((float) $diff) < 0.01) { $ist = $t; }
+            $heute = ($diff !== null && abs((float) $diff) < 0.01);
+            if ($heute) { $ist = $t; }
             $zeilen[] = [
                 $t['name'],
+                $diff === null ? '' : ($heute ? 'heute' : ((float) $diff < 0 ? 'günstiger' : 'teurer')),
+                $teuerster > 0 ? number_format(100 * (float) $t['gesamt'] / $teuerster, 0, ',', '.') . ' %' : '',
                 $eur($t['energie']),
-                $eur($t['entgelte']),
                 $eur($t['gesamt']),
                 number_format((float) $t['je_kwh_ct'], 2, ',', '.'),
-                $diff === null ? '' : (abs((float) $diff) < 0.01 ? 'heute'
+                $diff === null ? '' : ($heute ? '—'
                     : (($diff > 0 ? '+' : '−') . number_format(abs((float) $diff), 0, ',', '.') . ' €')),
             ];
         }
         $this->setReflect('SimTable', json_encode($zeilen, JSON_UNESCAPED_UNICODE));
 
         // --- Zeitzonen ---
-        $zz = [['Zone', 'Anteil', 'kWh/Jahr']];
+        $zz = [['Zone', 'Anteil', 'kWh/Jahr']];   // "Anteil" mit % wird zum Balken
         $summe = array_sum($x['gesamt']['zonen']);
         foreach ($x['gesamt']['zonen'] as $n => $v) {
             $zz[] = [$n, $summe > 0 ? number_format(100 * $v / $summe, 1, ',', '.') . ' %' : '—',
@@ -1360,13 +1369,16 @@ class EnergyManager extends EntityModule
         $x = $this->mgmtSimVerschiebung(['kwh' => $kwh, 'von' => 'Day', 'nach' => 'Sun']);
         if (empty($x['ok'])) { return; }
 
-        $zeilen = [['Tarif', 'Ersparnis', 'je kWh']];
+        $zeilen = [['Tarif', 'Status', 'Anteil', 'Ersparnis', 'je kWh']];
         $beste = 0.0;
+        foreach ($x['ergebnis'] as $e) { $beste = max($beste, (float) $e['ersparnis']); }
         foreach ($x['ergebnis'] as $e) {
-            $beste = max($beste, (float) $e['ersparnis']);
+            $wirkt = ((float) $e['ersparnis'] > 0);
             $zeilen[] = [$e['tarif'],
+                $wirkt ? 'günstiger' : 'ruht',
+                ($wirkt && $beste > 0) ? number_format(100 * (float) $e['ersparnis'] / $beste, 0, ',', '.') . ' %' : '0 %',
                 number_format((float) $e['ersparnis'], 0, ',', '.') . ' €',
-                ((float) $e['ersparnis'] > 0) ? number_format((float) $e['je_kwh_ct'], 2, ',', '.') . ' ct' : '—'];
+                $wirkt ? number_format((float) $e['je_kwh_ct'], 2, ',', '.') . ' ct' : '—'];
         }
         $this->setReflect('ShiftTable', json_encode($zeilen, JSON_UNESCAPED_UNICODE));
         $this->setReflect('ShiftSaving', round($beste, 0));
