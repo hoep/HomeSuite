@@ -837,10 +837,19 @@ final class PlexProvider implements IMediaProvider, IMediaWritable
     /**
      * Eine Aufnahme bestellen.
      *
-     * UNGEPRUEFT: auf dieser Anlage existiert keine einzige Aufnahmeregel, an der sich die
-     * erwartete Form ablesen liesse. Die Parameter folgen dem, was der Plex-Server bei
-     * /media/subscriptions dokumentiert; ob der Aufruf durchgeht, muss der erste echte
-     * Versuch zeigen. Bewusst so gekennzeichnet, statt Verlaesslichkeit vorzutaeuschen.
+     * FUNKTIONIERT NICHT - und das ist gemessen, nicht vermutet.
+     *
+     * Am 22.09.2026 zweimal versucht: einmal mit den Parametern im Rumpf, einmal komplett
+     * in der Adresszeile samt vollem prefs-Satz (minVideoQuality, replaceLowerQuality,
+     * recordPartials, startOffsetMinutes, endOffsetMinutes, lineupChannel, removeDuplicates,
+     * onlyFirstRuns, comskip, oneShot) und params[airDate]. Beide Male antwortet der Server
+     * mit einem nackten HTTP 400 - ohne zu sagen, welches Feld ihm fehlt. Angelegt wurde
+     * nichts (/media/subscriptions blieb bei size 0).
+     *
+     * Die erwartete Form laesst sich nicht erraten: es existiert keine einzige Regel auf
+     * diesem Server, an der man sie ablesen koennte. Was sie klaeren wuerde, ist EIN
+     * mitgeschnittener Aufruf der Plex-Oberflaeche beim Programmieren einer Aufnahme.
+     * Bis dahin gibt diese Methode den Fehlercode ehrlich zurueck, statt Erfolg zu melden.
      *
      * @param string $programId Sendung aus der Programmzeitschrift (ratingKey)
      * @param array  $opt       'typ' => 'single'|'series', 'section' => Zielbibliothek
