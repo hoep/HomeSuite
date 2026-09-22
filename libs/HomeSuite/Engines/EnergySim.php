@@ -1,0 +1,169 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Hoep\HomeSuite\Engines;
+
+/**
+ * EnergySim — was kostet der Strom, und was braechte es, ihn anders zu verbrauchen.
+ *
+ * Reine Rechenmaschine: sie kennt weder Symcon noch das Archiv. Wer sie fuettert, liefert
+ * eine Stundenreihe; sie liefert Zonen, Kosten und Vergleiche zurueck. Das ist Absicht -
+ * so laesst sich dieselbe Rechnung mit gemessenen Daten, mit Hochrechnungen oder mit
+ * erfundenen Reihen pruefen, ohne dass irgendwo eine Nebenwirkung entsteht.
+ *
+ * WARUM Zonen und nicht nur ein Preis: ein Zeitzonentarif berechnet dieselbe Kilowattstunde
+ * je nach Uhrzeit verschieden - bei Ökostrom Smart zwischen 5,00 und 17,04 ct. Erst diese
+ * Spanne macht Lastverschiebung ueberhaupt zu einer wirtschaftlichen Frage. Bei einem
+ * Festtarif bleibt sie eine Illusion, und die Simulation zeigt das offen, statt es zu
+ * verschweigen.
+ *
+ * WARUM nur die Energie verglichen wird: das Netzentgelt ist je Netzgebiet gleich, egal bei
+ * wem man kauft. Es in den Anbietervergleich zu mischen, verkleinert die Unterschiede
+ * kuenstlich und laesst jeden Wechsel harmloser aussehen, als er ist.
+ */
+final class EnergySim
+{
+    /** Vorgabe-Zonen: der Zeitzonentarif der Energie AG (Ökostrom Smart). */
+    public const ZONEN_SMART = [
+        ['name' => 'Sun',     'monate' => [4, 5, 6, 7, 8], 'stunden' => [12, 16], 'tage' => 'alle'],
+        ['name' => 'Night',   'stunden' => [22, 6],  'tage' => 'werktag'],
+        ['name' => 'Weekend', 'tage' => 'wochenende'],
+        ['name' => 'Day',     'stunden' => [6, 22],  'tage' => 'werktag'],
+    ];
+
+    private function __construct()
+    {
+    }
+
+    /**
+     * Eine Stunde einer Zone zuordnen. Die ERSTE passende gewinnt.
+     *
+     * Die Reihenfolge ist Teil der Tarifdefinition, nicht Zufall: das Sonnenfenster liegt
+     * mitten in der Tageszone und muss deshalb vorher geprueft werden, sonst verschwindet
+     * der guenstigste Preis des Tarifs stillschweigend im teuersten.
+     */
+    public static function zoneVon(int $ts, array $zonen): string
+    {
+        $monat = (int) date('n', $ts);
+        $wtag  = (int) date('N', $ts);   // 1=Mo .. 7=So
+        $std   = (int) date('G', $ts);
+        foreach ($zonen as $z) {
+            if (isset($z['monate']) && !in_array($monat, (array) $z['monate'], true)) {
+                continue;
+            }
+            $tage = (string) ($z['tage'] ?? 'alle');
+            if ($tage === 'werktag'    && $wtag >= 6) { continue; }
+            if ($tage === 'wochenende' && $wtag <  6) { continue; }
+            if (isset($z['stunden'])) {
+                [$a, $b] = array_map('intval', $z['stunden']);
+                // Ueber Mitternacht hinweg (22..6) ist die Pruefung umgekehrt.
+                $drin = ($a <= $b) ? ($std >= $a && $std < $b) : ($std >= $a || $std < $b);
+                if (!$drin) { continue; }
+            }
+            return (string) $z['name'];
+        }
+        return 'Rest';
+    }
+
+    /**
+     * Stundenreihe in Zonen-Kilowattstunden verwandeln.
+     *
+     * @param array $stunden Liste aus ['ts' => Unixzeit, 'kwh' => float]
+     * @return array{zonen:array<string,float>, gesamt:float, stunden:int, von:int, bis:int}
+     */
+    public static function zonen(array $stunden, array $zonenDef): array
+    {
+        $z = ['Rest' => 0.0];
+        foreach ($zonenDef as $d) { $z[(string) $d['name']] = 0.0; }
+        $gesamt = 0.0; $n = 0; $von = PHP_INT_MAX; $bis = 0;
+        foreach ($stunden as $h) {
+            $kwh = (float) ($h['kwh'] ?? 0);
+            $ts  = (int) ($h['ts'] ?? 0);
+            if ($ts <= 0) { continue; }
+            $n++;
+            $von = min($von, $ts); $bis = max($bis, $ts);
+            if ($kwh <= 0) { continue; }
+            $z[self::zoneVon($ts, $zonenDef)] += $kwh;
+            $gesamt += $kwh;
+        }
+        if ($z['Rest'] <= 0.0) { unset($z['Rest']); }
+        return ['zonen' => $z, 'gesamt' => $gesamt, 'stunden' => $n,
+                'von' => ($von === PHP_INT_MAX ? 0 : $von), 'bis' => $bis];
+    }
+
+    /**
+     * Jahreskosten eines Tarifs fuer eine Zonenverteilung.
+     *
+     * @param array $tarif ['name', 'grundEur' (je Monat), und entweder 'ct' (fest) oder
+     *                     'zonen' => [Zonenname => ct]]
+     * @param float $faktor Hochrechnung auf ein Jahr (1.0 = die Reihe deckt genau ein Jahr)
+     */
+    public static function kosten(array $zonen, array $tarif, float $faktor = 1.0): array
+    {
+        $grund = ((float) ($tarif['grundEur'] ?? 0)) * 12.0;
+        $arbeit = 0.0; $offen = [];
+        foreach ($zonen as $name => $kwh) {
+            if (isset($tarif['zonen'][$name])) {
+                $arbeit += $kwh * ((float) $tarif['zonen'][$name]) / 100.0;
+            } elseif (isset($tarif['ct'])) {
+                $arbeit += $kwh * ((float) $tarif['ct']) / 100.0;
+            } else {
+                // Eine Zone ohne Preis waere eine stille Untertreibung der Kosten.
+                $offen[] = $name;
+            }
+        }
+        return ['name' => (string) ($tarif['name'] ?? '?'),
+                'arbeit' => $arbeit * $faktor, 'grund' => $grund,
+                'gesamt' => $arbeit * $faktor + $grund,
+                'unvollstaendig' => $offen];
+    }
+
+    /** Mehrere Tarife vergleichen, guenstigster zuerst, mit Abstand zum Ist-Tarif. */
+    public static function vergleich(array $zonen, array $tarife, float $faktor = 1.0, string $istId = ''): array
+    {
+        $out = [];
+        foreach ($tarife as $t) {
+            $k = self::kosten($zonen, $t, $faktor);
+            $k['id'] = (string) ($t['id'] ?? '');
+            $out[] = $k;
+        }
+        $ist = null;
+        foreach ($out as $k) { if ($k['id'] === $istId) { $ist = $k['gesamt']; } }
+        foreach ($out as &$k) { $k['differenz'] = ($ist === null) ? null : round($k['gesamt'] - $ist, 2); }
+        unset($k);
+        usort($out, static fn($a, $b) => $a['gesamt'] <=> $b['gesamt']);
+        return $out;
+    }
+
+    /**
+     * Was braechte es, Verbrauch von einer Zone in eine andere zu verschieben?
+     *
+     * Beantwortet die Frage, die hinter jeder Lastverschiebung steht: lohnt sie sich
+     * ueberhaupt, und ab wieviel. Bei einem Festtarif kommt hier null heraus - und das ist
+     * die ehrlichste Antwort, die eine Simulation geben kann.
+     *
+     * @param float $kwh Menge, die jaehrlich umzieht
+     */
+    public static function verschiebung(array $zonen, array $tarif, string $vonZone, string $nachZone,
+                                        float $kwh, float $faktor = 1.0): array
+    {
+        $vorher = self::kosten($zonen, $tarif, $faktor);
+        $moeglich = min($kwh, (float) ($zonen[$vonZone] ?? 0) * $faktor);
+        $neu = $zonen;
+        // In der Reihe steht die ungerechnete Menge - deshalb durch den Faktor zurueck.
+        $neu[$vonZone]  = max(0.0, ($neu[$vonZone] ?? 0) - $moeglich / max(0.0001, $faktor));
+        $neu[$nachZone] = ($neu[$nachZone] ?? 0) + $moeglich / max(0.0001, $faktor);
+        $nachher = self::kosten($neu, $tarif, $faktor);
+        return [
+            'tarif'      => $vorher['name'],
+            'von'        => $vonZone, 'nach' => $nachZone,
+            'gewuenscht' => round($kwh, 1),
+            'moeglich'   => round($moeglich, 1),
+            'vorher'     => round($vorher['gesamt'], 2),
+            'nachher'    => round($nachher['gesamt'], 2),
+            'ersparnis'  => round($vorher['gesamt'] - $nachher['gesamt'], 2),
+            'je_kwh_ct'  => $moeglich > 0 ? round(100 * ($vorher['gesamt'] - $nachher['gesamt']) / $moeglich, 2) : 0.0,
+        ];
+    }
+}

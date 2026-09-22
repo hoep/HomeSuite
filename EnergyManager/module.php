@@ -148,6 +148,10 @@ class EnergyManager extends EntityModule
                 ['op' => 'listLoads',    'label' => 'Verschiebbare Lasten lesen'],
                 ['op' => 'setLoads',     'label' => 'Verschiebbare Lasten setzen'],
                 ['op' => 'computeProbe', 'label' => 'Was wuerde jetzt geschehen? (Trockenlauf)'],
+                ['op' => 'getSim',       'label' => 'Simulation: Konfiguration lesen'],
+                ['op' => 'setSim',       'label' => 'Simulation: Zaehler und Tarife festlegen'],
+                ['op' => 'simTarife',    'label' => 'Simulation: Tarife vergleichen'],
+                ['op' => 'simVerschiebung', 'label' => 'Simulation: Was braechte Lastverschiebung?'],
                 ['op' => 'setArmed',     'label' => 'Scharfschalten / Schatten-Modus'],
             ],
 
@@ -836,6 +840,24 @@ class EnergyManager extends EntityModule
                 $this->refreshMirrors();
                 return ['ok' => true, 'loads' => $this->lasten()];
             }
+            case 'getSim':
+                return ['ok' => true, 'sim' => $this->simCfg()];
+            case 'setSim': {
+                $cur = $this->simCfg();
+                foreach (['zaehler', 'tarife', 'zonen'] as $k) {
+                    if (isset($args[$k]) && is_array($args[$k])) { $cur[$k] = array_values($args[$k]); }
+                }
+                if (isset($args['tage']))     { $cur['tage'] = max(7, (int) $args['tage']); }
+                if (isset($args['istTarif'])) { $cur['istTarif'] = (string) $args['istTarif']; }
+                $this->store()->patch('config', ['sim' => $cur]);
+                @\IPS_ApplyChanges($this->InstanceID);
+                return ['ok' => true, 'sim' => $this->simCfg()];
+            }
+            case 'simTarife':
+                return $this->mgmtSimTarife($args);
+            case 'simVerschiebung':
+                return $this->mgmtSimVerschiebung($args);
+
             case 'computeProbe': {
                 $e = $this->bewerten();
                 // Die Schaltliste als Klartext - im Trockenlauf will man lesen, WAS
@@ -861,6 +883,184 @@ class EnergyManager extends EntityModule
             default:
                 return parent::mgmt($op, $args, $ctx);
         }
+    }
+
+    // ==================================================================
+    // Simulation
+    //
+    // Sie beantwortet zwei Fragen, und beide gehoeren zusammen:
+    //   1. Welcher Tarif waere fuer DIESEN Haushalt der guenstigste?
+    //   2. Was braechte es, Verbrauch zeitlich zu verschieben?
+    //
+    // Gerechnet wird auf den ECHTEN Stundenwerten der Netzzaehler, nicht auf einem
+    // Musterhaushalt. Der Unterschied ist erheblich: Vergleichsportale rechnen mit 3.100
+    // kWh, hier sind es ueber 13.000 auf zwei Zaehlpunkten - und der Grundpreis faellt
+    // zweimal an.
+    //
+    // Die Rechnung selbst steht in EnergySim und kennt kein Symcon. Hier wird nur gelesen
+    // und uebergeben.
+    // ==================================================================
+
+    /** Vorgabetarife: gemessen aus den Preisblaettern, Stand 22.09.2026, brutto. */
+    private const SIM_TARIFE = [
+        ['id' => 'loyal',    'name' => 'Energie AG Ökostrom Loyal',   'ct' => 14.90, 'grundEur' => 4.62],
+        ['id' => 'feelgood', 'name' => 'Energie AG Feel Good',        'ct' => 12.00, 'grundEur' => 5.28],
+        ['id' => 'komfort',  'name' => 'Energie AG Ökostrom Komfort', 'ct' => 19.46, 'grundEur' => 4.62],
+        ['id' => 'direkt',   'name' => 'Energie AG Ökostrom Direkt',  'ct' => 19.56, 'grundEur' => 7.26],
+        ['id' => 'voltino',  'name' => 'Voltino Fix 26 (Neukunde)',   'ct' => 14.11, 'grundEur' => 4.34],
+        ['id' => 'voltino2', 'name' => 'Voltino Fix 26 (danach)',     'ct' => 19.08, 'grundEur' => 5.88],
+        ['id' => 'smart',    'name' => 'Energie AG Ökostrom Smart',   'grundEur' => 5.18,
+         'zonen' => ['Sun' => 5.00, 'Day' => 17.04, 'Night' => 13.22, 'Weekend' => 13.05]],
+    ];
+
+    private function simCfg(): array
+    {
+        $c = $this->cfg();
+        $s = (isset($c['sim']) && is_array($c['sim'])) ? $c['sim'] : [];
+        $z = [];
+        foreach ((array) ($s['zaehler'] ?? []) as $e) {
+            $vid = (int) ($e['vid'] ?? 0);
+            if ($vid > 0) {
+                $z[] = ['vid' => $vid, 'name' => (string) ($e['name'] ?? \IPS_GetName($vid))];
+            }
+        }
+        return [
+            'zaehler'   => $z,
+            'tarife'    => (isset($s['tarife']) && is_array($s['tarife']) && $s['tarife'] !== [])
+                           ? $s['tarife'] : self::SIM_TARIFE,
+            'zonen'     => (isset($s['zonen']) && is_array($s['zonen']) && $s['zonen'] !== [])
+                           ? $s['zonen'] : \Hoep\HomeSuite\Engines\EnergySim::ZONEN_SMART,
+            'tage'      => max(7, (int) ($s['tage'] ?? 365)),
+            'istTarif'  => (string) ($s['istTarif'] ?? ''),
+        ];
+    }
+
+    /** Die Archiv-Instanz, ohne sie fest zu verdrahten. */
+    private function archivId(): int
+    {
+        $l = @\IPS_GetInstanceListByModuleID('{43192F0B-135B-4CE7-A0A7-1475603F3060}');
+        return is_array($l) && $l ? (int) $l[0] : 0;
+    }
+
+    /**
+     * Stundenreihe eines Leistungszaehlers als Kilowattstunden.
+     *
+     * Gelesen werden STUNDENMITTEL in Watt; ein Stundenmittel mal eine Stunde ergibt
+     * Wattstunden. Negative Werte (Einspeisung) zaehlen als null - dieser Zaehler misst
+     * den Bezug, und ein Anbieter verrechnet nichts Negatives.
+     *
+     * @return array<int,array{ts:int,kwh:float}>
+     */
+    private function stundenreihe(int $vid, int $tage): array
+    {
+        $ac = $this->archivId();
+        if ($ac <= 0 || $vid <= 0 || !@\AC_GetLoggingStatus($ac, $vid)) {
+            return [];
+        }
+        $a = @\AC_GetAggregatedValues($ac, $vid, 0, time() - $tage * 86400, time(), 0);
+        if (!is_array($a)) {
+            return [];
+        }
+        $out = [];
+        foreach ($a as $h) {
+            $w = (float) ($h['Avg'] ?? 0);
+            $out[] = ['ts' => (int) ($h['TimeStamp'] ?? 0), 'kwh' => $w > 0 ? $w / 1000.0 : 0.0];
+        }
+        return $out;
+    }
+
+    /**
+     * Tarifvergleich je Zaehlpunkt und in Summe.
+     *
+     * Der Vergleich umfasst NUR die Energie. Das Netzentgelt ist im Netzgebiet fuer alle
+     * Anbieter gleich; es mitzurechnen wuerde die Unterschiede kleiner erscheinen lassen,
+     * als sie sind.
+     */
+    private function mgmtSimTarife(array $args): array
+    {
+        $cfg  = $this->simCfg();
+        $tage = max(7, (int) ($args['tage'] ?? $cfg['tage']));
+        if ($cfg['zaehler'] === []) {
+            return ['ok' => false, 'error' => 'keine Zaehler konfiguriert (setSim)'];
+        }
+        $E = \Hoep\HomeSuite\Engines\EnergySim::class;
+        $gesamtZonen = []; $proZaehler = []; $faktor = 1.0;
+        foreach ($cfg['zaehler'] as $z) {
+            $reihe = $this->stundenreihe((int) $z['vid'], $tage);
+            if ($reihe === []) {
+                $proZaehler[] = ['zaehler' => $z['name'], 'fehler' => 'keine Archivdaten'];
+                continue;
+            }
+            $auf = $E::zonen($reihe, $cfg['zonen']);
+            // Deckt die Reihe weniger als ein Jahr, wird hochgerechnet - und gesagt, dass.
+            $faktor = $auf['stunden'] > 0 ? (8760.0 / $auf['stunden']) : 1.0;
+            $proZaehler[] = [
+                'zaehler'      => $z['name'],
+                'kwh'          => round($auf['gesamt'], 0),
+                'kwh_jahr'     => round($auf['gesamt'] * $faktor, 0),
+                'stunden'      => $auf['stunden'],
+                'zonen'        => array_map(static fn($v) => round($v, 0), $auf['zonen']),
+                'tarife'       => $E::vergleich($auf['zonen'], $cfg['tarife'], $faktor, $cfg['istTarif']),
+            ];
+            foreach ($auf['zonen'] as $n => $v) {
+                $gesamtZonen[$n] = ($gesamtZonen[$n] ?? 0.0) + $v;
+            }
+        }
+        return ['ok' => true,
+                'zeitraum_tage'  => $tage,
+                'hochgerechnet'  => round($faktor, 3),
+                'je_zaehlpunkt'  => $proZaehler,
+                'gesamt' => [
+                    'kwh_jahr' => round(array_sum($gesamtZonen) * $faktor, 0),
+                    'zonen'    => array_map(static fn($v) => round($v * $faktor, 0), $gesamtZonen),
+                    'tarife'   => $E::vergleich($gesamtZonen, $this->simTarifeDoppelt($cfg), $faktor, $cfg['istTarif']),
+                ],
+                'hinweis' => 'Nur Energiekosten. Netzentgelt und Abgaben sind anbieterunabhaengig.'];
+    }
+
+    /**
+     * Fuer die Gesamtsicht faellt der Grundpreis je ZAEHLPUNKT an, nicht je Haushalt.
+     *
+     * Das zu uebersehen ist der haeufigste Fehler beim Vergleich mit zwei Vertraegen - und
+     * er verzerrt gerade bei einem kleinen zweiten Zaehler erheblich.
+     */
+    private function simTarifeDoppelt(array $cfg): array
+    {
+        $n = max(1, count($cfg['zaehler']));
+        $out = [];
+        foreach ($cfg['tarife'] as $t) {
+            $t['grundEur'] = ((float) ($t['grundEur'] ?? 0)) * $n;
+            $out[] = $t;
+        }
+        return $out;
+    }
+
+    /** Was braechte es, Verbrauch aus einer Zone in eine andere zu verschieben? */
+    private function mgmtSimVerschiebung(array $args): array
+    {
+        $cfg  = $this->simCfg();
+        $tage = max(7, (int) ($args['tage'] ?? $cfg['tage']));
+        $kwh  = (float) ($args['kwh'] ?? 500);
+        $von  = (string) ($args['von'] ?? 'Day');
+        $nach = (string) ($args['nach'] ?? 'Sun');
+        $E = \Hoep\HomeSuite\Engines\EnergySim::class;
+        $zonen = []; $faktor = 1.0;
+        foreach ($cfg['zaehler'] as $z) {
+            $reihe = $this->stundenreihe((int) $z['vid'], $tage);
+            if ($reihe === []) { continue; }
+            $auf = $E::zonen($reihe, $cfg['zonen']);
+            $faktor = $auf['stunden'] > 0 ? (8760.0 / $auf['stunden']) : 1.0;
+            foreach ($auf['zonen'] as $n => $v) { $zonen[$n] = ($zonen[$n] ?? 0.0) + $v; }
+        }
+        if ($zonen === []) { return ['ok' => false, 'error' => 'keine Archivdaten']; }
+        $out = [];
+        foreach ($this->simTarifeDoppelt($cfg) as $t) {
+            $out[] = $E::verschiebung($zonen, $t, $von, $nach, $kwh, $faktor);
+        }
+        usort($out, static fn($a, $b) => $b['ersparnis'] <=> $a['ersparnis']);
+        return ['ok' => true, 'von' => $von, 'nach' => $nach, 'kwh' => $kwh,
+                'ergebnis' => $out,
+                'hinweis' => 'Bei einem Festtarif ist die Ersparnis null - dann ist Verschieben wirkungslos.'];
     }
 
     /** Lasten als lesbare Spiegelvariable im Baum. */
