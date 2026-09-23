@@ -3,10 +3,18 @@
     "name": "AudioZoneBridged",
     "type": 3,
     "vendor": "Hoep",
-    "aliases": ["AudioZoneBridged", "HSAUX", "HomeSuite Audio (Bridge)"],
+    "aliases": [
+        "AudioZoneBridged",
+        "HSAUX",
+        "HomeSuite Audio (Bridge)"
+    ],
     "url": "https://github.com/hoep/HomeSuite",
     "prefix": "HSAUX",
-    "parentRequirements": ["{D7E6F5C4-B3A2-4190-8E7D-6C5B4A392817}"],
+    "parentRequirements": [
+        "{D7E6F5C4-B3A2-4190-8E7D-6C5B4A392817}"
+    ],
     "childRequirements": [],
-    "implemented": []
+    "implemented": [
+        "{D7E6F5C4-B3A2-4190-8E7D-6C5B4A392817}"
+    ]
 }

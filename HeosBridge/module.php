@@ -74,7 +74,9 @@ class HeosBridge extends IPSModule
         if (IPS_HasChanges($pid)) {
             @IPS_ApplyChanges($pid);
         }
-        $this->RegisterParent(self::CLIENTSOCK); // Statuswechsel abonnieren
+        // Statuswechsel des Sockets abonnieren (MessageSink -> Handshake). RegisterParent()
+        // gibt es in IPSModule nicht; der Aufruf brach ApplyChanges mit einem fatalen Fehler ab.
+        $this->RegisterMessage($pid, IM_CHANGESTATUS);
     }
 
     private function onReady(): void
@@ -108,8 +110,10 @@ class HeosBridge extends IPSModule
         if (!isset($data->Buffer)) {
             return '';
         }
-        // Rohbytes rekonstruieren; HEOS liefert UTF-8-JSON.
-        $chunk = (string) $data->Buffer;
+        // Rohbytes rekonstruieren; HEOS liefert UTF-8-JSON. Symcon reicht I/O-Daten als
+        // Latin-1-Bytes in einem UTF-8-String durch - ohne Rueckwandlung wurde aus "Buero"
+        // mit Umlaut "B\u00c3\u00bcro".
+        $chunk = mb_convert_encoding((string) $data->Buffer, 'ISO-8859-1', 'UTF-8');
         $buf   = $this->ReadAttributeString('RxBuffer') . $chunk;
 
         // Zeilenweise (\r\n bzw. \n) framen.
@@ -155,7 +159,8 @@ class HeosBridge extends IPSModule
 
     private function toSocket(string $s): void
     {
-        $this->SendDataToParent(json_encode(['DataID' => self::IO_TX, 'Buffer' => $s]));
+        // Gegenrichtung zu ReceiveData: Rohbytes als Latin-1 in den UTF-8-Puffer heben.
+        $this->SendDataToParent(json_encode(['DataID' => self::IO_TX, 'Buffer' => mb_convert_encoding($s, 'UTF-8', 'ISO-8859-1')]));
     }
 
     /** @return array<int,array> bekannte Player (aus get_players). */
