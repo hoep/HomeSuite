@@ -1,0 +1,13 @@
+{
+    "id": "{D973AC1D-ECCF-4020-874E-FBAAE3A8C7E7}",
+    "name": "Rental",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["Rental", "Vermietung", "Ferienwohnung", "Auslastung"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSRT",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "hidden": false
+}
