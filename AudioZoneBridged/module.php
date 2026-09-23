@@ -130,6 +130,16 @@ class AudioZoneBridged extends AudioZone
             $this->setReflect('Mute', $st->mute);
         } elseif (strpos($cmd, 'play_state') !== false || strpos($cmd, 'state_changed') !== false) {
             $this->setReflect('PlayState', $st->playState);
+            // HEOS hat keinen Netzschalter, den man abfragen koennte: EIN heisst "spielt" -
+            // dieselbe Regel wie bei Sonos im Abruf. Eine gebundene Steckdose hat Vorrang.
+            // Ohne diese Zeile stand die Zone dauerhaft auf "aus", obwohl Musik lief.
+            $pw = (array) ($this->cfg()['power'] ?? []);
+            if ((string) ($pw['mode'] ?? 'playstop') === 'var' && (int) ($pw['varId'] ?? 0) > 0) {
+                $pv = @\GetValue((int) $pw['varId']);
+                $this->setReflect('Power', (bool) ($pw['invert'] ?? false) ? !$pv : (bool) $pv);
+            } else {
+                $this->setReflect('Power', (bool) $st->playState);
+            }
         } elseif (strpos($cmd, 'progress') !== false) {
             $this->setReflect('PositionTime', $this->hms($st->positionSec));
             $this->setReflect('Duration', $this->hms($st->durationSec));
