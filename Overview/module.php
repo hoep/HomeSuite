@@ -57,6 +57,12 @@ class Overview extends IPSModule
     {
         parent::ApplyChanges();
         $this->ensureProfile();
+        // Tagesprotokoll der tatsaechlich ausgefuehrten Aktionen. Als Variable, nicht als
+        // Attribut: nachtraeglich eingefuehrte Attribute fehlen laufenden Instanzen bis zum
+        // naechsten Neustart.
+        $this->RegisterVariableString('EventLog', 'Protokoll heute (JSON)', '', 95);
+        @IPS_SetHidden((int) $this->GetIDForIdent('EventLog'), true);
+        $this->watch();
         $this->SetTimerInterval('Update', max(15, $this->ReadPropertyInteger('IntervalSeconds')) * 1000);
         $this->SetStatus(102);
     }
@@ -66,6 +72,7 @@ class Overview extends IPSModule
     public function Update(): bool
     {
         $now = time();
+        if ((int) date('i') % 10 === 0) { $this->watch(); }
         $byMod = $this->instancesByModule();
         $hints = [];
         foreach ([$this->hintsShading($byMod), $this->hintsIrrigation($byMod), $this->hintsClimate($byMod),
@@ -91,6 +98,89 @@ class Overview extends IPSModule
         $this->put('HintWorst', $worst);
         $this->put('State', json_encode($state, JSON_UNESCAPED_UNICODE));
         return true;
+    }
+
+    /** Welche Variablen beobachtet werden: [ident => [Bereich, Art]] je Modul. */
+    private const WATCH = [
+        'ShadingDevice'     => ['Position' => ['Beschattung', 'pos']],
+        'LightDevice'       => ['Power' => ['Licht', 'onoff']],
+        'AudioZone'         => ['PlayState' => ['Musik', 'play']],
+        'AudioZoneBridged'  => ['PlayState' => ['Musik', 'play']],
+        'IrrigationCircuit' => ['Running' => ['Bewässerung', 'run']],
+        'ClimateZone'       => ['Power' => ['Klima', 'onoff']],
+        'Presence'          => ['Residents' => ['Anwesenheit', 'people']],
+    ];
+
+    /** Variablen der Fachmodule fuer das Tagesprotokoll anmelden (idempotent). */
+    private function watch(): void
+    {
+        $want = [];
+        foreach ($this->instancesByModule() as $mod => $ids) {
+            if (!isset(self::WATCH[$mod])) { continue; }
+            foreach ($ids as $iid) {
+                foreach (self::WATCH[$mod] as $ident => $_) {
+                    $v = @IPS_GetObjectIDByIdent($ident, $iid);
+                    if ($v) { $want[(int) $v] = true; }
+                }
+            }
+        }
+        $have = [];
+        foreach ($this->GetMessageList() as $sender => $msgs) {
+            if (in_array(VM_UPDATE, (array) $msgs, true)) { $have[(int) $sender] = true; }
+        }
+        foreach (array_diff_key($have, $want) as $v => $_) { $this->UnregisterMessage($v, VM_UPDATE); }
+        foreach (array_diff_key($want, $have) as $v => $_) { $this->RegisterMessage($v, VM_UPDATE); }
+    }
+
+    public function MessageSink($TimeStamp, $SenderID, $Message, $Data)
+    {
+        if ($Message !== VM_UPDATE || empty($Data[1])) { return; }   // nur echte Aenderungen
+        $vid = (int) $SenderID;
+        $iid = (int) @IPS_GetParent($vid);
+        if ($iid <= 0 || !@IPS_InstanceExists($iid)) { return; }
+        $mod = IPS_GetInstance($iid)['ModuleInfo']['ModuleName'];
+        $ident = (string) IPS_GetObject($vid)['ObjectIdent'];
+        if (!isset(self::WATCH[$mod][$ident])) { return; }
+        [$area, $art] = self::WATCH[$mod][$ident];
+        $new = $Data[0]; $old = $Data[2] ?? null;
+        $entries = [];
+        $room = $this->roomName($iid);
+        switch ($art) {
+            case 'pos':
+                $p = (int) $new;
+                $entries[] = [$area, $p <= 0 ? 'Rollos auf' : ($p >= 100 ? 'Rollos zu' : "Rollos auf $p %"), $room];
+                break;
+            case 'onoff':
+                $entries[] = [$area, $area . ($new ? ' an' : ' aus'), $room];
+                break;
+            case 'play':
+                $entries[] = [$area, $new ? 'Musik startet' : 'Musik stoppt', $room];
+                break;
+            case 'run':
+                $entries[] = [$area, $this->nice($iid) . ($new ? ' bewässert' : ': Bewässerung fertig'), ''];
+                break;
+            case 'people':
+                $a = array_filter(array_map('trim', explode(',', (string) $new)));
+                $b = array_filter(array_map('trim', explode(',', (string) $old)));
+                foreach (array_diff($a, $b) as $n) { $entries[] = [$area, "$n angekommen", '']; }
+                foreach (array_diff($b, $a) as $n) { $entries[] = [$area, "$n gegangen", '']; }
+                break;
+        }
+        if (!$entries) { return; }
+        $site = $this->siteOf($iid);
+        $t = (int) $TimeStamp ?: time();
+        if (!IPS_SemaphoreEnter('HSOV_Log_' . $this->InstanceID, 2000)) { return; }
+        try {
+            $lv = $this->GetIDForIdent('EventLog');
+            $log = json_decode((string) GetValue($lv), true) ?: [];
+            $day0 = mktime(0, 0, 0);
+            $log = array_values(array_filter($log, function ($e) use ($day0) { return (int) ($e[0] ?? 0) >= $day0; }));
+            foreach ($entries as [$ar, $title, $name]) { $log[] = [$t, $site, $ar, $title, $name]; }
+            if (count($log) > 1500) { $log = array_slice($log, -1500); }
+            SetValue($lv, json_encode($log, JSON_UNESCAPED_UNICODE));
+        } finally {
+            IPS_SemaphoreLeave('HSOV_Log_' . $this->InstanceID);
+        }
     }
 
     public function GetState(): string
@@ -455,13 +545,30 @@ class Overview extends IPSModule
             }
         }
 
+        // TV-Aufnahmen der Receiver (Tabelle: Sender, Beginn "TT.MM. HH:MM", Ende, Titel ...)
+        foreach ($by['EnigmaReceiver'] ?? [] as $rid) {
+            $rows = $this->jsonVar($rid, 'TimerListe');
+            foreach (array_slice($rows, 1) as $r) {
+                if (!is_array($r) || !preg_match('/(\d{1,2})\.(\d{1,2})\.\s+(\d{1,2}):(\d{2})/', (string) ($r[1] ?? ''), $m)) { continue; }
+                $t = mktime((int) $m[3], (int) $m[4], 0, (int) $m[2], (int) $m[1]);
+                $sender = preg_match('/alt="([^"]*)"/', (string) ($r[0] ?? ''), $sm) ? $sm[1] : strip_tags((string) ($r[0] ?? ''));
+                $add($t, $this->siteOf($rid), 'TV', 'Aufnahme: ' . (string) ($r[3] ?? ''), '',
+                    trim($sender . ' · bis ' . (string) ($r[2] ?? '')), '');
+            }
+        }
+        // Was TATSAECHLICH geschah (Tagesprotokoll)
+        foreach (json_decode((string) $this->GetValue('EventLog'), true) ?: [] as $e) {
+            [$t, $site, $area, $title, $name] = $e + [0, 0, '', '', ''];
+            $add((int) $t, (int) $site, (string) $area, (string) $title, (string) $name, '', 'done');
+        }
+
         $ev = [];
         foreach ($grp as $k => $g) {
             $n = count($g['names']);
             $title = $g['title'];
             $detail = $g['detail'];
             if ($n > 1) {
-                $title .= ' · ' . $n . ($g['area'] === 'Heizung' ? ' Räume' : ($g['area'] === 'Beschattung' ? ' Rollos' : ''));
+                $title .= ' · ' . $n . ($g['area'] === 'Heizung' || $g['area'] === 'Licht' || $g['area'] === 'Musik' || $g['area'] === 'Klima' ? ' Räume' : ($g['area'] === 'Beschattung' ? ' Rollos' : ''));
                 $detail = trim($this->kurzliste($g['names']) . ($detail !== '' ? ' · ' . $detail : ''));
             } elseif ($n === 1) {
                 $detail = trim($g['names'][0] . ($detail !== '' ? ' · ' . $detail : ''));
