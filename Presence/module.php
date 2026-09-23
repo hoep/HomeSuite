@@ -38,6 +38,7 @@ class Presence extends IPSModule
         $this->RegisterPropertyBoolean('DetectGuests', true);
         $this->RegisterPropertyString('GuestPattern', PresenceEngine::DEFAULT_GUEST_PATTERN);
         $this->RegisterPropertyString('IgnoreNames', '');     // Komma-Liste: nie als Gast zaehlen
+        $this->RegisterPropertyString('ResidentNames', '');   // wer HIER wohnt (Komma); leer = Ferienhaus
 
         $this->RegisterAttributeString('State', '{}');
 
@@ -103,11 +104,12 @@ class Presence extends IPSModule
             'ignore'       => $this->csv($this->ReadPropertyString('IgnoreNames')),
             'guestWlan'    => $this->ReadPropertyBoolean('DetectGuests') ? $guestWlan : 0,
             'guestHosts'   => $this->ReadPropertyBoolean('DetectGuests') ? $guestHosts : [],
+            'residents'    => $this->csv($this->ReadPropertyString('ResidentNames')),
         ]);
         $this->WriteAttributeString('State', json_encode($res['state']));
 
         $this->setIfChanged('Occupancy', (int) $res['occupancy']);
-        $this->setIfChanged('Anyone', in_array($res['occupancy'], [1, 2, 3], true));
+        $this->setIfChanged('Anyone', in_array($res['occupancy'], [1, 2, 3, 5], true));
         $this->setIfChanged('Residents', implode(', ', $res['present']));
         $this->setIfChanged('Guests', (int) $res['guests']);
         $this->setIfChanged('GuestList', implode(', ', $res['guestNames']));
@@ -144,7 +146,7 @@ class Presence extends IPSModule
         return $vid ? (bool) GetValue((int) $vid) : false;
     }
 
-    /** Belegung als Zahl (0 leer, 1 Bewohner, 2 Gaeste, 3 beides, 4 unbekannt). */
+    /** Belegung als Zahl (0 leer, 1 Bewohner, 2 Gaeste, 3 Bewohner/Familie und Gaeste, 4 unbekannt, 5 Familie). */
     public function GetOccupancy(): int
     {
         return (int) $this->GetValue('Occupancy');
@@ -177,6 +179,8 @@ class Presence extends IPSModule
                     'Anwesenheit eines Standorts. Die Instanz unter den Standort (HSSP, Ebene Haus) haengen.'],
                 ['type' => 'SelectCategory', 'name' => 'HostsCategory',
                  'caption' => 'Ordner mit den Host-Variablen des Routers (Ident = MAC)'],
+                ['type' => 'ValidationTextBox', 'name' => 'ResidentNames',
+                 'caption' => 'Bewohner dieses Standorts (Namen aus der Liste, Komma; leer = Ferienhaus: alle sind Familie)'],
                 ['type' => 'SelectObject', 'name' => 'GuestCountVid',
                  'caption' => 'Gaestenetz: Ordner mit dessen Host-Variablen (oder Anzahl-Variable)'],
                 ['type' => 'List', 'name' => 'Persons', 'caption' => 'Bewohner',
@@ -212,12 +216,13 @@ class Presence extends IPSModule
         if (!IPS_VariableProfileExists('HSPR.Belegung')) {
             IPS_CreateVariableProfile('HSPR.Belegung', 1);
         }
-        IPS_SetVariableProfileValues('HSPR.Belegung', 0, 4, 1);
+        IPS_SetVariableProfileValues('HSPR.Belegung', 0, 5, 1);
         IPS_SetVariableProfileAssociation('HSPR.Belegung', 0, 'Leer', '', 0x7F8C8D);
         IPS_SetVariableProfileAssociation('HSPR.Belegung', 1, 'Bewohner', '', 0x00CDAB);
         IPS_SetVariableProfileAssociation('HSPR.Belegung', 2, 'Gäste', '', 0x5AA9FF);
         IPS_SetVariableProfileAssociation('HSPR.Belegung', 3, 'Bewohner und Gäste', '', 0x9B7BFF);
         IPS_SetVariableProfileAssociation('HSPR.Belegung', 4, 'Unbekannt', '', 0xFFB45C);
+        IPS_SetVariableProfileAssociation('HSPR.Belegung', 5, 'Familie', '', 0x7FD4C1);
     }
 
     /** Je Person eine Variable "Name da"; verwaiste bleiben stehen (Archiv), werden aber nicht mehr geschrieben. */

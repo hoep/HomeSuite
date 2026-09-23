@@ -28,6 +28,7 @@ final class PresenceEngine
     public const OCC_GUESTS  = 2;  // nur Gaeste
     public const OCC_BOTH    = 3;  // Bewohner und Gaeste
     public const OCC_UNKNOWN = 4;  // Router meldet nichts Aktuelles
+    public const OCC_FAMILY  = 5;  // bekannte Personen, die hier NICHT wohnen (Besuch, Ferienhaus)
 
     /** Geraetenamen, die typischerweise ein Telefon oder eine Uhr bezeichnen (Gaeste-Erkennung). */
     public const DEFAULT_GUEST_PATTERN = '/iphone|galaxy|pixel|oneplus|huawei|xiaomi|redmi|android|phone|watch|-von-|mate-|nord/i';
@@ -161,12 +162,20 @@ final class PresenceEngine
         $guestsPresent = $guestSeen > 0 && ($now - $guestSeen) <= $hold;
 
         $present = array_keys(array_filter($out));
+        // Rollen: sind Bewohner genannt, zaehlen nur sie als "Bewohner"; andere bekannte
+        // Personen sind "Familie" (Besuch). Ohne Liste (Ferienhaus) ist jede bekannte
+        // Person Familie.
+        $resNames = array_map([self::class, 'norm'], (array) ($opt['residents'] ?? []));
+        $hasRes = false;
+        foreach ($present as $pn) {
+            if (in_array(self::norm($pn), $resNames, true)) { $hasRes = true; }
+        }
         if (!$fresh && $present === [] && !$guestsPresent) {
             $occ = self::OCC_UNKNOWN;
         } elseif ($present && $guestsPresent) {
             $occ = self::OCC_BOTH;
         } elseif ($present) {
-            $occ = self::OCC_RESIDENT;
+            $occ = $hasRes ? self::OCC_RESIDENT : self::OCC_FAMILY;
         } elseif ($guestsPresent) {
             $occ = self::OCC_GUESTS;
         } else {
