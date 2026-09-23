@@ -450,15 +450,18 @@ class Overview extends IPSModule
             if ($name !== '') { $grp[$k]['names'][] = $name; }
         };
 
+        // NUR SCHARFE DOMAENEN. Ein Plan im Schatten-Modus schaltet nichts - ihn in den
+        // Fahrplan zu schreiben hiesse, Aktionen zu behaupten, die nie stattfinden
+        // (23.09.2026: "22:00 Klima Planwechsel" in einer Klima-Domaene, die aus war).
         // Beschattung: jeder Wechsel des aktiven Wochenplans
-        foreach ($by['ShadingDevice'] ?? [] as $iid) {
+        foreach ($this->armedList($by, 'Shading', 'ShadingDevice', 'HSSH') as $iid) {
             foreach ($this->weekChanges($this->manageJson('HSSH', $iid, 'getSchedule'), $day0, $to) as [$t, $val]) {
                 $title = $val <= 0 ? 'Rollos auf' : ($val >= 100 ? 'Rollos zu' : "Rollos auf $val %");
                 $add($t, $this->siteOf($iid), 'Beschattung', $title, $this->roomName($iid));
             }
         }
         // Heizung: Plan der aktuell gewaehlten Anwesenheitsvariante
-        foreach ($by['HeatingZone'] ?? [] as $iid) {
+        foreach ($this->armedList($by, 'Heating', 'HeatingZone', 'HSHT') as $iid) {
             $st = $this->state('HSHT', $iid);
             $pres = isset($st['Presence']) ? (int) $st['Presence'] : -1;
             $plan = function_exists('HSHT_GetScheduleJson') ? json_decode((string) @HSHT_GetScheduleJson($iid, $pres), true) : null;
@@ -467,7 +470,7 @@ class Overview extends IPSModule
             }
         }
         // Bewaesserung: Fenster des Wochenplans, mit Sperrgrund
-        foreach ($by['IrrigationCircuit'] ?? [] as $iid) {
+        foreach ($this->armedList($by, 'Irrigation', 'IrrigationCircuit', 'HSIR') as $iid) {
             $st = $this->state('HSIR', $iid);
             $dur = function_exists('HSIR_GetEffectiveMinutes') ? (int) @HSIR_GetEffectiveMinutes($iid) : 0;
             $skip = !empty($st['RainBlocked']);
@@ -479,16 +482,16 @@ class Overview extends IPSModule
                     $skip && !$past ? ('entfällt' . ($grund !== '' ? ' · ' . $grund : '')) : ($dur > 0 ? "$dur min" : ''), $skip && !$past ? 'skip' : '');
             }
         }
-        // Klima: naechster Planwechsel
-        foreach ($by['ClimateZone'] ?? [] as $iid) {
+        // Klima: naechster Planwechsel - nur scharf UND mit aktivem Zeitplan
+        foreach ($this->armedList($by, 'Climate', 'ClimateZone', 'HSAC') as $iid) {
             $st = $this->state('HSAC', $iid);
             $t = (int) ($st['NextChange'] ?? 0);
-            if ($t >= $now) { $add($t, $this->siteOf($iid), 'Klima', 'Klima Planwechsel', $this->roomName($iid)); }
+            if ($t >= $now && ((int) ($st['PlanMode'] ?? 0) !== 0 || !empty($st['Scheduled']))) { $add($t, $this->siteOf($iid), 'Klima', 'Klima Planwechsel', $this->roomName($iid)); }
         }
         // Licht-Automatik (Hub): aktive Zeit- und Sonnenregeln
         foreach ($by['HomeSuite Hub'] ?? [] as $hub) {
             $la = function_exists('HSH_Manage') ? json_decode((string) @HSH_Manage($hub, json_encode(['op' => 'lightAutoGet'])), true) : null;
-            if (!is_array($la) || empty($la['automationEnabled'])) { continue; }
+            if (!is_array($la) || empty($la['automationEnabled']) || !$this->armed($by, 'Light')) { continue; }
             $sun = (array) ($la['sun'] ?? []);
             foreach ((array) ($la['rules'] ?? []) as $r) {
                 if (empty($r['enabled']) || ($r['type'] ?? '') !== 'schedule') { continue; }
@@ -515,6 +518,10 @@ class Overview extends IPSModule
             $p = IPS_GetParent($eid);
             if (@IPS_InstanceExists($p) && in_array(IPS_GetInstance($p)['ModuleInfo']['ModuleName'], $covered, true)) { continue; }
             $site = $this->siteOf($p);
+            if ($this->isHomeSuite($p)) {
+                $gate = ['AudioZone' => 'Audio', 'AudioZoneBridged' => 'Audio', 'LightDevice' => 'Light', 'PoolController' => 'Pool', 'MowerDevice' => 'Mower'][IPS_GetInstance($p)['ModuleInfo']['ModuleName']] ?? '';
+                if ($gate !== '' && !$this->armed($by, $gate)) { continue; }
+            }
             $area = $this->isHomeSuite($p) ? $this->domainLabel($p) : $this->areaGuess($p, (string) IPS_GetName($eid));
             if ((int) $e['EventType'] === 2) {
                 foreach ([0, 1] as $plus) {
@@ -564,8 +571,19 @@ class Overview extends IPSModule
             $add((int) $t, (int) $site, (string) $area, (string) $title, (string) $name, '', 'done');
         }
 
+        // Geplantes, das schon als erledigt im Protokoll steht, nicht doppelt zeigen
+        // (Plan 19:10 "Rollos zu" + Protokoll 19:10 "Rollos zu").
+        $done = [];
+        foreach ($grp as $g) {
+            if ($g['kind'] === 'done') { $done[] = [$g['site'], $g['area'], $g['t']]; }
+        }
         $ev = [];
         foreach ($grp as $k => $g) {
+            if ($g['kind'] === '' && $g['t'] <= time()) {
+                foreach ($done as [$ds, $da, $dt]) {
+                    if ($ds === $g['site'] && $da === $g['area'] && abs($dt - $g['t']) <= 1200) { continue 2; }
+                }
+            }
             $n = count($g['names']);
             $title = $g['title'];
             $detail = $g['detail'];
@@ -615,6 +633,41 @@ class Overview extends IPSModule
         return $n;
     }
 
+    /**
+     * Scharf-Stufe einer Domaene im Hub: Arm<Domain>Mode 0 = alle Schatten, 1 = je Geraet,
+     * 2 = alle scharf (Vorrang); ohne Mode-Variable der alte Schalter Arm<Domain>.
+     * Rueckgabe 0, 1 oder 2.
+     */
+    private function armMode(array $by, string $domain): int
+    {
+        foreach ($by['HomeSuite Hub'] ?? [] as $hub) {
+            $m = @IPS_GetObjectIDByIdent('Arm' . $domain . 'Mode', $hub);
+            if ($m) { return max(0, min(2, (int) GetValue($m))); }
+            $v = @IPS_GetObjectIDByIdent('Arm' . $domain, $hub);
+            if ($v) { return GetValue($v) ? 2 : 0; }
+        }
+        return 2;
+    }
+
+    /** Domaene ueberhaupt aktiv (nicht "alle Schatten")? */
+    private function armed(array $by, string $domain): bool
+    {
+        return $this->armMode($by, $domain) > 0;
+    }
+
+    /** Geraete einer Domaene, die wirklich schalten (Stufe 2 alle, Stufe 1 nur die scharfen). */
+    private function armedList(array $by, string $domain, string $module, string $pfx): array
+    {
+        $mode = $this->armMode($by, $domain);
+        $ids = $by[$module] ?? [];
+        if ($mode === 0) { return []; }
+        if ($mode === 2) { return $ids; }
+        return array_values(array_filter($ids, function ($iid) use ($pfx) {
+            $c = $this->manageJson($pfx, $iid, 'getConfig');
+            return !empty($c['config']['armed']);
+        }));
+    }
+
     /** JSON-Antwort einer Verwaltungsoperation (PREFIX_Manage). */
     private function manageJson(string $pfx, int $iid, string $op): array
     {
@@ -636,6 +689,17 @@ class Overview extends IPSModule
     {
         $week = $plan['week'] ?? null;
         if (!is_array($week) || count($week) < 7) { return []; }
+        // Sonnengebundene Grenzen ("anchor":"sunset","offset":10): das gespeicherte "end"
+        // ist nur die Ersatzzeit. Gezaehlt wird Sonnenereignis + Versatz (23.09.2026: Plan
+        // zeigte 20:29, gefahren wurde um 19:10 = Sonnenuntergang 19:00 + 10 min).
+        $sun = (array) ($plan['sunEvents'] ?? []);
+        $endOf = function (array $slot) use ($sun) {
+            $a = (string) ($slot['anchor'] ?? '');
+            if ($a !== '' && isset($sun[$a])) {
+                return max(0, min(1440, (int) $sun[$a] + (int) ($slot['offset'] ?? 0)));
+            }
+            return (int) ($slot['end'] ?? 0);
+        };
         $out = [];
         for ($d0 = $from; $d0 <= $to; $d0 += 86400) {
             $wd = (int) date('N', $d0) - 1;
@@ -650,7 +714,7 @@ class Overview extends IPSModule
                     if ($t >= $from && $t <= $to) { $out[] = [$t, $val]; }
                 }
                 $prevVal = $val;
-                $start = (int) ($slot['end'] ?? 0);
+                $start = $endOf((array) $slot);
             }
         }
         return $out;
