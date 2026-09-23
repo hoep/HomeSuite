@@ -1,0 +1,13 @@
+{
+    "id": "{3BBD5AD6-C20B-497C-BC31-68CEE18B9877}",
+    "name": "Presence",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["Presence", "Anwesenheit", "Belegung"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSPR",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "hidden": false
+}

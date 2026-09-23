@@ -1,0 +1,198 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Hoep\HomeSuite\Engines;
+
+/**
+ * Anwesenheit aus Netzwerk-Hosts — reine Entscheidungslogik, ohne Symcon-Aufrufe.
+ *
+ * Eingang ist eine Liste von Hosts, wie sie ein Router meldet (Name, MAC, online), dazu
+ * die Personen mit ihren Merkmalen. Ausgang ist, wer da ist, ob Gaeste da sind und
+ * welche Belegung daraus folgt.
+ *
+ * Drei Dinge, die diese Logik bewusst so macht:
+ *
+ *  1. Personen werden an MEHREREN Merkmalen erkannt (MAC-Liste UND Geraetename).
+ *     Telefone wechseln ihre WLAN-Adresse (private Adressen, Rotation); wer nur an einer
+ *     MAC haengt, gilt nach einem Wechsel still und dauerhaft als abwesend.
+ *  2. Eine HALTEZEIT ueberbrueckt Funkpausen. Ein Telefon im Ruhezustand verlaesst das WLAN
+ *     fuer Minuten; ohne Haltezeit flackert die Anwesenheit im Takt des Akkusparens.
+ *  3. Ein veralteter Router ist KEINE Abwesenheit. Meldet der Router laenger nichts, ist der
+ *     Zustand unbekannt — sonst schaltet ein Netzausfall das Haus auf "leer".
+ */
+final class PresenceEngine
+{
+    public const OCC_EMPTY   = 0;  // niemand da
+    public const OCC_RESIDENT = 1; // nur Bewohner
+    public const OCC_GUESTS  = 2;  // nur Gaeste
+    public const OCC_BOTH    = 3;  // Bewohner und Gaeste
+    public const OCC_UNKNOWN = 4;  // Router meldet nichts Aktuelles
+
+    /** Geraetenamen, die typischerweise ein Telefon oder eine Uhr bezeichnen (Gaeste-Erkennung). */
+    public const DEFAULT_GUEST_PATTERN = '/iphone|galaxy|pixel|oneplus|huawei|xiaomi|redmi|android|phone|watch|-von-|mate-|nord/i';
+
+    /**
+     * @param array $hosts   Liste [{name, mac, online:bool, updated:int}] — name darf den
+     *                       angehaengten " (IP)"-Teil tragen, er wird abgeschnitten.
+     * @param array $persons Liste [{name, macs:[..], names:[..], ext:?bool}] — ext ist ein
+     *                       bereits fertig ermittelter Anwesenheitswert aus anderer Quelle
+     *                       (null = keine andere Quelle).
+     * @param array $state   Vorzustand: {seen:{person:ts}, guestSeen:ts}
+     * @param array $opt     {now, holdSec, staleSec, guestPattern, ignore:[..], guestWlan:int}
+     * @return array {persons:{name:bool}, present:[names], guests:int, guestNames:[..],
+     *                occupancy:int, fresh:bool, state:{...}}
+     */
+    public static function evaluate(array $hosts, array $persons, array $state, array $opt): array
+    {
+        $now      = (int) ($opt['now'] ?? time());
+        $hold     = max(0, (int) ($opt['holdSec'] ?? 1200));
+        $stale    = max(60, (int) ($opt['staleSec'] ?? 1800));
+        $pattern  = (string) ($opt['guestPattern'] ?? self::DEFAULT_GUEST_PATTERN);
+        $ignore   = array_map([self::class, 'norm'], (array) ($opt['ignore'] ?? []));
+        $guestWlan = max(0, (int) ($opt['guestWlan'] ?? 0));
+
+        $seen = is_array($state['seen'] ?? null) ? $state['seen'] : [];
+        $guestSeen = (int) ($state['guestSeen'] ?? 0);
+
+        // Frische: der juengste Host-Zeitstempel sagt, ob der Router ueberhaupt noch meldet.
+        $newest = 0;
+        foreach ($hosts as $h) {
+            $newest = max($newest, (int) ($h['updated'] ?? 0));
+        }
+        $fresh = $hosts === [] ? false : ($now - $newest) <= $stale;
+
+        // Hosts normalisieren
+        $list = [];
+        foreach ($hosts as $h) {
+            $list[] = [
+                'name'   => self::hostName((string) ($h['name'] ?? '')),
+                'mac'    => self::mac((string) ($h['mac'] ?? '')),
+                'online' => (bool) ($h['online'] ?? false)
+                            && ($now - (int) ($h['updated'] ?? 0)) <= $stale,
+            ];
+        }
+
+        // Personen
+        $out = [];
+        $claimed = [];   // Hosts, die einer Person gehoeren (zaehlen nie als Gast)
+        foreach ($persons as $p) {
+            $pn = trim((string) ($p['name'] ?? ''));
+            if ($pn === '') {
+                continue;
+            }
+            $macs  = array_filter(array_map([self::class, 'mac'], (array) ($p['macs'] ?? [])));
+            $names = array_filter(array_map([self::class, 'norm'], (array) ($p['names'] ?? [])));
+            $onlineNow = false;
+            foreach ($list as $i => $h) {
+                $hit = ($h['mac'] !== '' && in_array($h['mac'], $macs, true))
+                    || self::nameMatches($h['name'], $names);
+                if ($hit) {
+                    $claimed[$i] = true;
+                    if ($h['online']) {
+                        $onlineNow = true;
+                    }
+                }
+            }
+            $ext = $p['ext'] ?? null;
+            if ($ext === true) {
+                $onlineNow = true;
+            }
+            if ($onlineNow) {
+                $seen[$pn] = $now;
+            }
+            $last = (int) ($seen[$pn] ?? 0);
+            $out[$pn] = $last > 0 && ($now - $last) <= $hold;
+            // Ohne frischen Router und ohne zweite Quelle wissen wir nichts Neues: dann
+            // bleibt der letzte Stand stehen, statt die Person abzumelden.
+            if (!$fresh && $ext === null && $last > 0) {
+                $out[$pn] = (bool) ($state['last'][$pn] ?? $out[$pn]);
+            }
+        }
+
+        // Gaeste: fremde Telefone/Uhren im Hauptnetz plus alles im Gaeste-WLAN
+        $guestNames = [];
+        foreach ($list as $i => $h) {
+            if (!$h['online'] || isset($claimed[$i]) || $h['name'] === '') {
+                continue;
+            }
+            if (in_array(self::norm($h['name']), $ignore, true)) {
+                continue;
+            }
+            if (@preg_match($pattern, $h['name']) === 1) {
+                $guestNames[] = $h['name'];
+            }
+        }
+        $guestNames = array_values(array_unique($guestNames));
+        $guestsNow = count($guestNames) + $guestWlan;
+        if ($guestsNow > 0) {
+            $guestSeen = $now;
+        }
+        $guestsPresent = $guestSeen > 0 && ($now - $guestSeen) <= $hold;
+
+        $present = array_keys(array_filter($out));
+        if (!$fresh && $present === [] && !$guestsPresent) {
+            $occ = self::OCC_UNKNOWN;
+        } elseif ($present && $guestsPresent) {
+            $occ = self::OCC_BOTH;
+        } elseif ($present) {
+            $occ = self::OCC_RESIDENT;
+        } elseif ($guestsPresent) {
+            $occ = self::OCC_GUESTS;
+        } else {
+            $occ = self::OCC_EMPTY;
+        }
+
+        return [
+            'persons'    => $out,
+            'present'    => $present,
+            'guests'     => $guestsNow,
+            'guestNames' => $guestNames,
+            'guestsPresent' => $guestsPresent,
+            'occupancy'  => $occ,
+            'fresh'      => $fresh,
+            'state'      => ['seen' => $seen, 'guestSeen' => $guestSeen, 'last' => $out],
+        ];
+    }
+
+    /** "PeteriPhone (10.30.10.8)" -> "PeteriPhone" */
+    public static function hostName(string $n): string
+    {
+        return trim((string) preg_replace('/\s*\([^)]*\)\s*$/', '', $n));
+    }
+
+    /** MAC in Grossbuchstaben ohne Trenner; alles andere als 12 Hexzeichen -> ''. */
+    public static function mac(string $m): string
+    {
+        $m = strtoupper((string) preg_replace('/[^0-9A-Fa-f]/', '', $m));
+        return strlen($m) === 12 ? $m : '';
+    }
+
+    public static function norm(string $s): string
+    {
+        return mb_strtolower(trim($s));
+    }
+
+    /** Name exakt (ohne Gross/Klein) oder als Muster mit * . */
+    private static function nameMatches(string $host, array $names): bool
+    {
+        $h = self::norm($host);
+        if ($h === '') {
+            return false;
+        }
+        foreach ($names as $n) {
+            if ($n === '') {
+                continue;
+            }
+            if (strpos($n, '*') !== false) {
+                $rx = '/^' . str_replace('\*', '.*', preg_quote($n, '/')) . '$/u';
+                if (preg_match($rx, $h) === 1) {
+                    return true;
+                }
+            } elseif ($h === $n) {
+                return true;
+            }
+        }
+        return false;
+    }
+}

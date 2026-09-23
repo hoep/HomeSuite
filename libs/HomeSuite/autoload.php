@@ -98,6 +98,7 @@ $__hs_files = [
     'Engines/LightAutomation.php',     // Licht-Automatik (L7-L11): reine Entscheidungslogik
     'Engines/Contacts.php',            // markenuebergreifende Tuer-/Fensterkontakt-Erkennung
     'Engines/EnergySim.php',           // Tarif- und Lastverschiebungs-Simulation (reine Rechnung)
+    'Engines/PresenceEngine.php',      // Anwesenheit/Belegung aus Router-Hosts (reine Entscheidungslogik)
     'Engines/SunTimes.php',            // Sonnen-Ereigniszeiten (date_sun_info) fuer verankerte Grenzen
     'Engines/RadioNow.php',            // Radio "was laeuft" (ICY-Titel + Song-Cover, IPSSonos-frei)
     'Engines/MediaProviders.php',      // Registry/Factory der Inhalte-Provider (renderer-unabhaengig)
