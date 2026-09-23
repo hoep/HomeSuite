@@ -75,6 +75,13 @@ class Rental extends IPSModule
     {
         parent::ApplyChanges();
         $this->ensureProfiles();
+        // Anzeige-Tabellen (Zeilenformat wie das Tabellen-Widget). Hier statt in Create(),
+        // damit bestehende Instanzen sie ohne Neuanlage bekommen.
+        $this->RegisterVariableString('Summary', 'Kurzfassung', '', 15);
+        $this->RegisterVariableString('CalendarTable', 'Kalender (Tabelle)', '', 91);
+        $this->RegisterVariableString('CalendarPrevTable', 'Kalender Vorjahr (Tabelle)', '', 92);
+        $this->RegisterVariableString('BookingsTable', 'Buchungen (Tabelle)', '', 93);
+        $this->RegisterVariableString('FreeTable', 'Noch buchbar (Tabelle)', '', 94);
         $this->ensureLogging();
         $this->SetTimerInterval('Sample', 60 * 1000);
         $min = max(0, $this->ReadPropertyInteger('IntervalMinutes'));
@@ -106,16 +113,7 @@ class Rental extends IPSModule
         $this->Sample();
         $year = (int) date('Y');
         $values = $this->dayValues($year);
-        $eng = new OccupancyEngine($values, $year, $this->ReadPropertyString('SeasonStart'),
-            $this->ReadPropertyString('SeasonEnd'), $this->prices(), [
-                'vacant_max'   => $this->ReadPropertyFloat('VacantMax'),
-                'service_max'  => $this->ReadPropertyFloat('ServiceMax'),
-                'occupied_min' => $this->ReadPropertyFloat('OccupiedMin'),
-            ], [
-                'mode'    => $this->ReadPropertyString('Mode'),
-                'gapMax'  => $this->ReadPropertyInteger('GapMax'),
-                'minStay' => $this->ReadPropertyInteger('MinStay'),
-            ]);
+        $eng = $this->engine($values, $year, (int) date('z'));
         $st = $eng->stats();
         $rv = $eng->revenue();
 
@@ -143,8 +141,10 @@ class Rental extends IPSModule
         }
         $fmt = function (array $w) use ($eng) {
             return ['von' => $eng->date($w['start']), 'bis' => $eng->date($w['end']), 'tage' => $w['days']]
-                + (isset($w['price']) ? ['preis' => $w['price'], 'vermutet' => (bool) $w['presumed']] : []);
+                + (isset($w['price']) ? ['preis' => $w['price'], 'vermutet' => (bool) $w['presumed'],
+                                          'wochen' => (int) ($w['weeks'] ?? max(1, (int) round($w['days'] / 7)))] : []);
         };
+        $this->writeTables($eng, $values, $rv, $today, $map);
         $this->put('Register', json_encode([
             'jahr'     => $year,
             'saison'   => [$this->ReadPropertyString('SeasonStart'), $this->ReadPropertyString('SeasonEnd')],
@@ -158,6 +158,90 @@ class Rental extends IPSModule
             'stand'     => time(),
         ], JSON_UNESCAPED_UNICODE));
         return true;
+    }
+
+    /** Rechenkern mit den Einstellungen der Instanz. $fromDay: freie Wochen erst ab diesem Tag. */
+    private function engine(array $values, int $year, int $fromDay): OccupancyEngine
+    {
+        return new OccupancyEngine($values, $year, $this->ReadPropertyString('SeasonStart'),
+            $this->ReadPropertyString('SeasonEnd'), $this->prices(), [
+                'vacant_max'   => $this->ReadPropertyFloat('VacantMax'),
+                'service_max'  => $this->ReadPropertyFloat('ServiceMax'),
+                'occupied_min' => $this->ReadPropertyFloat('OccupiedMin'),
+            ], [
+                'mode'    => $this->ReadPropertyString('Mode'),
+                'gapMax'  => $this->ReadPropertyInteger('GapMax'),
+                'minStay' => $this->ReadPropertyInteger('MinStay'),
+                'fromDay' => $fromDay,
+            ]);
+    }
+
+    /**
+     * Tabellen fuer die Anzeige. Kalender: je Saisonmonat eine Zeile, Spalte 2 die Tage als
+     * Zustaende mit Semikolon (ok = belegt, warn = An-/Abreise, fehler = frei, leer = ausser
+     * Saison), "*" vorn markiert heute, ":" leitet den Tooltip ein.
+     */
+    private function writeTables(OccupancyEngine $eng, array $values, array $rv, int $today, array $map): void
+    {
+        $year = (int) date('Y');
+        $this->put('CalendarTable', json_encode($this->calendarRows($eng, $values, $year, $today, $map), JSON_UNESCAPED_UNICODE));
+        $prevVals = $this->dayValues($year - 1);
+        $prev = $this->engine($prevVals, $year - 1, 0);
+        $this->put('CalendarPrevTable', json_encode($this->calendarRows($prev, $prevVals, $year - 1, -1, $map), JSON_UNESCAPED_UNICODE));
+
+        $dm = function (int $i) use ($eng) { return date('j.n.', mktime(0, 0, 0, 1, 1 + $i, $year = (int) substr($eng->date(0), 0, 4))); };
+        $eur = function (float $x) { return number_format($x, 0, ',', '.') . ' €'; };
+        $b = [['Zeitraum', 'Tage', 'Wo.', 'Preis', 'Art']];
+        foreach ($rv['bookings'] as $w) {
+            $b[] = [$dm($w['start']) . ' – ' . $dm($w['end']), $w['days'], (int) ($w['weeks'] ?? max(1, (int) round($w['days'] / 7))),
+                    $eur((float) $w['price']), $w['presumed'] ? 'vermutet' : 'erkannt'];
+        }
+        $this->put('BookingsTable', json_encode($b, JSON_UNESCAPED_UNICODE));
+        $f = [['Zeitraum', 'Tage']];
+        foreach ($rv['free'] as $w) {
+            $f[] = [$dm($w['start']) . ' – ' . $dm($w['end']), $w['days']];
+        }
+        $this->put('FreeTable', json_encode($f, JSON_UNESCAPED_UNICODE));
+
+        // Kurzfassung fuer den Seitenkopf
+        $st = $map[$eng->status($today)];
+        $txt = [self::ST_OFF => 'außer Saison', self::ST_FREE => 'frei', self::ST_SERVICE => 'An-/Abreise', self::ST_OCCUPIED => 'belegt'][$st];
+        $last = null; $cur = null;
+        foreach ($rv['bookings'] as $w) {
+            if ($w['end'] < $today) { $last = $w; }
+            if ($w['start'] <= $today && $w['end'] >= $today) { $cur = $w; }
+        }
+        if ($cur !== null) {
+            $txt .= ' · seit ' . $dm($cur['start']);
+        } elseif ($last !== null) {
+            $txt .= ' · letzte Abreise ' . $dm($last['end']);
+        }
+        $this->put('Summary', $txt);
+    }
+
+    private function calendarRows(OccupancyEngine $eng, array $values, int $year, int $today, array $map): array
+    {
+        $tok = [self::ST_OFF => '', self::ST_FREE => 'fehler', self::ST_SERVICE => 'warn', self::ST_OCCUPIED => 'ok'];
+        $name = [self::ST_OFF => 'außer Saison', self::ST_FREE => 'frei', self::ST_SERVICE => 'An-/Abreise', self::ST_OCCUPIED => 'belegt'];
+        $monate = ['', 'Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
+        $rows = [['Monat', 'Tage', 'Zustände', 'Auslastung']];
+        for ($m = 1; $m <= 12; $m++) {
+            $n = (int) date('t', mktime(0, 0, 0, $m, 1, $year));
+            $cells = []; $inSeason = 0; $busy = 0;
+            for ($d = 1; $d <= $n; $d++) {
+                $i = (int) date('z', mktime(0, 0, 0, $m, $d, $year));
+                $s = $map[$eng->status($i)];
+                if ($s !== self::ST_OFF) { $inSeason++; }
+                if ($s === self::ST_SERVICE || $s === self::ST_OCCUPIED) { $busy++; }
+                $v = number_format((float) ($values[$i] ?? 0), 1, ',', '');
+                $cells[] = ($i === $today ? '*' : '') . $tok[$s] . ':' . $d . '.' . $m . '. ' . $name[$s] . ' (' . $v . ')';
+            }
+            if ($inSeason === 0) {
+                continue;   // nur Monate mit Saisontagen
+            }
+            $rows[] = [$monate[$m], $n . ' Tage', implode(';', $cells), round($busy / $inSeason * 100) . ' %'];
+        }
+        return $rows;
     }
 
     /** Status heute als Zahl: 0 ausser Saison, 1 frei, 2 An-/Abreise, 3 belegt. */

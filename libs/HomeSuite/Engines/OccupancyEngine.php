@@ -46,6 +46,7 @@ final class OccupancyEngine
     private int $gapMax;
     private int $minStay;
     private ?array $v2 = null;  // Zwischenergebnis der v2-Rechnung
+    private int $fromDay;       // v2: freie Wochen/Potenzial erst ab diesem Tag (heute)
 
     /**
      * @param array  $values     Tageswert je Tagesindex (fehlend = 0)
@@ -61,6 +62,7 @@ final class OccupancyEngine
         $this->mode    = (($opts['mode'] ?? 'v2') === 'legacy') ? 'legacy' : 'v2';
         $this->gapMax  = max(0, (int) ($opts['gapMax'] ?? 2));
         $this->minStay = max(1, (int) ($opts['minStay'] ?? 3));
+        $this->fromDay = max(0, (int) ($opts['fromDay'] ?? 0));
         $this->year   = $year;
         $this->days   = self::isLeap($year) ? 366 : 365;
         $this->values = $values;
@@ -269,10 +271,12 @@ final class OccupancyEngine
         foreach ($allW as $w) { $max += $this->weekPrice($w['start'], $w['end']); }
         $cur = 0.0; $weeks = 0;
         foreach ($v['bookings'] as $b) { $cur += $b['price']; $weeks += $b['weeks']; }
-        // freie Wochen: Saisontage ausserhalb aller Buchungen, Laeufe ab 7 Tagen
+        // freie Wochen: Saisontage ausserhalb aller Buchungen, Laeufe ab 7 Tagen - nur ab
+        // fromDay (heute). Eine vergangene freie Woche ist nicht mehr buchbar und damit
+        // kein Potenzial mehr.
         $free = []; $start = null;
         for ($i = 0; $i < $this->days; $i++) {
-            $isFree = $this->inSeason($i) && !isset($v['covered'][$i]);
+            $isFree = $i >= $this->fromDay && $this->inSeason($i) && !isset($v['covered'][$i]);
             if ($isFree && $start === null) { $start = $i; }
             if (!$isFree && $start !== null) { $free = array_merge($free, $this->splitFree($start, $i - 1)); $start = null; }
         }
