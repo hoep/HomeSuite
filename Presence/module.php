@@ -73,9 +73,14 @@ class Presence extends IPSModule
         $persons = $this->persons();
         $hosts = $this->readHosts($this->ReadPropertyInteger('HostsCategory'));
 
+        // GuestCountVid: ein ORDNER = Host-Variablen des Gaestenetzes (jedes Geraet einzeln,
+        // Haustechnik wird ausgefiltert); eine VARIABLE = nur deren Anzahl (Altform).
         $guestWlan = 0;
+        $guestHosts = [];
         $gv = $this->ReadPropertyInteger('GuestCountVid');
-        if ($gv > 0 && @IPS_VariableExists($gv)) {
+        if ($gv > 0 && @IPS_CategoryExists($gv)) {
+            $guestHosts = $this->readHosts($gv);
+        } elseif ($gv > 0 && @IPS_VariableExists($gv)) {
             $guestWlan = max(0, (int) GetValue($gv));
         }
 
@@ -97,6 +102,7 @@ class Presence extends IPSModule
                 ? $this->ReadPropertyString('GuestPattern') : '/(?!)/',
             'ignore'       => $this->csv($this->ReadPropertyString('IgnoreNames')),
             'guestWlan'    => $this->ReadPropertyBoolean('DetectGuests') ? $guestWlan : 0,
+            'guestHosts'   => $this->ReadPropertyBoolean('DetectGuests') ? $guestHosts : [],
         ]);
         $this->WriteAttributeString('State', json_encode($res['state']));
 
@@ -124,6 +130,7 @@ class Presence extends IPSModule
             }, array_keys($res['persons'])),
             'guests'    => $res['guestNames'],
             'guestWlan' => $guestWlan,
+            'guestNetOnline' => count(array_filter(array_column($guestHosts, 'online'))),
             'updated'   => time(),
         ];
         $this->setIfChanged('Register', json_encode($reg, JSON_UNESCAPED_UNICODE));
@@ -170,8 +177,8 @@ class Presence extends IPSModule
                     'Anwesenheit eines Standorts. Die Instanz unter den Standort (HSSP, Ebene Haus) haengen.'],
                 ['type' => 'SelectCategory', 'name' => 'HostsCategory',
                  'caption' => 'Ordner mit den Host-Variablen des Routers (Ident = MAC)'],
-                ['type' => 'SelectVariable', 'name' => 'GuestCountVid',
-                 'caption' => 'Anzahl Geraete im Gaeste-WLAN (optional)'],
+                ['type' => 'SelectObject', 'name' => 'GuestCountVid',
+                 'caption' => 'Gaestenetz: Ordner mit dessen Host-Variablen (oder Anzahl-Variable)'],
                 ['type' => 'List', 'name' => 'Persons', 'caption' => 'Bewohner',
                  'add' => true, 'delete' => true, 'rowCount' => 6,
                  'columns' => [
@@ -188,7 +195,8 @@ class Presence extends IPSModule
                 ['type' => 'NumberSpinner', 'name' => 'StaleMinutes', 'caption' => 'Router gilt als stumm nach', 'suffix' => 'min'],
                 ['type' => 'NumberSpinner', 'name' => 'IntervalSeconds', 'caption' => 'Takt', 'suffix' => 's'],
                 ['type' => 'CheckBox', 'name' => 'DetectGuests', 'caption' => 'Gaeste erkennen'],
-                ['type' => 'ValidationTextBox', 'name' => 'GuestPattern', 'caption' => 'Muster fuer Gaeste-Geraete (Regex)'],
+                ['type' => 'ValidationTextBox', 'name' => 'GuestPattern',
+                 'caption' => 'Gaeste auch im Hauptnetz: Muster (Regex, leer = nur Gaestenetz)'],
                 ['type' => 'ValidationTextBox', 'name' => 'IgnoreNames', 'caption' => 'Nie als Gast zaehlen (Komma)'],
             ],
             'actions' => [

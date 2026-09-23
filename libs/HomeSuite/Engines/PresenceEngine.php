@@ -33,6 +33,18 @@ final class PresenceEngine
     public const DEFAULT_GUEST_PATTERN = '/iphone|galaxy|pixel|oneplus|huawei|xiaomi|redmi|android|phone|watch|-von-|mate-|nord/i';
 
     /**
+     * Geraete, die NIE als Gast zaehlen, auch wenn das Gaeste-Muster passt: Tablets und
+     * Rechner bleiben im Haus und reisen nicht mit ("iPad-von-..." traf sonst "-von-").
+     */
+    /**
+     * Haustechnik, die im Gaestenetz haengen darf, ohne ein Gast zu sein (Lautsprecher,
+     * Bridges, Klimageraete, Steckdosen, Kameras).
+     */
+    public const DEFAULT_INFRA_PATTERN = '/sonos|denon|heos|hue|apple-?tv|chromecast|fire-?tv|echo|alexa|repeater|tado|shelly|plug|camera|kamera|gateway|bridge|printer|drucker|linktap|ikea|tasmota|esp/i';
+
+    public const DEFAULT_NO_GUEST_PATTERN = '/ipad|tablet|macbook|laptop|notebook|xps|desktop|spectre|surface/i';
+
+    /**
      * @param array $hosts   Liste [{name, mac, online:bool, updated:int}] — name darf den
      *                       angehaengten " (IP)"-Teil tragen, er wird abgeschnitten.
      * @param array $persons Liste [{name, macs:[..], names:[..], ext:?bool}] — ext ist ein
@@ -49,8 +61,13 @@ final class PresenceEngine
         $hold     = max(0, (int) ($opt['holdSec'] ?? 1200));
         $stale    = max(60, (int) ($opt['staleSec'] ?? 1800));
         $pattern  = (string) ($opt['guestPattern'] ?? self::DEFAULT_GUEST_PATTERN);
+        $noGuest  = (string) ($opt['noGuestPattern'] ?? self::DEFAULT_NO_GUEST_PATTERN);
         $ignore   = array_map([self::class, 'norm'], (array) ($opt['ignore'] ?? []));
         $guestWlan = max(0, (int) ($opt['guestWlan'] ?? 0));
+        // Hosts des Gaestenetzes (optional). Sind sie gegeben, zaehlt JEDES Online-Geraet dort
+        // als Gast - ausser Haustechnik und Geraeten einer Person.
+        $guestHosts = (array) ($opt['guestHosts'] ?? []);
+        $infra    = (string) ($opt['infraPattern'] ?? self::DEFAULT_INFRA_PATTERN);
 
         $seen = is_array($state['seen'] ?? null) ? $state['seen'] : [];
         $guestSeen = (int) ($state['guestSeen'] ?? 0);
@@ -62,10 +79,14 @@ final class PresenceEngine
         }
         $fresh = $hosts === [] ? false : ($now - $newest) <= $stale;
 
-        // Hosts normalisieren
+        // Hosts normalisieren (Hauptnetz, danach Gaestenetz mit Markierung)
         $list = [];
-        foreach ($hosts as $h) {
+        foreach (array_merge(
+            array_map(function ($h) { $h['guestNet'] = false; return $h; }, $hosts),
+            array_map(function ($h) { $h['guestNet'] = true; return $h; }, $guestHosts)
+        ) as $h) {
             $list[] = [
+                'guestNet' => (bool) $h['guestNet'],
                 'name'   => self::hostName((string) ($h['name'] ?? '')),
                 'mac'    => self::mac((string) ($h['mac'] ?? '')),
                 'online' => (bool) ($h['online'] ?? false)
@@ -110,17 +131,26 @@ final class PresenceEngine
             }
         }
 
-        // Gaeste: fremde Telefone/Uhren im Hauptnetz plus alles im Gaeste-WLAN
+        // Gaeste: im Gaestenetz jedes fremde Geraet ausser Haustechnik; im Hauptnetz nur,
+        // wenn ein Muster gesetzt ist (fremde Telefone/Uhren). Leeres Muster = Hauptnetz aus.
         $guestNames = [];
         foreach ($list as $i => $h) {
-            if (!$h['online'] || isset($claimed[$i]) || $h['name'] === '') {
+            if (!$h['online'] || isset($claimed[$i])) {
                 continue;
             }
+            $label = $h['name'] !== '' ? $h['name'] : $h['mac'];
             if (in_array(self::norm($h['name']), $ignore, true)) {
                 continue;
             }
-            if (@preg_match($pattern, $h['name']) === 1) {
-                $guestNames[] = $h['name'];
+            if ($h['guestNet']) {
+                if ($infra === '' || @preg_match($infra, $h['name']) !== 1) {
+                    $guestNames[] = $label;
+                }
+                continue;
+            }
+            if ($pattern !== '' && $h['name'] !== ''
+                && @preg_match($pattern, $h['name']) === 1 && @preg_match($noGuest, $h['name']) !== 1) {
+                $guestNames[] = $label;
             }
         }
         $guestNames = array_values(array_unique($guestNames));

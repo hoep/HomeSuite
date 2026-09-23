@@ -6,7 +6,8 @@ Anwesenheit und Belegung eines Standorts. Eine Instanz je Standort, eingehaengt 
 ## Was die Instanz beantwortet
 
 - Welche Bewohner sind da? Je Person eine Variable `<Name> da`.
-- Sind Gaeste da? Fremde Telefone und Uhren im Hauptnetz plus die Geraete im Gaeste-WLAN.
+- Sind Gaeste da? Standard: jedes fremde Geraet im Gaestenetz, ausser Haustechnik (Lautsprecher,
+  Bridges, Klimageraete, Kameras). Optional zusaetzlich fremde Telefone im Hauptnetz (Muster).
 - Belegung (`HSPR.Belegung`): 0 Leer, 1 Bewohner, 2 Gaeste, 3 Bewohner und Gaeste, 4 Unbekannt.
 
 ## Quelle
@@ -21,6 +22,14 @@ Quellen werden ODER-verknuepft.
 Telefone verwenden je WLAN eine eigene private Adresse. Die MAC, unter der ein Telefon
 zuhause bekannt ist, taucht an einem zweiten Standort nicht auf. Personen werden deshalb an
 einer MAC-Liste und an Geraetenamen erkannt (`*` als Platzhalter erlaubt).
+
+## Gaestenetz
+
+`GuestCountVid` zeigt auf den ORDNER mit den Host-Variablen des Gaestenetzes (jedes Geraet
+einzeln). Altform: eine Variable mit der Anzahl.
+
+Achtung bei Routern mit drei Funkbaendern: das Gaestenetz ist dort nicht WLAN 3, sondern
+WLAN 4. Wer den Ordner des falschen WLANs eintraegt, zaehlt das Hausnetz als Gaeste.
 
 ## Verhalten
 
