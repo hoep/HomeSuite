@@ -3,10 +3,19 @@
     "name": "HeosBridge",
     "type": 2,
     "vendor": "Hoep",
-    "aliases": ["HeosBridge", "HSBH", "HomeSuite HEOS Bridge"],
+    "aliases": [
+        "HeosBridge",
+        "HSBH",
+        "HomeSuite HEOS Bridge"
+    ],
     "url": "https://github.com/hoep/HomeSuite",
     "prefix": "HSBH",
-    "parentRequirements": ["{79827379-F36E-4ADA-8A95-5F8313DAE8DB}"],
+    "parentRequirements": [
+        "{79827379-F36E-4ADA-8A95-5F8313DAE8DB}"
+    ],
     "childRequirements": [],
-    "implemented": ["{D7E6F5C4-B3A2-4190-8E7D-6C5B4A392817}"]
+    "implemented": [
+        "{D7E6F5C4-B3A2-4190-8E7D-6C5B4A392817}",
+        "{018EF6B5-AB94-40C6-AA53-46943E824ACF}"
+    ]
 }

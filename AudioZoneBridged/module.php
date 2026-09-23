@@ -31,7 +31,8 @@ class AudioZoneBridged extends AudioZone
         parent::Create();
         $this->RegisterPropertyString('PID', '');    // HEOS Player-ID (aus der Bridge-Playerliste)
         $this->RegisterPropertyString('Vendor', 'heos');
-        $this->RegisterPropertyInteger('QueryInterval', 15); // Abfrage-Intervall in SEKUNDEN (default = RX_MS/1000)
+        // QueryInterval erbt die Zone von AudioZone (Standard 5 s); ein zweites Register brach
+        // das Anlegen ab. Fuer HEOS genuegt ein seltener Abgleich, Push kommt ueber die Bridge.
         $this->ConnectParent(self::HSBH);            // unter die HEOS-Bridge haengen
     }
 

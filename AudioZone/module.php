@@ -374,9 +374,21 @@ class AudioZone extends EntityModule
         if ($driverId === '' || !DriverFactory::has($driverId)) {
             return null; // unkonfiguriert -> Schatten-Modus
         }
-        // Mindest-Bindung: irgendeine schaltbare Variable/ein Skript vorhanden?
+        // Adresse: der Speicher (Altbestand aus dem Umzug) hat Vorrang, sonst die eigenen
+        // Eigenschaften. Neue Zonen haben NUR die Eigenschaften - ohne diesen Rueckfall stand
+        // ihr Treiber ohne Adresse da (online=false, Lautstaerke 0, Refresh-Timer aus).
+        if (($cfg['host'] ?? '') === '' && ($cfg['speakerIp'] ?? '') !== '') {
+            $cfg['host'] = (string) $cfg['speakerIp'];
+        }
+        if (($cfg['rincon'] ?? '') === '' && ($cfg['speakerRincon'] ?? '') !== '') {
+            $cfg['rincon'] = (string) $cfg['speakerRincon'];
+        }
+        // Mindest-Bindung: schaltbare Variable/Skript - gilt nur fuer Treiber, die ueber
+        // Variablen arbeiten. Native Treiber sprechen das Geraet direkt an und brauchen
+        // stattdessen eine Adresse.
         $bind = (array) ($cfg['bind'] ?? []);
-        if ($bind === []) {
+        $nativ = in_array($driverId, ['sonos-upnp', 'heos'], true) && ($cfg['host'] ?? '') !== '';
+        if ($bind === [] && !$nativ) {
             return null;
         }
         try {
