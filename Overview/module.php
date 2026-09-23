@@ -287,7 +287,7 @@ class Overview extends IPSModule
     {
         $out = [];
         foreach ($this->siteList() as $sid) {
-            $row = ['id' => $sid, 'name' => IPS_GetName($sid), 'occupancy' => -1, 'occLabel' => '', 'residents' => '',
+            $row = ['id' => $sid, 'name' => IPS_GetName($sid), 'abbr' => $this->siteAbbr($sid), 'occupancy' => -1, 'occLabel' => '', 'residents' => '',
                     'guests' => 0, 'fresh' => null, 'rental' => null, 'hints' => 0, 'worst' => 0];
             foreach (IPS_GetChildrenIDs($sid) as $c) {
                 if (!IPS_InstanceExists($c)) { continue; }
@@ -442,13 +442,13 @@ class Overview extends IPSModule
 
     private function hint(string $id, int $site, string $area, int $sev, string $title, string $detail, int $since, array $actions): array
     {
-        return ['id' => $id, 'site' => $site, 'siteName' => $this->siteName($site), 'area' => $area, 'sev' => $sev,
+        return ['id' => $id, 'site' => $site, 'siteName' => $this->siteName($site), 'siteAbbr' => $this->siteAbbr($site), 'area' => $area, 'sev' => $sev,
                 'title' => $title, 'detail' => $detail, 'since' => $since, 'actions' => $actions];
     }
 
     private function event(string $id, int $t, int $site, string $area, string $title, string $detail, string $kind = ''): array
     {
-        return ['id' => $id, 't' => $t, 'site' => $site, 'siteName' => $this->siteName($site), 'area' => $area,
+        return ['id' => $id, 't' => $t, 'site' => $site, 'siteName' => $this->siteName($site), 'siteAbbr' => $this->siteAbbr($site), 'area' => $area,
                 'title' => $title, 'detail' => $detail, 'kind' => $kind, 'past' => $t < time()];
     }
 
@@ -506,6 +506,14 @@ class Overview extends IPSModule
     private function siteName(int $site): string
     {
         return $site > 0 && @IPS_ObjectExists($site) ? IPS_GetName($site) : 'Anlage';
+    }
+
+    /** Kuerzel des Standorts (Eigenschaft Abbr), sonst der Name. */
+    private function siteAbbr(int $site): string
+    {
+        if ($site <= 0 || !@IPS_InstanceExists($site)) { return 'Anlage'; }
+        $a = trim((string) @IPS_GetProperty($site, 'Abbr'));
+        return $a !== '' ? $a : IPS_GetName($site);
     }
 
     /** Raum = naechster HSSP ueber der Instanz (Kind Raum), sonst Instanzname. */
