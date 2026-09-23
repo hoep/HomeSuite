@@ -48,6 +48,9 @@ class Rental extends IPSModule
         $this->RegisterPropertyFloat('TaxPct', 21.0);
         $this->RegisterPropertyString('Overrides', '[]');       // [{Datum "d.m.Y", Wert}]
         $this->RegisterPropertyInteger('IntervalMinutes', 60);
+        $this->RegisterPropertyString('Mode', 'v2');           // v2 | legacy (Regeln des alten Skripts)
+        $this->RegisterPropertyInteger('GapMax', 2);           // v2: Luecke in Tagen, die ein Aufenthalt ueberbrueckt
+        $this->RegisterPropertyInteger('MinStay', 3);          // v2: Mindestdauer einer Buchung in Tagen
 
         $this->ensureProfiles();
         $this->RegisterVariableInteger('GuestDevices', 'Gäste-Geräte (jetzt)', '', 10);
@@ -108,6 +111,10 @@ class Rental extends IPSModule
                 'vacant_max'   => $this->ReadPropertyFloat('VacantMax'),
                 'service_max'  => $this->ReadPropertyFloat('ServiceMax'),
                 'occupied_min' => $this->ReadPropertyFloat('OccupiedMin'),
+            ], [
+                'mode'    => $this->ReadPropertyString('Mode'),
+                'gapMax'  => $this->ReadPropertyInteger('GapMax'),
+                'minStay' => $this->ReadPropertyInteger('MinStay'),
             ]);
         $st = $eng->stats();
         $rv = $eng->revenue();
@@ -141,6 +148,7 @@ class Rental extends IPSModule
         $this->put('Register', json_encode([
             'jahr'     => $year,
             'saison'   => [$this->ReadPropertyString('SeasonStart'), $this->ReadPropertyString('SeasonEnd')],
+            'rechenweise' => $this->ReadPropertyString('Mode'),
             'stats'    => $st,
             'umsatz'   => ['brutto' => $rv['current'], 'nachProvision' => round($rv['current'] * $comm, 2),
                            'netto' => round($rv['current'] * $comm * $tax, 2), 'potenzial' => $rv['potential'], 'maximum' => $rv['max']],
@@ -194,6 +202,14 @@ class Rental extends IPSModule
                 ]],
                 ['type' => 'List', 'name' => 'Overrides', 'caption' => 'Tageswerte korrigieren', 'add' => true, 'delete' => true, 'rowCount' => 4,
                  'columns' => [$spalte('Datum (T.M.JJJJ)', 'Datum', '160px', ''), $spalte('Wert', 'Wert', 'auto', 0, 'NumberSpinner')]],
+                ['type' => 'Select', 'name' => 'Mode', 'caption' => 'Rechenweise', 'options' => [
+                    ['caption' => 'Aufenthalte (empfohlen)', 'value' => 'v2'],
+                    ['caption' => 'wie das fruehere Skript', 'value' => 'legacy'],
+                ]],
+                ['type' => 'RowLayout', 'items' => [
+                    ['type' => 'NumberSpinner', 'name' => 'GapMax', 'caption' => 'Luecke ueberbruecken bis', 'suffix' => 'Tage'],
+                    ['type' => 'NumberSpinner', 'name' => 'MinStay', 'caption' => 'Buchung ab', 'suffix' => 'Tage'],
+                ]],
                 ['type' => 'NumberSpinner', 'name' => 'IntervalMinutes', 'caption' => 'Neu rechnen alle', 'suffix' => 'min'],
             ],
             'actions' => [['type' => 'Button', 'caption' => 'Jetzt rechnen', 'onClick' => 'HSRT_Update($id);']],
