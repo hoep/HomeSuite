@@ -60,7 +60,7 @@ class ShadingDevice extends EntityModule
      * (kein Engine-Umbau). Trennzeichen zwischen den Achsen: VARIANT_SEP.
      */
     private const PLAN_VARIANTS   = ['Anwesend', 'Abwesend', 'Urlaub'];
-    private const SEASON_VARIANTS = ['Sommer', 'Winter'];
+    private const SEASON_VARIANTS = ['Standard', 'Winter'];
     private const VARIANT_SEP     = ' · ';
 
     /** Lazy-Cache des HAL-Treibers (pro Instanz-Prozess). */
@@ -176,7 +176,7 @@ class ShadingDevice extends EntityModule
                     'role' => 'shading:season', 'label' => 'Saison',
                     'varType' => 1, 'actionable' => true, 'profile' => 'HSSH.Season',
                     'options' => [
-                        ['value' => 0, 'label' => 'Sommer'],
+                        ['value' => 0, 'label' => 'Standard'],
                         ['value' => 1, 'label' => 'Winter'],
                     ],
                 ],
@@ -679,7 +679,28 @@ class ShadingDevice extends EntityModule
                 $out[] = $plan . self::VARIANT_SEP . $season;
             }
         }
-        return $out; // 6 Varianten: Anwesend·Sommer, Anwesend·Winter, Abwesend·Sommer, …
+        return $out; // 6 Varianten: Anwesend·Standard, Anwesend·Winter, Abwesend·Standard, …
+    }
+
+    /**
+     * Saison "Sommer" heisst seit 23.09.2026 "Standard": die Plaene haengen am
+     * Sonnenuntergang und gelten ganzjaehrig. Die Wochenplaene liegen unter dem
+     * Variantennamen im Store und ziehen einmalig auf den neuen Namen um.
+     */
+    private function migrateSeasonNames(): void
+    {
+        $sch = $this->store()->get('schedule', []);
+        if (!is_array($sch)) { return; }
+        $neu = false;
+        foreach (array_keys($sch) as $k) {
+            $alt = self::VARIANT_SEP . 'Sommer';
+            if (substr((string) $k, -strlen($alt)) !== $alt) { continue; }
+            $ziel = substr((string) $k, 0, -strlen($alt)) . self::VARIANT_SEP . 'Standard';
+            if (!isset($sch[$ziel])) { $sch[$ziel] = $sch[$k]; }
+            unset($sch[$k]);
+            $neu = true;
+        }
+        if ($neu) { $this->store()->set('schedule', $sch); }
     }
 
     /**
@@ -1507,6 +1528,7 @@ class ShadingDevice extends EntityModule
         $this->driverResolved = false;
         $this->driverInstance = null;
         $this->migrateAutomationProps(); // Store -> Properties (Tuerkontakte/Sensoren), einmalig
+        $this->migrateSeasonNames();
 
         $drv    = $this->driver();
         $active = $drv instanceof IShutter;
@@ -2959,7 +2981,7 @@ class ShadingDevice extends EntityModule
     {
         $vars = $this->scheduleVariants();
         $idx  = $this->activeVariantIndex();
-        return $vars[$idx] ?? ($vars[0] ?? 'Anwesend' . self::VARIANT_SEP . 'Sommer');
+        return $vars[$idx] ?? ($vars[0] ?? 'Anwesend' . self::VARIANT_SEP . 'Standard');
     }
 
     /** Config-Wert (aus dem Store) mit Default. */
