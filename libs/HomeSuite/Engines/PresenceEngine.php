@@ -155,7 +155,7 @@ final class PresenceEngine
         ];
     }
 
-    /** "PeteriPhone (10.30.10.8)" -> "PeteriPhone" */
+    /** "Telefon-A (192.168.1.20)" -> "Telefon-A" */
     public static function hostName(string $n): string
     {
         return trim((string) preg_replace('/\s*\([^)]*\)\s*$/', '', $n));
