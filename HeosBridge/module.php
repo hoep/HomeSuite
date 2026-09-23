@@ -23,7 +23,7 @@ declare(strict_types=1);
  */
 class HeosBridge extends IPSModule
 {
-    private const IO_TX      = '{79827379-F36E-4ADA-8A95-5F8313DAE8DB}'; // -> ClientSocket
+    private const IO_TX      = '{79827379-F36E-4ADA-8A95-5F8D1DC92FA9}'; // -> ClientSocket
     private const CLIENTSOCK = '{3CFF0FD9-E306-41DB-9B5A-9D06D38576C3}'; // ClientSocket-Modul
     private const CHILD_DL   = '{D7E6F5C4-B3A2-4190-8E7D-6C5B4A392817}'; // Bridge -> Zone (downstream)
 
