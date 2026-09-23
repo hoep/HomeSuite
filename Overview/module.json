@@ -1,0 +1,13 @@
+{
+    "id": "{A3073772-E4EE-47B8-8BDD-7838F4D0E679}",
+    "name": "Overview",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": ["Overview", "Lage", "Startseite", "Hinweise", "Fahrplan"],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSOV",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "hidden": false
+}
