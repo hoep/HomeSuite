@@ -1000,17 +1000,55 @@ class EnergyManager extends EntityModule
      * es: im ersten Jahr Platz zwei, danach Platz zehn.
      */
     private const SIM_TARIFE = [
-        // --- Energie AG Oberoesterreich ---
-        ['id' => 'feelgood', 'name' => 'Energie AG Feel Good',        'ct' => 12.00, 'grundEur' => 5.28,
-         'bindung' => '12 Monate', 'stand' => '2026-09-22', 'quelle' => 'energieag.at/privat/strom/standard-tarife/festpreis'],
-        ['id' => 'loyal',    'name' => 'Energie AG Ökostrom Loyal',   'ct' => 14.90, 'grundEur' => 4.62,
+        // --- Energie AG ---
+        ['id' => 'feelgood', 'name' => 'Energie AG Feel Good (Jahr 1)', 'ct' => 12.00, 'rabattPct' => 5.0, 'grundEur' => 5.28,
+         'bindung' => '12 Monate Festpreis', 'stand' => '2026-09-22',
+         // Der Grundpreis steht als LISTENpreis. Auf ihn gibt es 1,50 EUR/Monat
+         // Kombi-Bonus - aber nur in Verbindung mit einem zweiten Produkt. Ob der
+         // Haushalt ihn bekommt, ist eine Vertragsfrage, keine Rechenfrage; ihn
+         // ungefragt einzurechnen wuerde die Ersparnis um 36 EUR/Jahr schoenrechnen
+         // (zwei Zaehlpunkte mal zwoelf Monate).
+         'hinweis' => '1,50 EUR/Monat Kombi-Bonus moeglich, nicht eingerechnet',
+         'quelle' => 'energieag.at/privat/strom/standard-tarife/festpreis'],
+        // Der Festpreis gilt NUR zwoelf Monate. Danach laeuft der Vertrag ohne
+        // Kuendigung automatisch in Oekostrom Loyal - also genau in den Tarif, der
+        // heute schon gilt. Ein befristeter Tarif ohne seinen Folgetarif in der
+        // Liste verspricht eine Ersparnis, die es im zweiten Jahr nicht mehr gibt;
+        // die anderen befristeten Angebote stehen aus demselben Grund doppelt drin.
+        ['id' => 'feelgood2', 'name' => 'Energie AG Feel Good (ab Jahr 2)', 'ct' => 14.90, 'rabattPct' => 5.0, 'gratisTage' => 30, 'grundEur' => 4.62,
+         'hinweis' => 'automatischer Wechsel in Ökostrom Loyal', 'stand' => '2026-09-22',
+         'quelle' => 'energieag.at/privat/strom/standard-tarife/festpreis'],
+        ['id' => 'loyal',    'name' => 'Energie AG Ökostrom Loyal',   'ct' => 14.90, 'rabattPct' => 5.0, 'gratisTage' => 30, 'grundEur' => 4.62,
          'hinweis' => 'Preiserhöhung vertraglich ausgeschlossen', 'stand' => '2026-09-22', 'quelle' => 'Preisblatt Ökostrom Loyal'],
-        ['id' => 'smart',    'name' => 'Energie AG Ökostrom Smart',   'grundEur' => 5.18,
+        ['id' => 'smart',    'name' => 'Energie AG Ökostrom Smart',   'rabattPct' => 5.0, 'grundEur' => 5.18,
          'zonen' => ['Sun' => 5.00, 'Day' => 17.04, 'Night' => 13.22, 'Weekend' => 13.05],
          'bindung' => '12 Monate, Smart Meter', 'stand' => '2026-09-22', 'quelle' => 'Preisblatt Ökostrom Smart'],
-        ['id' => 'komfort',  'name' => 'Energie AG Ökostrom Komfort', 'ct' => 19.46, 'grundEur' => 4.62,
+        // Drei Zonen mit EIGENEN Grenzen - deshalb 'zonenDef' am Tarif selbst.
+        // SommerSonne Apr-Sep 10-16, WinterSonne Okt-Maerz 10-16, sonst Basis.
+        // Beispiel aus einer Anlage mit PV: dort fielen nur rund 9 % des
+        // Netzbezugs in die Sommersonne - mittags deckt die PV den Bedarf, sodass
+        // gerade in der billigsten Stunde fast nichts aus dem Netz kommt. Rund 76 %
+        // lagen in der Basiszone zu 16,98 ct, also UEBER dem Festpreis von Loyal.
+        ['id' => 'smartloyal', 'name' => 'Energie AG Ökostrom Smart Loyal', 'rabattPct' => 5.0, 'grundEur' => 5.28,
+         'zonen' => ['SommerSonne' => 6.60, 'WinterSonne' => 13.20, 'Basis' => 16.98],
+         'zonenDef' => [
+             ['name' => 'SommerSonne', 'monate' => [4, 5, 6, 7, 8, 9], 'stunden' => [10, 16], 'tage' => 'alle'],
+             ['name' => 'WinterSonne', 'monate' => [10, 11, 12, 1, 2, 3], 'stunden' => [10, 16], 'tage' => 'alle'],
+             ['name' => 'Basis'],
+         ],
+         'bindung' => 'Smart Meter, Bindung optional',
+         'hinweis' => '5 % Kombi-Bonus auf den Arbeitspreis nicht eingerechnet',
+         'stand' => '2026-09-22', 'quelle' => 'Preisblatt Ökostrom Smart Loyal'],
+        // Boersenpreis plus Aufschlag. Das Produkt rechnet VIERTELstuendlich ab, die
+        // hinterlegte EPEX-Reihe ist stuendlich - fuer einen Haushalt ohne grosse
+        // schaltbare Lasten ist das eine brauchbare Naeherung, aber eben eine.
+        ['id' => 'eagspot', 'name' => 'Energie AG Ökostrom Spot', 'typ' => 'spot', 'aufschlagCt' => 3.00,
+         'rabattPct' => 5.0, 'grundEur' => 5.40, 'bindung' => 'Smart Meter, viertelstuendlich',
+         'hinweis' => 'stuendlich gerechnet, Produkt ist viertelstuendlich',
+         'stand' => '2026-09-22', 'quelle' => 'energieag.at/privat/strom/standard-tarife'],
+        ['id' => 'komfort',  'name' => 'Energie AG Ökostrom Komfort', 'ct' => 19.46, 'rabattPct' => 5.0, 'grundEur' => 4.62,
          'stand' => '2026-09-22', 'quelle' => 'tarife.at'],
-        ['id' => 'direkt',   'name' => 'Energie AG Ökostrom Direkt',  'ct' => 19.56, 'grundEur' => 7.26,
+        ['id' => 'direkt',   'name' => 'Energie AG Ökostrom Direkt',  'ct' => 19.56, 'rabattPct' => 5.0, 'grundEur' => 7.26,
          'bindung' => '12 Monate', 'stand' => '2026-09-22', 'quelle' => 'Preisblatt Ökostrom Direkt'],
         // --- Voltino (Wels Strom) ---
         ['id' => 'voltino1', 'name' => 'Voltino Fix 26 (Neukundenjahr)', 'ct' => 14.11, 'grundEur' => 4.34,

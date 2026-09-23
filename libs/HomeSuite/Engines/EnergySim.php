@@ -102,6 +102,14 @@ final class EnergySim
     public static function kosten(array $zonen, array $tarif, float $faktor = 1.0): array
     {
         $grund = ((float) ($tarif['grundEur'] ?? 0)) * 12.0;
+        // Kombi-/Treuebonus als Prozentsatz auf den ARBEITSpreis. Der Grundpreis
+        // bleibt unberuehrt - wo ein Bonus dort ansetzt, steht er direkt im
+        // 'grundEur' des Tarifs.
+        $rab = 1.0 - max(0.0, min(50.0, (float) ($tarif['rabattPct'] ?? 0))) / 100.0;
+        // Treuebonus als GRATISTAGE: an so vielen Tagen im Jahr entfaellt der
+        // Arbeitspreis. 30 Tage sind 8,2 Prozent des Jahres - und wirken NUR auf
+        // die Arbeit, nicht auf den Grundpreis, der weiterlaeuft.
+        $rab *= 1.0 - max(0.0, min(365.0, (float) ($tarif['gratisTage'] ?? 0))) / 365.0;
         $arbeit = 0.0; $offen = [];
         foreach ($zonen as $name => $kwh) {
             if (isset($tarif['zonen'][$name])) {
@@ -114,8 +122,8 @@ final class EnergySim
             }
         }
         return ['name' => (string) ($tarif['name'] ?? '?'),
-                'arbeit' => $arbeit * $faktor, 'grund' => $grund,
-                'gesamt' => $arbeit * $faktor + $grund,
+                'arbeit' => $arbeit * $rab * $faktor, 'grund' => $grund,
+                'gesamt' => $arbeit * $rab * $faktor + $grund,
                 'unvollstaendig' => $offen];
     }
 
@@ -136,6 +144,8 @@ final class EnergySim
     public static function kostenSpot(array $stunden, array $tarif, array $spot, float $faktor = 1.0): array
     {
         $auf  = (float) ($tarif['aufschlagCt'] ?? 0);
+        $rab  = 1.0 - max(0.0, min(50.0, (float) ($tarif['rabattPct'] ?? 0))) / 100.0;
+        $rab *= 1.0 - max(0.0, min(365.0, (float) ($tarif['gratisTage'] ?? 0))) / 365.0;
         $ust  = 1.0 + ((float) ($tarif['ustProzent'] ?? 20)) / 100.0;
         $arbeit = 0.0; $gedeckt = 0.0; $offen = 0.0;
         foreach ($stunden as $h) {
@@ -151,8 +161,8 @@ final class EnergySim
         if ($offen > 0 && $gedeckt > 0) { $arbeit += $offen * ($arbeit / $gedeckt); }
         $grund = ((float) ($tarif['grundEur'] ?? 0)) * 12.0;
         return ['name' => (string) ($tarif['name'] ?? '?'),
-                'arbeit' => $arbeit * $faktor, 'grund' => $grund,
-                'gesamt' => $arbeit * $faktor + $grund,
+                'arbeit' => $arbeit * $rab * $faktor, 'grund' => $grund,
+                'gesamt' => $arbeit * $rab * $faktor + $grund,
                 'unvollstaendig' => [],
                 'ungedeckt_kwh' => round($offen, 0),
                 'mittelpreis_ct' => $gedeckt > 0 ? round(100 * $arbeit / $gedeckt, 2) : null];
@@ -177,8 +187,20 @@ final class EnergySim
                           'fehlt' => 'keine Boersenpreisreihe', 'unvollstaendig' => []];
                 continue;
             }
+            // Ein Tarif darf EIGENE Zonengrenzen mitbringen. Bis 22.09.2026 galt eine
+            // Definition fuer alle - damit liess sich "Oekostrom Smart" (12-16 Uhr)
+            // und "Oekostrom Smart Loyal" (10-16 Uhr, Sommer/Winter getrennt) nicht
+            // gleichzeitig rechnen. Fehlt 'zonenDef', bleibt alles wie bisher.
+            // zonen() liefert eine STRUKTUR (zonen/gesamt/stunden/von/bis), nicht die
+            // Zonenkarte selbst - wer sie ungeoeffnet weiterreicht, uebergibt kosten()
+            // die Schluessel 'gesamt' und 'stunden' als waeren es Zonennamen. Dann
+            // findet der Tarif keine seiner Zonen wieder und berechnet nur den
+            // Grundpreis: 1.351 statt 3.261 Euro.
+            $eigene = (isset($t['zonenDef']) && is_array($t['zonenDef']) && $t['zonenDef'] !== [])
+                    ? (self::zonen($stunden, $t['zonenDef'])['zonen'] ?? $zonen)
+                    : $zonen;
             $k = $istSpot ? self::kostenSpot($stunden, $t, $spot, $faktor)
-                          : self::kosten($zonen, $t, $faktor);
+                          : self::kosten($eigene, $t, $faktor);
             $k['id']   = (string) ($t['id'] ?? '');
             $k['spot'] = $istSpot;
             foreach (['stand', 'quelle', 'hinweis', 'bindung'] as $f) {
