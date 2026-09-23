@@ -168,7 +168,9 @@ class Overview extends IPSModule
         }
         if (!$entries) { return; }
         $site = $this->siteOf($iid);
-        $t = (int) $TimeStamp ?: time();
+        // $TimeStamp von Symcon ist keine Unix-Zeit (im Test 1 h 40 min daneben) - die
+        // Meldung kommt sofort, also gilt die aktuelle Uhrzeit.
+        $t = time();
         if (!IPS_SemaphoreEnter('HSOV_Log_' . $this->InstanceID, 2000)) { return; }
         try {
             $lv = $this->GetIDForIdent('EventLog');
