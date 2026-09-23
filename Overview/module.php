@@ -41,7 +41,7 @@ class Overview extends IPSModule
         $this->RegisterPropertyBoolean('ShowHealth', true);
         $this->RegisterPropertyBoolean('ShowBattery', true);
         $this->RegisterPropertyInteger('PastHours', 3);
-        $this->RegisterPropertyInteger('AheadHours', 20);
+        $this->RegisterPropertyInteger('AheadHours', 30);   // ab Mitternacht: heute + morgen frueh
 
         $this->RegisterAttributeString('Dismissed', '{}');     // {hintId: bis-Zeitstempel}
 
@@ -336,89 +336,238 @@ class Overview extends IPSModule
 
     // ================================================================= Fahrplan
 
+    /**
+     * Tagesfahrplan: der ganze heutige Tag (0:00) bis morgen frueh (AheadHours ab
+     * Mitternacht), vergangene Punkte eingeschlossen. Quellen:
+     *   - Wochenplaene der Fachmodule (Beschattung, Heizung, Bewaesserung) - jeder Wechsel
+     *   - Klima: naechster Planwechsel
+     *   - Licht-Automatik: aktive Zeit-/Sonnenregeln
+     *   - Symcon-Wochenplaene aller uebrigen Objekte (Warmwasser, Maehplan, Pool, Wecker ...)
+     *   - Symcon-Ereignisse mit fester Tageszeit (taeglich/woechentlich "um HH:MM")
+     * Gleiche Aktionen zur selben Minute am selben Standort werden zusammengefasst.
+     */
     private function timeline(array $by, int $now): array
     {
-        $from = $now - max(0, $this->ReadPropertyInteger('PastHours')) * 3600;
-        $to = $now + max(1, $this->ReadPropertyInteger('AheadHours')) * 3600;
-        $ev = [];
+        $day0 = mktime(0, 0, 0);
+        $to = $day0 + max(24, $this->ReadPropertyInteger('AheadHours')) * 3600;
+        $grp = [];   // key -> [t, site, area, title, names[], detail, kind]
+        $add = function (int $t, int $site, string $area, string $title, string $name, string $detail = '', string $kind = '') use (&$grp, $day0, $to) {
+            if ($t < $day0 || $t > $to) { return; }
+            $k = $site . '|' . intdiv($t, 60) . '|' . $area . '|' . $title . '|' . $kind . '|' . $detail;
+            if (!isset($grp[$k])) { $grp[$k] = ['t' => $t, 'site' => $site, 'area' => $area, 'title' => $title, 'names' => [], 'detail' => $detail, 'kind' => $kind]; }
+            if ($name !== '') { $grp[$k]['names'][] = $name; }
+        };
 
-        // Rollos: naechste Fahrt je Geraet, zusammengefasst je Standort, Minute und Richtung
-        $grp = [];
+        // Beschattung: jeder Wechsel des aktiven Wochenplans
         foreach ($by['ShadingDevice'] ?? [] as $iid) {
-            $st = $this->state('HSSH', $iid);
-            $t = (int) ($st['NaechsteFahrt'] ?? 0);
-            if ($t < $now || $t > $to) { continue; }
-            $dir = (string) ($st['NaechsteRichtung'] ?? '');
-            $ziel = (int) ($st['NaechstesZiel'] ?? 0);
-            $txt = $dir === 'Auf' ? 'Rollos auf' : ($ziel >= 100 ? 'Rollos zu' : "Rollos auf $ziel %");
-            $key = $this->siteOf($iid) . '|' . intdiv($t, 60) . '|' . $txt;
-            $grp[$key]['t'] = $t; $grp[$key]['txt'] = $txt; $grp[$key]['site'] = $this->siteOf($iid);
-            $grp[$key]['names'][] = $this->roomName($iid);
+            foreach ($this->weekChanges($this->manageJson('HSSH', $iid, 'getSchedule'), $day0, $to) as [$t, $val]) {
+                $title = $val <= 0 ? 'Rollos auf' : ($val >= 100 ? 'Rollos zu' : "Rollos auf $val %");
+                $add($t, $this->siteOf($iid), 'Beschattung', $title, $this->roomName($iid));
+            }
         }
-        foreach ($grp as $key => $g) {
-            $ev[] = $this->event('sh-' . md5($key), $g['t'], $g['site'], 'Beschattung', $g['txt'],
-                count($g['names']) === 1 ? $g['names'][0] : count($g['names']) . ' Rollos · ' . $this->kurzliste($g['names']));
+        // Heizung: Plan der aktuell gewaehlten Anwesenheitsvariante
+        foreach ($by['HeatingZone'] ?? [] as $iid) {
+            $st = $this->state('HSHT', $iid);
+            $pres = isset($st['Presence']) ? (int) $st['Presence'] : -1;
+            $plan = function_exists('HSHT_GetScheduleJson') ? json_decode((string) @HSHT_GetScheduleJson($iid, $pres), true) : null;
+            foreach ($this->weekChanges(is_array($plan) ? $plan : [], $day0, $to) as [$t, $val]) {
+                $add($t, $this->siteOf($iid), 'Heizung', 'Heizung auf ' . $this->num($val) . ' °C', $this->roomName($iid));
+            }
         }
-
-        // Bewaesserung: Fenster des Wochenplans heute und morgen frueh
+        // Bewaesserung: Fenster des Wochenplans, mit Sperrgrund
         foreach ($by['IrrigationCircuit'] ?? [] as $iid) {
             $st = $this->state('HSIR', $iid);
-            $plan = function_exists('HSIR_Manage') ? json_decode((string) @HSIR_Manage($iid, json_encode(['op' => 'getSchedule'])), true) : null;
-            $week = is_array($plan) ? ($plan['week'] ?? null) : null;
-            if (!is_array($week) || count($week) < 7) { continue; }
             $dur = function_exists('HSIR_GetEffectiveMinutes') ? (int) @HSIR_GetEffectiveMinutes($iid) : 0;
-            foreach ([0, 1] as $plus) {
-                $day0 = mktime(0, 0, 0, (int) date('n'), (int) date('j') + $plus);
-                $wd = (int) date('N', $day0) - 1;
-                $prevEnd = 0;
-                foreach ((array) $week[$wd] as $slot) {
-                    $end = (int) ($slot['end'] ?? 0);
-                    if ((int) ($slot['val'] ?? 0) > 0) {
-                        $t = $day0 + $prevEnd * 60;
-                        if ($t >= $from && $t <= $to) {
-                            $skip = !empty($st['RainBlocked']);
-                            $grund = $skip ? $this->umlaute(trim((string) preg_replace('/^Gesperrt:\s*/i', '', (string) ($st['LastRun'] ?? '')))) : '';
-                            $ev[] = $this->event("ir-$iid-$t", $t, $this->siteOf($iid), 'Bewässerung', $this->nice($iid) . ' bewässern',
-                                $skip ? ('entfällt' . ($grund !== '' ? ' · ' . $grund : '')) : (($dur > 0 ? $dur : ($end - $prevEnd)) . ' min'),
-                                $skip ? 'skip' : '');
-                        }
+            $skip = !empty($st['RainBlocked']);
+            $grund = $skip ? $this->umlaute(trim((string) preg_replace('/^Gesperrt:\s*/i', '', (string) ($st['LastRun'] ?? '')))) : '';
+            foreach ($this->weekChanges($this->manageJson('HSIR', $iid, 'getSchedule'), $day0, $to) as [$t, $val]) {
+                if ($val <= 0) { continue; }
+                $past = $t < $now;
+                $add($t, $this->siteOf($iid), 'Bewässerung', $this->nice($iid) . ($past ? ' bewässert' : ' bewässern'), '',
+                    $skip && !$past ? ('entfällt' . ($grund !== '' ? ' · ' . $grund : '')) : ($dur > 0 ? "$dur min" : ''), $skip && !$past ? 'skip' : '');
+            }
+        }
+        // Klima: naechster Planwechsel
+        foreach ($by['ClimateZone'] ?? [] as $iid) {
+            $st = $this->state('HSAC', $iid);
+            $t = (int) ($st['NextChange'] ?? 0);
+            if ($t >= $now) { $add($t, $this->siteOf($iid), 'Klima', 'Klima Planwechsel', $this->roomName($iid)); }
+        }
+        // Licht-Automatik (Hub): aktive Zeit- und Sonnenregeln
+        foreach ($by['HomeSuite Hub'] ?? [] as $hub) {
+            $la = function_exists('HSH_Manage') ? json_decode((string) @HSH_Manage($hub, json_encode(['op' => 'lightAutoGet'])), true) : null;
+            if (!is_array($la) || empty($la['automationEnabled'])) { continue; }
+            $sun = (array) ($la['sun'] ?? []);
+            foreach ((array) ($la['rules'] ?? []) as $r) {
+                if (empty($r['enabled']) || ($r['type'] ?? '') !== 'schedule') { continue; }
+                $tr = (array) ($r['trigger'] ?? []);
+                foreach ([0, 1] as $plus) {
+                    $d0 = $day0 + $plus * 86400;
+                    $days = (array) ($tr['days'] ?? []);
+                    if ($days && !in_array((int) date('N', $d0), array_map('intval', $days), true) && !in_array((int) date('N', $d0) - 1, array_map('intval', $days), true)) { continue; }
+                    $min = null;
+                    if (($tr['kind'] ?? '') === 'time' && preg_match('/^(\d{1,2}):(\d{2})/', (string) ($tr['time'] ?? ''), $m)) {
+                        $min = (int) $m[1] * 60 + (int) $m[2];
+                    } elseif (($tr['kind'] ?? '') === 'sun' && isset($sun[$tr['event'] ?? ''])) {
+                        $min = (int) $sun[$tr['event']] + (int) ($tr['offsetMin'] ?? 0);
                     }
-                    $prevEnd = $end;
+                    if ($min !== null) { $add($d0 + $min * 60, $this->siteOf($hub), 'Licht', 'Licht: ' . (string) ($r['name'] ?? 'Regel'), ''); }
+                }
+            }
+        }
+        // Symcon-Ereignisse: Wochenplaene (alle Schaltpunkte) und feste Tageszeiten
+        $covered = ['IrrigationCircuit', 'ClimateZone', 'ShadingDevice', 'HeatingZone'];
+        foreach (IPS_GetEventList() as $eid) {
+            $e = IPS_GetEvent($eid);
+            if (!$e['EventActive']) { continue; }
+            $p = IPS_GetParent($eid);
+            if (@IPS_InstanceExists($p) && in_array(IPS_GetInstance($p)['ModuleInfo']['ModuleName'], $covered, true)) { continue; }
+            $site = $this->siteOf($p);
+            $area = $this->isHomeSuite($p) ? $this->domainLabel($p) : $this->areaGuess($p, (string) IPS_GetName($eid));
+            if ((int) $e['EventType'] === 2) {
+                foreach ([0, 1] as $plus) {
+                    $d0 = $day0 + $plus * 86400;
+                    // Der Punkt um 0:00 ist meist nur der Tagesanfang des Plans - kein Schalten,
+                    // wenn er dieselbe Aktion traegt wie der letzte Punkt des Vortags.
+                    $prev = $this->schedulePoints($e, $d0 - 86400);
+                    $prevAct = $prev ? end($prev)[1] : null;
+                    foreach ($this->schedulePoints($e, $d0) as [$t, $act]) {
+                        if ($t === $d0 && $act === $prevAct) { continue; }
+                        $add($t, $site, $area, $this->objLabel($p) . ($act !== '' ? ': ' . $act : ''), '');
+                    }
+                }
+            } elseif ((int) $e['EventType'] === 1 && (int) $e['CyclicTimeType'] === 0) {
+                // feste Tageszeit: "taeglich um HH:MM" (DateType 2) oder "woechentlich" (3) an Tagen
+                $dt = (int) $e['CyclicDateType'];
+                if ($dt !== 2 && $dt !== 3) { continue; }
+                $tf = (array) ($e['CyclicTimeFrom'] ?? []);
+                foreach ([0, 1] as $plus) {
+                    $d0 = $day0 + $plus * 86400;
+                    if ($dt === 3 && (((int) $e['CyclicDateDay']) & (1 << ((int) date('N', $d0) - 1))) === 0) { continue; }
+                    $t = $d0 + (int) ($tf['Hour'] ?? 0) * 3600 + (int) ($tf['Minute'] ?? 0) * 60 + (int) ($tf['Second'] ?? 0);
+                    $name = trim((string) IPS_GetName($eid));
+                    $label = preg_match('/^(alle|t(ae|ä)glich|w(oe|ö)chentlich|unnamed)/i', $name) || $name === '' ? '' : $name;
+                    $title = $this->objLabel($p) . ($label !== '' ? ': ' . $label : '');
+                    // Technik nur am Skript-/Ereignisnamen erkennen - Ordnernamen wie "Zaehler"
+                    // oder "Statistik" wuerden sonst echte Schaltaktionen verstecken.
+                    $add($t, $site, $this->isTechnik($this->nice($p) . ' ' . $label) ? 'Technik' : $area, $title, '');
                 }
             }
         }
 
-        // Klima: naechster Planwechsel, je Standort und Minute zusammengefasst
-        $kg = [];
-        foreach ($by['ClimateZone'] ?? [] as $iid) {
-            $st = $this->state('HSAC', $iid);
-            $t = (int) ($st['NextChange'] ?? 0);
-            if ($t >= $now && $t <= $to) {
-                $k = $this->siteOf($iid) . '|' . intdiv($t, 60);
-                $kg[$k]['t'] = $t; $kg[$k]['site'] = $this->siteOf($iid); $kg[$k]['rooms'][] = $this->roomName($iid);
+        $ev = [];
+        foreach ($grp as $k => $g) {
+            $n = count($g['names']);
+            $title = $g['title'];
+            $detail = $g['detail'];
+            if ($n > 1) {
+                $title .= ' · ' . $n . ($g['area'] === 'Heizung' ? ' Räume' : ($g['area'] === 'Beschattung' ? ' Rollos' : ''));
+                $detail = trim($this->kurzliste($g['names']) . ($detail !== '' ? ' · ' . $detail : ''));
+            } elseif ($n === 1) {
+                $detail = trim($g['names'][0] . ($detail !== '' ? ' · ' . $detail : ''));
+            }
+            $ev[] = $this->event(substr(md5($k), 0, 12), $g['t'], $g['site'], $g['area'], $title, $detail, $g['kind']);
+        }
+        usort($ev, function ($a, $b) { return [$a['t'], $a['area']] <=> [$b['t'], $b['area']]; });
+        return $ev;
+    }
+
+    /**
+     * Interne Buchhaltung (Zaehler nullen, Staende rechnen, Listen leeren, Mitternachts-
+     * Timer) schaltet nichts im Haus - sie steht als "Technik" im Fahrplan und ist dort
+     * standardmaessig ausgeblendet.
+     */
+    private function isTechnik(string $t): bool
+    {
+        return (bool) preg_match('/berechn|rechnen|setzen|reset|zur(ue|ü)ck|null|leeren|import|timer|status|feiertag|neuer tag|config|abgleich|aufr(ae|ä)um|speicher|sicher|archiv|log|statistik|z(ae|ä)hler/i', $t);
+    }
+
+    /** Bereich eines fremden Zeitplans aus Objekt- und Ereignisnamen erraten. */
+    private function areaGuess(int $p, string $eventName): string
+    {
+        $t = IPS_GetName($p) . ' ' . $eventName . ' ' . (@IPS_InstanceExists($p) ? IPS_GetInstance($p)['ModuleInfo']['ModuleName'] : '');
+        foreach (['/m(ae|ä)h|mower|automower/i' => 'Mäher', '/warmwasser|viessmann|boiler/i' => 'Warmwasser',
+                  '/pool|filter|umw(ae|ä)lz/i' => 'Pool', '/alarm|w(ae|ä)chter|scharf/i' => 'Sicherheit',
+                  '/licht|lampe|beleucht/i' => 'Licht', '/rollo|jalousie|markise|beschatt/i' => 'Beschattung',
+                  '/heiz|thermost/i' => 'Heizung', '/musik|sonos|radio|wecker/i' => 'Musik'] as $rx => $area) {
+            if (preg_match($rx, $t)) { return $area; }
+        }
+        return 'Zeitplan';
+    }
+
+    /** Anzeigename; bei Skripten mit dem Ordner davor ("Beleuchtung: Aus"). */
+    private function objLabel(int $id): string
+    {
+        $n = $this->nice($id);
+        if (@IPS_ObjectExists($id) && IPS_GetObject($id)['ObjectType'] === 3) {
+            $parent = (int) IPS_GetParent($id);
+            if ($parent > 0) { return $this->nice($parent) . ': ' . $n; }
+        }
+        return $n;
+    }
+
+    /** JSON-Antwort einer Verwaltungsoperation (PREFIX_Manage). */
+    private function manageJson(string $pfx, int $iid, string $op): array
+    {
+        $fn = $pfx . '_Manage';
+        if (!function_exists($fn)) { return []; }
+        try {
+            $j = json_decode((string) @$fn($iid, json_encode(['op' => $op])), true);
+            return is_array($j) ? $j : [];
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
+     * Wechsel eines Wochenplans (week[Mo..So] = Slots {end: Minute, val}) im Zeitraum:
+     * liefert [[Zeitstempel, neuer Wert], ...]. Der Wert vor 0:00 ist der letzte des Vortags.
+     */
+    private function weekChanges(array $plan, int $from, int $to): array
+    {
+        $week = $plan['week'] ?? null;
+        if (!is_array($week) || count($week) < 7) { return []; }
+        $out = [];
+        for ($d0 = $from; $d0 <= $to; $d0 += 86400) {
+            $wd = (int) date('N', $d0) - 1;
+            $prevDay = (array) $week[($wd + 6) % 7];
+            $last = $prevDay ? end($prevDay) : null;
+            $prevVal = is_array($last) ? (float) ($last['val'] ?? 0) : null;
+            $start = 0;
+            foreach ((array) $week[$wd] as $slot) {
+                $val = (float) ($slot['val'] ?? 0);
+                if ($prevVal === null || $val != $prevVal) {
+                    $t = $d0 + $start * 60;
+                    if ($t >= $from && $t <= $to) { $out[] = [$t, $val]; }
+                }
+                $prevVal = $val;
+                $start = (int) ($slot['end'] ?? 0);
             }
         }
-        foreach ($kg as $k => $g) {
-            $n = count($g['rooms']);
-            $ev[] = $this->event('ac-' . md5($k), $g['t'], $g['site'], 'Klima', $n === 1 ? 'Klima ' . $g['rooms'][0] : "Klima · $n Räume",
-                'Planwechsel' . ($n > 1 ? ' · ' . $this->kurzliste($g['rooms']) : ''));
-        }
+        return $out;
+    }
 
-        // Wochenplan-Ereignisse der HomeSuite-Module (Audio-Zeitplan u. a.)
-        foreach (IPS_GetEventList() as $eid) {
-            $e = IPS_GetEvent($eid);
-            if (!$e['EventActive'] || (int) $e['EventType'] !== 2) { continue; }
-            $p = IPS_GetParent($eid);
-            if (!$this->isHomeSuite($p)) { continue; }
-            // Bewaesserung, Klima und Beschattung stehen schon mit eigenem Text im Fahrplan
-            if (in_array(IPS_GetInstance($p)['ModuleInfo']['ModuleName'], ['IrrigationCircuit', 'ClimateZone', 'ShadingDevice'], true)) { continue; }
-            $t = (int) $e['NextRun'];
-            if ($t < $now || $t > $to) { continue; }
-            $ev[] = $this->event("ev-$eid-$t", $t, $this->siteOf($p), $this->domainLabel($p), $this->nice($p), $this->scheduleAction($e, $t));
+    /** Alle Schaltpunkte eines Symcon-Wochenplans an einem Tag: [[Zeitstempel, Aktionsname]]. */
+    private function schedulePoints(array $e, int $d0): array
+    {
+        $names = [];
+        foreach ((array) $e['ScheduleActions'] as $a) { $names[(int) $a['ID']] = (string) $a['Name']; }
+        $bit = 1 << ((int) date('N', $d0) - 1);
+        $out = [];
+        foreach ((array) $e['ScheduleGroups'] as $g) {
+            if (((int) $g['Days'] & $bit) === 0) { continue; }
+            foreach ((array) $g['Points'] as $pt) {
+                $t = $d0 + (int) $pt['Start']['Hour'] * 3600 + (int) $pt['Start']['Minute'] * 60 + (int) ($pt['Start']['Second'] ?? 0);
+                $out[] = [$t, $names[(int) $pt['ActionID']] ?? ''];
+            }
         }
+        usort($out, function ($a, $b) { return $a[0] <=> $b[0]; });
+        return $out;
+    }
 
-        usort($ev, function ($a, $b) { return $a['t'] <=> $b['t']; });
-        return $ev;
+    private function num(float $v): string
+    {
+        return rtrim(rtrim(number_format($v, 1, ',', ''), '0'), ',');
     }
 
     /** Name der Aktion, die ein Wochenplan zum Zeitpunkt $t ausloest. */
@@ -499,6 +648,12 @@ class Overview extends IPSModule
                 if (is_array($cfg) && ($cfg['Kind'] ?? '') === 'Haus') { $res = $x; break; }
             }
             $x = (int) @IPS_GetParent($x);
+        }
+        if ($res === 0) {
+            // Technik ohne Standort (Pool, Warmwasser, Maeher ...) steht am Hauptstandort:
+            // dem ersten Standort in Baumreihenfolge.
+            $l = $this->siteList();
+            $res = $l ? $l[0] : 0;
         }
         return $this->siteCache[$id] = $res;
     }
