@@ -82,11 +82,47 @@ class Rental extends IPSModule
         $this->RegisterVariableString('CalendarPrevTable', 'Kalender Vorjahr (Tabelle)', '', 92);
         $this->RegisterVariableString('BookingsTable', 'Buchungen (Tabelle)', '', 93);
         $this->RegisterVariableString('FreeTable', 'Noch buchbar (Tabelle)', '', 94);
+        // Saison aus der Visualisierung einstellbar: schaltbare Spiegel der Einstellungen.
+        $this->RegisterVariableString('SeasonFrom', 'Saison von', '', 80);
+        $this->RegisterVariableString('SeasonTo', 'Saison bis', '', 81);
+        $this->EnableAction('SeasonFrom');
+        $this->EnableAction('SeasonTo');
+        $this->SetValue('SeasonFrom', $this->ReadPropertyString('SeasonStart'));
+        $this->SetValue('SeasonTo', $this->ReadPropertyString('SeasonEnd'));
         $this->ensureLogging();
         $this->SetTimerInterval('Sample', 60 * 1000);
         $min = max(0, $this->ReadPropertyInteger('IntervalMinutes'));
         $this->SetTimerInterval('Update', $min > 0 ? max(5, $min) * 60 * 1000 : 0);
         $this->SetStatus($this->ReadPropertyInteger('PresenceId') > 0 || $this->ReadPropertyInteger('LegacyGuestVid') > 0 ? 102 : 104);
+    }
+
+    /**
+     * Saison von/bis aus der Visualisierung: "1.6.", "01.06", "1.6.2026" - alles wird zu "T.M.".
+     * Ungueltiges wird verworfen, die Anzeige springt auf den gueltigen Wert zurueck. Gueltiges
+     * wird Einstellung (bleibt nach Neustart) und sofort neu gerechnet.
+     */
+    public function RequestAction($Ident, $Value)
+    {
+        if ($Ident !== 'SeasonFrom' && $Ident !== 'SeasonTo') {
+            throw new Exception('Unbekannte Aktion ' . $Ident);
+        }
+        $prop = $Ident === 'SeasonFrom' ? 'SeasonStart' : 'SeasonEnd';
+        $norm = '';
+        if (preg_match('/^\s*(\d{1,2})\s*[.\/-]\s*(\d{1,2})\s*[.\/-]?\s*(\d{2,4})?\s*$/', (string) $Value, $m)
+            && checkdate((int) $m[2], (int) $m[1], 2024)) {
+            $norm = (int) $m[1] . '.' . (int) $m[2] . '.';
+        }
+        if ($norm === '') {
+            $this->SetValue($Ident, $this->ReadPropertyString($prop));   // Eingabe verworfen
+            $this->LogMessage('Saison: "' . $Value . '" ist kein Datum (T.M.)', KL_WARNING);
+            return;
+        }
+        $this->SetValue($Ident, $norm);
+        if ($norm !== $this->ReadPropertyString($prop)) {
+            IPS_SetProperty($this->InstanceID, $prop, $norm);
+            IPS_ApplyChanges($this->InstanceID);
+            $this->Update();
+        }
     }
 
     /** Minuetlich: aktuelle Gaeste-Geraetezahl aus der Anwesenheit uebernehmen (wird archiviert). */
