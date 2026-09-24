@@ -112,7 +112,13 @@ class Overview extends IPSModule
         'IrrigationCircuit' => ['Running' => ['Bewässerung', 'run']],
         'ClimateZone'       => ['Power' => ['Klima', 'onoff']],
         'Presence'          => ['Residents' => ['Anwesenheit', 'people']],
+        // Wetter je Standort (fremde Bibliothek SymconWeatherStation): der Standort ergibt
+        // sich wie ueberall aus dem Platz im Baum.
+        'BlitzortungListener' => ['Active' => ['Wetter', 'storm']],
+        'WeatherStation'      => ['PrecipType' => ['Wetter', 'precip']],
     ];
+
+    private const NIEDERSCHLAG = [1 => 'Regen', 2 => 'Schneeregen', 3 => 'Schnee'];
 
     /** Variablen der Fachmodule fuer das Tagesprotokoll anmelden (idempotent). */
     private function watch(): void
@@ -162,6 +168,25 @@ class Overview extends IPSModule
             case 'run':
                 $entries[] = [$area, $this->nice($iid) . ($new ? ' bewässert' : ': Bewässerung fertig'), ''];
                 break;
+            case 'storm':
+                if ($new) {
+                    $km = @GetValue((int) @IPS_GetObjectIDByIdent('Nearest', $iid));
+                    $ri = (string) @GetValue((int) @IPS_GetObjectIDByIdent('BearingText', $iid));
+                    $ri = trim((string) preg_replace('/^\d+°\s*/u', '', $ri));
+                    $entries[] = [$area, 'Gewitter in der Nähe', trim(($km ? $km . ' km' : '') . ($ri !== '' && $ri !== '–' ? ' ' . $ri : ''))];
+                } else {
+                    $entries[] = [$area, 'Gewitter vorbei', ''];
+                }
+                break;
+            case 'precip':
+                $n = (int) $new; $o = (int) $old;
+                if ($n > 0 && $o === 0) {
+                    $entries[] = [$area, (self::NIEDERSCHLAG[$n] ?? 'Niederschlag') . ' beginnt', ''];
+                } elseif ($n === 0 && $o > 0) {
+                    $mm = @GetValue((int) @IPS_GetObjectIDByIdent('RainDay', $iid));
+                    $entries[] = [$area, (self::NIEDERSCHLAG[$o] ?? 'Niederschlag') . ' hört auf', is_numeric($mm) && $mm > 0 ? number_format((float) $mm, 1, ',', '') . ' mm heute' : ''];
+                }
+                break;
             case 'people':
                 $a = array_filter(array_map('trim', explode(',', (string) $new)));
                 $b = array_filter(array_map('trim', explode(',', (string) $old)));
@@ -180,7 +205,22 @@ class Overview extends IPSModule
             $log = json_decode((string) GetValue($lv), true) ?: [];
             $day0 = mktime(0, 0, 0);
             $log = array_values(array_filter($log, function ($e) use ($day0) { return (int) ($e[0] ?? 0) >= $day0; }));
-            foreach ($entries as [$ar, $title, $name]) { $log[] = [$t, $site, $ar, $title, $name]; }
+            foreach ($entries as [$ar, $title, $name]) {
+                // Regen mit kurzer Pause ist EIN Regen: endete er vor weniger als 20 Minuten
+                // am selben Standort, faellt das Ende weg statt eines neuen Beginns.
+                if (substr($title, -8) === ' beginnt') {
+                    for ($i = count($log) - 1; $i >= 0; $i--) {
+                        $e = $log[$i];
+                        if ((int) $e[1] !== $site || $e[2] !== $ar) { continue; }
+                        if (substr((string) $e[3], -9) === ' hört auf' && $t - (int) $e[0] < 1200) {
+                            array_splice($log, $i, 1);
+                            continue 2;
+                        }
+                        break;
+                    }
+                }
+                $log[] = [$t, $site, $ar, $title, $name];
+            }
             if (count($log) > 1500) { $log = array_slice($log, -1500); }
             SetValue($lv, json_encode($log, JSON_UNESCAPED_UNICODE));
         } finally {
@@ -565,6 +605,17 @@ class Overview extends IPSModule
                     $add($t, $site, $this->isTechnik($this->nice($p) . ' ' . $label) ? 'Technik' : $area, $title, '');
                 }
             }
+        }
+
+        // Aufziehendes Gewitter: die Stationsauswertung schaetzt, wann es da ist. Das ist eine
+        // Schaetzung, kein Schaltpunkt - darum steht es so im Detail.
+        foreach ($by['WeatherStation'] ?? [] as $wid) {
+            $ap = @IPS_GetObjectIDByIdent('StormApproaching', $wid);
+            $eta = @IPS_GetObjectIDByIdent('StormEta', $wid);
+            if (!$ap || !$eta || !GetValue($ap) || (int) GetValue($eta) <= 0) { continue; }
+            $dist = @IPS_GetObjectIDByIdent('StormDist', $wid);
+            $add(time() + (int) GetValue($eta) * 60, $this->siteOf($wid), 'Wetter', 'Gewitter kommt', '',
+                'geschätzt' . ($dist && GetValue($dist) > 0 ? ' · jetzt ' . (int) GetValue($dist) . ' km entfernt' : ''), '');
         }
 
         // TV-Aufnahmen der Receiver (Tabelle: Sender, Beginn "TT.MM. HH:MM", Ende, Titel ...)
