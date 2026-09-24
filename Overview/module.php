@@ -79,7 +79,8 @@ class Overview extends IPSModule
         $byMod = $this->instancesByModule();
         $hints = [];
         foreach ([$this->hintsShading($byMod), $this->hintsIrrigation($byMod), $this->hintsClimate($byMod),
-                  $this->hintsPresence($byMod), $this->hintsHealth($byMod), $this->hintsBattery($byMod)] as $part) {
+                  $this->hintsPresence($byMod), $this->hintsHealth($byMod), $this->hintsBattery($byMod),
+                  $this->hintsWarnings($byMod)] as $part) {
             $hints = array_merge($hints, $part);
         }
         // weggeklickte Hinweise ausblenden; Eintraege fuer verschwundene Hinweise aufraeumen
@@ -394,6 +395,40 @@ class Overview extends IPSModule
         return $out;
     }
 
+    private const WARNSTUFE = [1 => 'gelb', 2 => 'orange', 3 => 'rot'];
+
+    /** Warnungen einer WeatherWarnings-Instanz (heute und kuenftig). */
+    private function warnings(int $wid): array
+    {
+        $v = @IPS_GetObjectIDByIdent('Warnings', $wid);
+        $l = $v ? json_decode((string) GetValue($v), true) : null;
+        return is_array($l) ? $l : [];
+    }
+
+    private function uhrzeit(int $t): string
+    {
+        return date('Y-m-d', $t) === date('Y-m-d') ? date('H:i', $t) : (['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'][(int) date('w', $t)] . ' ' . date('H:i', $t));
+    }
+
+    /** Laufende Unwetterwarnungen ab orange brauchen Aufmerksamkeit; gelb steht nur im Fahrplan. */
+    private function hintsWarnings(array $by): array
+    {
+        $out = [];
+        $now = time();
+        foreach ($by['WeatherWarnings'] ?? [] as $wid) {
+            foreach ($this->warnings($wid) as $w) {
+                $st = (int) ($w['stufe'] ?? 0);
+                if ($st < 2 || (int) $w['von'] > $now || (int) $w['bis'] <= $now) { continue; }
+                $text = trim((string) ($w['text'] ?? ''));
+                $out[] = $this->hint('wx-' . $wid . '-' . ($w['id'] ?? ''), $this->siteOf($wid), 'Wetter', $st >= 3 ? 3 : 2,
+                    'Unwetterwarnung ' . $w['art'] . ' (' . self::WARNSTUFE[$st] . ')',
+                    'bis ' . $this->uhrzeit((int) $w['bis']) . ($text !== '' ? ' · ' . (mb_strlen($text) > 110 ? mb_substr($text, 0, 108) . '…' : $text) : ''),
+                    (int) $w['von'], []);
+            }
+        }
+        return $out;
+    }
+
     private function hintsBattery(array $by): array
     {
         if (!$this->ReadPropertyBoolean('ShowBattery')) { return []; }
@@ -486,10 +521,10 @@ class Overview extends IPSModule
         $day0 = mktime(0, 0, 0);
         $to = $day0 + max(24, $this->ReadPropertyInteger('AheadHours')) * 3600;
         $grp = [];   // key -> [t, site, area, title, names[], detail, kind]
-        $add = function (int $t, int $site, string $area, string $title, string $name, string $detail = '', string $kind = '') use (&$grp, $day0, $to) {
+        $add = function (int $t, int $site, string $area, string $title, string $name, string $detail = '', string $kind = '', string $badge = '') use (&$grp, $day0, $to) {
             if ($t < $day0 || $t > $to) { return; }
-            $k = $site . '|' . intdiv($t, 60) . '|' . $area . '|' . $title . '|' . $kind . '|' . $detail;
-            if (!isset($grp[$k])) { $grp[$k] = ['t' => $t, 'site' => $site, 'area' => $area, 'title' => $title, 'names' => [], 'detail' => $detail, 'kind' => $kind]; }
+            $k = $site . '|' . intdiv($t, 60) . '|' . $area . '|' . $title . '|' . $kind . '|' . $detail . '|' . $badge;
+            if (!isset($grp[$k])) { $grp[$k] = ['t' => $t, 'site' => $site, 'area' => $area, 'title' => $title, 'names' => [], 'detail' => $detail, 'kind' => $kind, 'badge' => $badge]; }
             if ($name !== '') { $grp[$k]['names'][] = $name; }
         };
 
@@ -607,6 +642,15 @@ class Overview extends IPSModule
             }
         }
 
+        // Amtliche Wetterwarnungen (Modul WeatherWarnings) zu ihrem Beginn, Plakette in der
+        // Warnfarbe. Laeuft eine schon seit gestern, steht sie am Tagesanfang.
+        foreach ($by['WeatherWarnings'] ?? [] as $wid) {
+            foreach ($this->warnings($wid) as $w) {
+                $add(max((int) $w['von'], $day0), $this->siteOf($wid), 'Wetter', 'Warnung ' . $w['art'], '',
+                    'bis ' . $this->uhrzeit((int) $w['bis']), '', self::WARNSTUFE[(int) $w['stufe']] ?? '');
+            }
+        }
+
         // Aufziehendes Gewitter: die Stationsauswertung schaetzt, wann es da ist. Das ist eine
         // Schaetzung, kein Schaltpunkt - darum steht es so im Detail.
         foreach ($by['WeatherStation'] ?? [] as $wid) {
@@ -658,7 +702,8 @@ class Overview extends IPSModule
             } elseif ($n === 1) {
                 $detail = trim($g['names'][0] . ($detail !== '' ? ' · ' . $detail : ''));
             }
-            $badge = ($g['area'] === 'Sicherheit' && $g['kind'] === '' && $alarm === false) ? 'unscharf' : '';
+            $badge = (string) ($g['badge'] ?? '');
+            if ($badge === '') { $badge = ($g['area'] === 'Sicherheit' && $g['kind'] === '' && $alarm === false) ? 'unscharf' : ''; }
             $ev[] = $this->event(substr(md5($k), 0, 12), $g['t'], $g['site'], $g['area'], $title, $detail, $g['kind'], $badge);
         }
         usort($ev, function ($a, $b) { return [$a['t'], $a['area']] <=> [$b['t'], $b['area']]; });
