@@ -80,7 +80,7 @@ class Overview extends IPSModule
         $hints = [];
         foreach ([$this->hintsShading($byMod), $this->hintsIrrigation($byMod), $this->hintsClimate($byMod),
                   $this->hintsPresence($byMod), $this->hintsHealth($byMod), $this->hintsBattery($byMod),
-                  $this->hintsWarnings($byMod)] as $part) {
+                  $this->hintsWarnings($byMod), $this->hintsAir()] as $part) {
             $hints = array_merge($hints, $part);
         }
         // weggeklickte Hinweise ausblenden; Eintraege fuer verschwundene Hinweise aufraeumen
@@ -408,6 +408,23 @@ class Overview extends IPSModule
     private function uhrzeit(int $t): string
     {
         return date('Y-m-d', $t) === date('Y-m-d') ? date('H:i', $t) : (['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'][(int) date('w', $t)] . ' ' . date('H:i', $t));
+    }
+
+    /**
+     * Luftnotfall in der Naehe: das Skript "Notfälle abrufen" (Flugverkehr) fuehrt die Variable
+     * mit Ident NfNah - leer, solange nichts ansteht. Gesucht wird unter den Standorten.
+     */
+    private function hintsAir(): array
+    {
+        foreach ($this->siteList() as $site) {
+            $v = $this->identDeep($site, 'NfNah');
+            if (!$v) { continue; }
+            $t = trim((string) GetValue($v));
+            if ($t === '') { return []; }
+            return [$this->hint('air-' . strtok($t, ' '), $site, 'Flugverkehr', 3, 'Luftnotfall in der Nähe', $t,
+                (int) IPS_GetVariable($v)['VariableChanged'], [])];
+        }
+        return [];
     }
 
     /** Laufende Unwetterwarnungen ab orange brauchen Aufmerksamkeit; gelb steht nur im Fahrplan. */
