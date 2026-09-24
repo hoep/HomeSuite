@@ -120,6 +120,46 @@ final class OccupancyEngine
         return self::ST_OCCUPIED;
     }
 
+    /**
+     * Warum ein Tag so eingestuft ist - fuer den Tooltip im Kalender. Liefert den Grund in
+     * Worten und, falls der Tag zu einer Buchung gehoert, deren Grenzen.
+     * @return array{grund:string, buchung:?array{0:int,1:int,2:bool}}
+     */
+    public function reason(int $i): array
+    {
+        if (!$this->inSeason($i)) {
+            return ['grund' => 'außer Saison', 'buchung' => null];
+        }
+        $raw = $this->rawStatus($i);
+        $v = isset($this->values[$i]) ? (float) $this->values[$i] : null;
+        $zahl = function ($x) { return number_format((float) $x, 1, ',', ''); };
+        $mess = $v === null ? 'kein Messwert' : ('Tageswert ' . $zahl($v));
+        $schwelle = $raw === self::ST_OCCUPIED ? ($mess . ' über ' . $zahl($this->serviceMax) . ' = belegt')
+                  : ($raw === self::ST_SERVICE ? ($mess . ' über ' . $zahl($this->vacantMax) . ' bis ' . $zahl($this->serviceMax) . ' = Wechseltag/Reinigung')
+                  : ($mess . ' bis ' . $zahl($this->vacantMax) . ' = leer'));
+        if ($this->mode !== 'v2') {
+            return ['grund' => $schwelle, 'buchung' => null];
+        }
+        $v2 = $this->v2();
+        foreach ($v2['bookings'] as $b) {
+            if ($i < $b['start'] || $i > $b['end']) { continue; }
+            $buch = [$b['start'], $b['end'], (bool) $b['presumed']];
+            if ($b['presumed']) {
+                return ['grund' => 'vermutete Buchung: zwei Wechseltage in Folge, aber kein belegter Tag · ' . $schwelle, 'buchung' => $buch];
+            }
+            if ($raw === self::ST_FREE) {
+                return ['grund' => 'Lücke im Aufenthalt (bis ' . $this->gapMax . ' Tage) überbrückt · ' . $schwelle, 'buchung' => $buch];
+            }
+            return ['grund' => $schwelle, 'buchung' => $buch];
+        }
+        foreach ($v2['activity'] as [$a, $e]) {
+            if ($i >= $a && $i <= $e) {
+                return ['grund' => 'Aktivität ' . ($e - $a + 1) . ' Tag(e), zu kurz oder ohne belegten Tag für eine Buchung (ab ' . $this->minStay . ' Tagen) · ' . $schwelle, 'buchung' => null];
+            }
+        }
+        return ['grund' => $schwelle, 'buchung' => null];
+    }
+
     /** Tagesstatistik der Saison (gleiche Felder wie der fruehere Analysator). */
     public function stats(): array
     {

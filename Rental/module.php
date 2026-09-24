@@ -269,8 +269,7 @@ class Rental extends IPSModule
                 $s = $map[$eng->status($i)];
                 if ($s !== self::ST_OFF) { $inSeason++; }
                 if ($s === self::ST_SERVICE || $s === self::ST_OCCUPIED) { $busy++; }
-                $v = number_format((float) ($values[$i] ?? 0), 1, ',', '');
-                $cells[] = ($i === $today ? '*' : '') . $tok[$s] . ':' . $d . '.' . $m . '. ' . $name[$s] . ' (' . $v . ')';
+                $cells[] = ($i === $today ? '*' : '') . $tok[$s] . ':' . $this->tooltip($eng, $i, $year, $d . '.' . $m . '. ' . $name[$s]);
             }
             if ($inSeason === 0) {
                 continue;   // nur Monate mit Saisontagen
@@ -278,6 +277,28 @@ class Rental extends IPSModule
             $rows[] = [$monate[$m], $n . ' Tage', implode(';', $cells), round($busy / $inSeason * 100) . ' %'];
         }
         return $rows;
+    }
+
+    /**
+     * Tooltip einer Kalenderzelle: Status, zugehoerige Buchung, Grund der Einstufung und die
+     * einzelnen Messbeitraege (WLAN-Gaeste, Klima-Schaltvorgaenge, Korrektur). Zeilen mit
+     * Zeilenumbruch; ohne Semikolon, das trennt im Kalender die Zellen.
+     */
+    private function tooltip(OccupancyEngine $eng, int $i, int $year, string $kopf): string
+    {
+        $r = $eng->reason($i);
+        $z = [$kopf];
+        if ($r['buchung'] !== null) {
+            [$a, $b, $p] = $r['buchung'];
+            $dm = function (int $k) use ($year) { return date('j.n.', mktime(0, 0, 0, 1, 1 + $k, $year)); };
+            $z[] = 'Buchung ' . $dm($a) . ' – ' . $dm($b) . ($p ? ' (vermutet)' : ' (erkannt)');
+        }
+        if ($r['grund'] !== 'außer Saison') {
+            $z[] = 'Grund: ' . $r['grund'];
+            foreach ($this->detail[$year][$i] ?? [] as $zeile) { $z[] = '· ' . $zeile; }
+            if (empty($this->detail[$year][$i])) { $z[] = '· keine Messwerte an diesem Tag'; }
+        }
+        return str_replace(';', ',', implode("\n", $z));
     }
 
     /** Status heute als Zahl: 0 ausser Saison, 1 frei, 2 An-/Abreise, 3 belegt. */
@@ -339,8 +360,13 @@ class Rental extends IPSModule
     // ---------------------------------------------------------------- intern
 
     /** Tageswert je Tagesindex: Mittel der Gaeste-Geraete + Mittel der Aktivitaetszaehler. */
+    /** Je Tag die einzelnen Beitraege zum Tageswert, fuer den Tooltip: [Jahr][Tag] => [Zeilen]. */
+    private array $detail = [];
+
     private function dayValues(int $year): array
     {
+        $det = [];
+        $zahl = function ($x) { return number_format((float) $x, 1, ',', ''); };
         $arch = $this->archiveId();
         $from = mktime(0, 0, 0, 1, 1, $year);
         $to = min(time(), mktime(23, 59, 59, 12, 31, $year));
@@ -348,28 +374,56 @@ class Rental extends IPSModule
         if ($arch > 0) {
             $legacy = $this->ReadPropertyInteger('LegacyGuestVid');
             if ($legacy > 0 && @IPS_VariableExists($legacy)) {
-                foreach ($this->dailyAvg($arch, $legacy, $from, $to) as $i => $v) {
+                foreach ($this->dailyAgg($arch, $legacy, $from, $to) as $i => [$v, $mx]) {
                     $guest[$i] = $v;
+                    $det[$i]['gast'] = 'WLAN-Gäste (Vorgeschichte): Ø ' . $zahl($v) . ' · max ' . (int) round($mx) . ' Geräte';
                 }
             }
             // eigene Werte haben Vorrang, wo es sie gibt
-            foreach ($this->dailyAvg($arch, $this->GetIDForIdent('GuestDevices'), $from, $to) as $i => $v) {
+            foreach ($this->dailyAgg($arch, $this->GetIDForIdent('GuestDevices'), $from, $to) as $i => [$v, $mx]) {
                 $guest[$i] = $v;
+                $det[$i]['gast'] = 'WLAN-Gäste: Ø ' . $zahl($v) . ' · max ' . (int) round($mx) . ' Geräte';
             }
         }
         $values = $guest;
         foreach ($this->counters() as $vid) {
-            foreach ($arch > 0 ? $this->dailyAvg($arch, $vid, $from, $to) : [] as $i => $v) {
+            // Name mit Ordner davor ("Toshiba Klimaanlagen · Zustandsaenderungen") - der Zaehler
+            // allein heisst oft nur "Zustandsaenderungen". Ein Zaehler-Tageswert ist eine Summe,
+            // ein Maximum dazu waere sinnlos.
+            $name = @IPS_ObjectExists($vid) ? IPS_GetName($vid) : ('#' . $vid);
+            $ord = @IPS_ObjectExists($vid) ? (int) IPS_GetParent($vid) : 0;
+            if ($ord > 0) { $name = IPS_GetName($ord) . ' · ' . $name; }
+            foreach ($arch > 0 ? $this->dailyAgg($arch, $vid, $from, $to) : [] as $i => [$v, $mx]) {
                 $values[$i] = round(($values[$i] ?? 0) + $v, 1);
+                if ($v > 0) {
+                    $det[$i]['z' . $vid] = $name . ': ' . (abs($v - round($v)) < 0.05 ? (int) round($v) : $zahl($v));
+                }
             }
         }
         foreach (json_decode($this->ReadPropertyString('Overrides'), true) ?: [] as $o) {
             $ts = $this->parseDate((string) ($o['Datum'] ?? ''));
             if ($ts !== null && (int) date('Y', $ts) === $year) {
-                $values[(int) date('z', $ts)] = (float) ($o['Wert'] ?? 0);
+                $i = (int) date('z', $ts);
+                $values[$i] = (float) ($o['Wert'] ?? 0);
+                $det[$i] = ['hand' => 'von Hand korrigiert auf ' . $zahl($values[$i]) . ' (Messwerte ersetzt)'];
             }
         }
+        $this->detail[$year] = array_map('array_values', $det);
         return $values;
+    }
+
+    /** Tagesmittel und -maximum aus dem Archiv, indiziert nach Tag des Jahres: [Tag => [avg, max]]. */
+    private function dailyAgg(int $arch, int $vid, int $from, int $to): array
+    {
+        if (!@AC_GetLoggingStatus($arch, $vid)) {
+            return [];
+        }
+        $rows = @AC_GetAggregatedValues($arch, $vid, 1, $from, $to, 0);
+        $out = [];
+        foreach (is_array($rows) ? $rows : [] as $r) {
+            $out[(int) date('z', (int) $r['TimeStamp'])] = [(float) $r['Avg'], (float) $r['Max']];
+        }
+        return $out;
     }
 
     /** Tagesmittel aus dem Archiv, indiziert nach Tag des Jahres. */
