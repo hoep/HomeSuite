@@ -42,6 +42,9 @@ class Overview extends IPSModule
         $this->RegisterPropertyBoolean('ShowBattery', true);
         $this->RegisterPropertyInteger('PastHours', 3);
         $this->RegisterPropertyInteger('AheadHours', 30);   // ab Mitternacht: heute + morgen frueh
+        // Alarmanlage: Variablen-IDs (Komma), die "scharf" anzeigen. Ist keine davon an,
+        // tragen die Sicherheits-Eintraege im Fahrplan das Kennzeichen "unscharf".
+        $this->RegisterPropertyString('AlarmArmedVars', '');
 
         $this->RegisterAttributeString('Dismissed', '{}');     // {hintId: bis-Zeitstempel}
 
@@ -577,6 +580,7 @@ class Overview extends IPSModule
         foreach ($grp as $g) {
             if ($g['kind'] === 'done') { $done[] = [$g['site'], $g['area'], $g['t']]; }
         }
+        $alarm = $this->alarmArmed();
         $ev = [];
         foreach ($grp as $k => $g) {
             if ($g['kind'] === '' && $g['t'] <= time()) {
@@ -593,7 +597,8 @@ class Overview extends IPSModule
             } elseif ($n === 1) {
                 $detail = trim($g['names'][0] . ($detail !== '' ? ' · ' . $detail : ''));
             }
-            $ev[] = $this->event(substr(md5($k), 0, 12), $g['t'], $g['site'], $g['area'], $title, $detail, $g['kind']);
+            $badge = ($g['area'] === 'Sicherheit' && $g['kind'] === '' && $alarm === false) ? 'unscharf' : '';
+            $ev[] = $this->event(substr(md5($k), 0, 12), $g['t'], $g['site'], $g['area'], $title, $detail, $g['kind'], $badge);
         }
         usort($ev, function ($a, $b) { return [$a['t'], $a['area']] <=> [$b['t'], $b['area']]; });
         return $ev;
@@ -768,10 +773,23 @@ class Overview extends IPSModule
                 'title' => $title, 'detail' => $detail, 'since' => $since, 'actions' => $actions];
     }
 
-    private function event(string $id, int $t, int $site, string $area, string $title, string $detail, string $kind = ''): array
+    private function event(string $id, int $t, int $site, string $area, string $title, string $detail, string $kind = '', string $badge = ''): array
     {
         return ['id' => $id, 't' => $t, 'site' => $site, 'siteName' => $this->siteName($site), 'siteAbbr' => $this->siteAbbr($site), 'area' => $area,
-                'title' => $title, 'detail' => $detail, 'kind' => $kind, 'past' => $t < time()];
+                'title' => $title, 'detail' => $detail, 'kind' => $kind, 'badge' => $badge, 'past' => $t < time()];
+    }
+
+    /** Alarmanlage scharf? null = nicht konfiguriert, sonst true sobald eine Anzeige-Variable an ist. */
+    private function alarmArmed(): ?bool
+    {
+        $ids = array_filter(array_map('intval', preg_split('/[\s,;]+/', (string) $this->ReadPropertyString('AlarmArmedVars'))));
+        $any = false;
+        foreach ($ids as $v) {
+            if (!@IPS_VariableExists($v)) { continue; }
+            $any = true;
+            if (GetValue($v)) { return true; }
+        }
+        return $any ? false : null;
     }
 
     private function instancesByModule(): array
