@@ -526,6 +526,16 @@ class Overview extends IPSModule
                 if ($gate !== '' && !$this->armed($by, $gate)) { continue; }
             }
             $area = $this->isHomeSuite($p) ? $this->domainLabel($p) : $this->areaGuess($p, (string) IPS_GetName($eid));
+            $label = $this->objLabel($p);
+            // Pool: der Filterplan gilt nur, wenn die Pumpe auf Auto steht. "Manuell Aus"
+            // (Winterbetrieb) oder "Manuell Ein" uebersteuert ihn am Controller - dann
+            // schaltet er nichts und gehoert nicht in den Fahrplan.
+            if (@IPS_InstanceExists($p) && IPS_GetInstance($p)['ModuleInfo']['ModuleName'] === 'PoolController'
+                && IPS_GetObject($eid)['ObjectIdent'] === 'FilterSchedule') {
+                $mode = $this->identDeep($p, 'Relay' . (int) @IPS_GetProperty($p, 'PumpRelayIndex') . 'Mode');
+                if ($mode && (int) GetValue($mode) !== 0) { continue; }
+                $label = 'Pumpe';
+            }
             if ((int) $e['EventType'] === 2) {
                 foreach ([0, 1] as $plus) {
                     $d0 = $day0 + $plus * 86400;
@@ -535,7 +545,7 @@ class Overview extends IPSModule
                     $prevAct = $prev ? end($prev)[1] : null;
                     foreach ($this->schedulePoints($e, $d0) as [$t, $act]) {
                         if ($t === $d0 && $act === $prevAct) { continue; }
-                        $add($t, $site, $area, $this->objLabel($p) . ($act !== '' ? ': ' . $act : ''), '');
+                        $add($t, $site, $area, $label . ($act !== '' ? ': ' . $act : ''), '');
                     }
                 }
             } elseif ((int) $e['EventType'] === 1 && (int) $e['CyclicTimeType'] === 0) {
@@ -612,6 +622,17 @@ class Overview extends IPSModule
     private function isTechnik(string $t): bool
     {
         return (bool) preg_match('/berechn|rechnen|setzen|reset|zur(ue|ü)ck|null|leeren|import|timer|status|feiertag|neuer tag|config|abgleich|aufr(ae|ä)um|speicher|sicher|archiv|log|statistik|z(ae|ä)hler/i', $t);
+    }
+
+    /** Objekt per Ident unter $root suchen - auch in Unterordnern (HSPC gruppiert seine Variablen). */
+    private function identDeep(int $root, string $ident): int
+    {
+        $id = @IPS_GetObjectIDByIdent($ident, $root);
+        if ($id) { return (int) $id; }
+        foreach (IPS_GetChildrenIDs($root) as $c) {
+            if (IPS_GetObject($c)['ObjectType'] === 0 && ($id = $this->identDeep($c, $ident))) { return $id; }
+        }
+        return 0;
     }
 
     /** Bereich eines fremden Zeitplans aus Objekt- und Ereignisnamen erraten. */
