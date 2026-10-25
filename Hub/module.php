@@ -1642,6 +1642,8 @@ class HomeSuiteHub extends EntityModule
         $st = $this->store()->get('_lightAutoState', []);
         $st = is_array($st) ? $st : [];
         $prevMin = isset($st['prevMin']) ? (int) $st['prevMin'] : $nowMin;
+        $prevMin = \Hoep\HomeSuite\Engines\LightAutomation::fensterStart($prevMin, $nowMin,
+            (string) ($st['prevTag'] ?? ''), date('Ymd', $now));
 
         // --- L7/L9: faellige Zeit-/Sonnen-Trigger + Wecken ---
         // Offene Prueflinge aus frueheren Durchgaengen zuerst: erst nachfassen, dann neu schalten.
@@ -1722,6 +1724,7 @@ class HomeSuiteHub extends EntityModule
         }
 
         $st['prevMin'] = $nowMin;
+        $st['prevTag'] = date('Ymd', $now);
         $this->store()->set('_lightAutoState', $st);
     }
 

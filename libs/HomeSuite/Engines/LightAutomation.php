@@ -105,6 +105,21 @@ final class LightAutomation
         return self::hhmm((string) ($tr['time'] ?? ''));
     }
 
+    /**
+     * Anfang des Tick-Fensters. Laeuft die Wanduhr am SELBEN Kalendertag rueckwaerts,
+     * ist das kein Mitternachtswechsel, sondern das Ende der Sommerzeit (02:59 -> 02:00).
+     * crossed() hielte es fuer einen Wrap und loeste jeden Zeitpunkt des Tages auf
+     * einmal aus - am 25.10.2026 um 02:00 Garten ein+aus und den Sonntagswecker.
+     * Die wiederholte Stunde ist schon einmal gelaufen, also: nichts nachholen.
+     */
+    public static function fensterStart(int $prevMin, int $nowMin, string $prevTag, string $nowTag): int
+    {
+        if ($prevTag !== '' && $prevTag === $nowTag && $nowMin < $prevMin) {
+            return $nowMin;
+        }
+        return $prevMin;
+    }
+
     /** Wurde $target im (halboffenen) Fenster (prev, now] ueberschritten? Mitternachts-Wrap beachtet. */
     public static function crossed(int $prev, int $now, int $target): bool
     {

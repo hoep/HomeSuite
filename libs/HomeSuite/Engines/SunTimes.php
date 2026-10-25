@@ -47,7 +47,17 @@ final class SunTimes
         foreach (self::ANCHORS as $k => $field) {
             $v = is_array($info) ? ($info[$field] ?? null) : null;
             // Bool (true=Polartag / false=Polarnacht) -> Ereignis tritt nicht ein.
-            $out[$k] = (is_int($v) || is_float($v)) ? (int) round(((int) $v - $midnight) / 60) : null;
+            if (!is_int($v) && !is_float($v)) {
+                $out[$k] = null;
+                continue;
+            }
+            // Wanduhr-Minute, NICHT vergangene Minuten seit Mitternacht: die Plaene
+            // vergleichen mit date('G')*60+date('i'). An den Umstelltagen hat der Tag
+            // 23 bzw. 25 Stunden - am 25.10.2026 lag Sonnenuntergang 16:58 so bei
+            // "17:58" und die Rollos fuhren eine Stunde zu spaet.
+            $r   = (int) round(((int) $v) / 60) * 60;
+            $min = ((int) date('G', $r)) * 60 + (int) date('i', $r);
+            $out[$k] = $min + 1440 * (int) round((strtotime('today', $r) - $midnight) / 86400);
         }
         return $out;
     }

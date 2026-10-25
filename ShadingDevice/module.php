@@ -2449,7 +2449,8 @@ class ShadingDevice extends EntityModule
 
             foreach ($res as $i => $s) {
                 // Der Wechsel passiert am ENDE dieses Slots: dort uebernimmt der naechste.
-                $grenze = $mid + $s['end'] * 60;
+                // Wanduhr-Minute -> Zeitpunkt; mktime rechnet die Umstellung richtig ein.
+                $grenze = mktime(0, (int) $s['end'], 0, (int) date('n', $mid), (int) date('j', $mid), (int) date('Y', $mid));
                 if ($grenze <= $now) {
                     $vorher = $s['val'];       // liegt hinter uns, gilt aber als Ausgangswert
                     continue;

@@ -504,11 +504,15 @@ class HomeSuiteWaechter extends EntityModule
         // Faellige Zeiteintraege — NUR was der Bewohner angelegt hat.
         $nowMin  = (int) date('G', $now) * 60 + (int) date('i', $now);
         $prevMin = (int) ($st['prevMin'] ?? $nowMin);
+        // Ende der Sommerzeit ist kein Mitternachtswechsel, siehe LightAutomation::fensterStart
+        $prevMin = \Hoep\HomeSuite\Engines\LightAutomation::fensterStart($prevMin, $nowMin,
+            (string) ($st['prevTag'] ?? ''), date('Ymd', $now));
         foreach (WSM::faellig($this->maschinenConfig(), $prevMin, $nowMin, (int) date('w', $now)) as $pid) {
             $this->ereignis(['art' => 'scharf', 'profil' => $pid], null);
             $st = $this->rt();
         }
         $st['prevMin'] = $nowMin;
+        $st['prevTag'] = date('Ymd', $now);
         $this->rtSet($st);
     }
 
