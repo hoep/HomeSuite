@@ -151,6 +151,11 @@ class HomeSuiteWaechter extends EntityModule
                  'label' => 'Zustand (Code)', 'varType' => 1, 'profile' => 'HSSC.State', 'actionable' => false],
                 ['ident' => 'GapsTable', 'type' => ControlContract::T_REFLECT, 'role' => 'security:gaps',
                  'label' => 'Lücken (Tabelle)', 'varType' => 3, 'actionable' => false],
+                // Derselbe Ablauf als fertige Zeitleiste fuer das HTML-Widget der LiveView.
+                // Die Tabelle bleibt daneben bestehen - sie kann sortieren und suchen,
+                // die Zeitleiste liest sich dafuer wie der Fahrplan auf der Lage-Seite.
+                ['ident' => 'ChronikHtml', 'type' => ControlContract::T_REFLECT, 'role' => 'security:chronikhtml',
+                 'label' => 'Chronik (Zeitleiste)', 'varType' => 3, 'actionable' => false],
             ],
 
             'managementActions' => [
@@ -171,6 +176,7 @@ class HomeSuiteWaechter extends EntityModule
                 ['op' => 'panic',          'label' => 'Panik'],
                 ['op' => 'assess',         'label' => 'Melderlage beurteilen (Diagnose)'],
                 ['op' => 'chronik',        'label' => 'Chronik lesen'],
+                ['op' => 'melden',         'label' => 'Erkennung melden (Fremdquelle)'],
                 ['op' => 'selfTest',       'label' => 'Meldewege prüfen'],
                 ['op' => 'setArmed',       'label' => 'Scharfschalten / Schatten-Modus'],
             ],
@@ -514,6 +520,10 @@ class HomeSuiteWaechter extends EntityModule
         $st['prevMin'] = $nowMin;
         $st['prevTag'] = date('Ymd', $now);
         $this->rtSet($st);
+
+        // Zeitleiste und Tabelle mitziehen: die JETZT-Marke soll die echte Uhrzeit
+        // zeigen, nicht die der letzten Beobachtung.
+        $this->chronikSpiegel();
     }
 
     /**
@@ -811,6 +821,16 @@ class HomeSuiteWaechter extends EntityModule
             case 'chronik':
                 return ['ok' => true, 'eintraege' => $this->chronikLesen((int) ($args['n'] ?? 100))];
 
+            // Fremdquellen (z. B. der Protect-Webhook) tragen hier ihre Beobachtung ein.
+            // Bewusst OHNE Pruefung auf scharf: eine Person im Kamerabereich ist
+            // sicherheitsrelevant, auch wenn nicht scharf geschaltet ist - sie gehoert
+            // in denselben Ablauf wie die eigenen Beobachtungen des Waechters.
+            case 'melden':
+                $was = trim((string) ($args['was'] ?? ''));
+                if ($was === '') { return ['ok' => false, 'fehler' => 'was fehlt']; }
+                $this->chronik($was, (array) ($args['daten'] ?? []));
+                return ['ok' => true];
+
             case 'selfTest':
                 $this->selbsttest();
                 return ['ok' => true];
@@ -976,19 +996,204 @@ class HomeSuiteWaechter extends EntityModule
         if (count($ring) > 200) { $ring = array_slice($ring, -200); }
         $this->WriteAttributeString(self::ATTR_CHRONIK, json_encode($ring, JSON_UNESCAPED_UNICODE));
 
+        $this->chronikSpiegel();
+    }
+
+    /**
+     * Tabelle und Zeitleiste neu aufbauen.
+     *
+     * Laeuft an ZWEI Stellen: beim Schreiben eines Eintrags und im 30-Sekunden-Takt der
+     * Wache. Nur am Eintrag zu haengen war zu wenig - die JETZT-Marke der Zeitleiste
+     * traegt die Uhrzeit des Aufbaus, und die stand dann stundenlang auf dem Zeitpunkt
+     * der letzten Beobachtung. Eine Zeitleiste, deren JETZT zwei Stunden zurueckliegt,
+     * ist schlimmer als keine: sie sieht aktuell aus und ist es nicht.
+     *
+     * Geschrieben wird nur, was sich wirklich geaendert hat - sonst stiege bei jedem Takt
+     * ein Variablenereignis auf, und das Archiv fuellte sich mit 14 kB Markup je 30 s.
+     */
+    private function chronikSpiegel(): void
+    {
+        $ring = json_decode((string) $this->ReadAttributeString(self::ATTR_CHRONIK), true);
+        $ring = is_array($ring) ? $ring : [];
+
         // Spiegel fuer das Tabellen-Widget: [Zeile][Spalte], juengste zuerst.
         // Zeile 0 ist die Kopfzeile: das Tabellen-Widget nimmt sie als solche.
-        $zeilen = [['Zeit', 'Was', 'Einzelheiten']];
+        // Spalte 'Bild': daten.bild traegt die Media-ID eines Vorschaubildes (Protect-Webhook).
+        // Ausgeliefert wird der Handler-Endpunkt ?api=media&id=N; data-media laesst die
+        // LiveView das Bild bei Aenderung von selbst nachziehen. Die Spalte braucht im
+        // Widget 'Spalte: HTML' (colRaw), sonst steht das Markup als Text da.
+        $zeilen = [['Zeit', 'Was', 'Einzelheiten', 'Bild']];
         foreach (array_reverse(array_slice($ring, -60)) as $e) {
             $d = (array) ($e['daten'] ?? []);
+            [$url, $bildId] = $this->bildQuelle($d);
+            unset($d['bild'], $d['snap']);   // stecken in der eigenen Spalte, nicht nochmal im Text
             $txt = [];
             foreach ($d as $k => $v) {
                 $txt[] = $k . ': ' . (is_scalar($v) ? (string) $v : json_encode($v, JSON_UNESCAPED_UNICODE));
             }
+            $bild = '';
+            if ($url !== '') {
+                $bild = '<a href="' . $url . '" target="_blank" rel="noopener" '
+                      . 'title="Bild in voller Aufloesung">'
+                      . '<img' . ($bildId > 0 ? ' data-media="' . $bildId . '"' : '')
+                      . ' src="' . $url . '" alt="" '
+                      . 'style="height:30px;width:auto;border-radius:4px;display:block"></a>';
+            }
             $zeilen[] = [date('d.m. H:i:s', (int) ($e['ts'] ?? 0)), (string) ($e['was'] ?? ''),
-                         implode(' · ', $txt)];
+                         implode(' · ', $txt), $bild];
         }
         $this->anzeige('ChronikTable', json_encode($zeilen, JSON_UNESCAPED_UNICODE));
+        $this->anzeigeWennNeu('ChronikTable', json_encode($zeilen, JSON_UNESCAPED_UNICODE));
+        $this->anzeigeWennNeu('ChronikHtml', $this->chronikZeitleiste($ring));
+    }
+
+    /** Anzeige nur schreiben, wenn der Inhalt ein anderer ist. */
+    private function anzeigeWennNeu(string $ident, string $wert): void
+    {
+        $vid = @$this->GetIDForIdent($ident);
+        if ($vid === false) { return; }
+        if ((string) @GetValueString($vid) === $wert) { return; }
+        $this->anzeige($ident, $wert);
+    }
+
+    /**
+     * Die Chronik als senkrechte Zeitleiste - dieselbe Bauart wie der Fahrplan auf der
+     * Lage-Seite (ovplan): Raster aus Zeitspalte, Punkt mit durchgehender Linie und Text.
+     *
+     * Bewusst mit den Skin-Token --accent/--line/--surface/--muted/--warn gebaut: das
+     * HTML-Widget legt den Inhalt in ein Shadow DOM, aber CSS-Variablen vererben sich
+     * dorthin. Die Zeitleiste folgt damit hellem und dunklem Skin von selbst, ohne dass
+     * hier eine Farbe fest steht.
+     *
+     * Der Kopf traegt eine JETZT-Marke, darunter laeuft es rueckwaerts in die
+     * Vergangenheit - die juengste Beobachtung steht oben, wie in der Tabelle auch.
+     */
+    /**
+     * Woher kommt das Vorschaubild dieses Eintrags?
+     *
+     * Zwei Quellen, in dieser Reihenfolge:
+     *   daten.snap  Schnappschuss-DATEI je Ereignis (?api=snap) - bleibt fuer immer das
+     *               Bild dieser einen Erkennung. So soll es sein.
+     *   daten.bild  Media-ID der Kamera (?api=media) - Rueckfall fuer Eintraege von vor
+     *               der Umstellung. Dieses Objekt haelt nur das juengste Bild, alte
+     *               Eintraege zeigten damit ein fremdes Motiv.
+     *
+     * Liefert ['', 0], wenn nichts Anzeigbares da ist.
+     */
+    private function bildQuelle(array $d): array
+    {
+        $snap = (string) ($d['snap'] ?? '');
+        if ($snap !== '' && preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.(jpg|jpeg|png|webp)$/', $snap)
+            && is_file(rtrim(IPS_GetKernelDir(), '/') . '/schnappschuesse/' . $snap)) {
+            return ['?api=snap&f=' . rawurlencode($snap), 0];
+        }
+        $id = (int) ($d['bild'] ?? 0);
+        if ($this->bildVorhanden($id)) { return ['?api=media&id=' . $id, $id]; }
+        return ['', 0];
+    }
+
+    /**
+     * Traegt das Medienobjekt wirklich ein Bild?
+     *
+     * IPS_MediaExists sagt nur, dass das Objekt da ist - nicht, dass Inhalt darin steht.
+     * Genau das war der Fall: nach dem Umstellen der Dateinamen zeigten Eintraege auf
+     * leere Objekte, und im Ablauf klaffte ein kaputtes Bildfeld. Geprueft wird ueber die
+     * Datei, nicht ueber IPS_GetMediaContent - das laed sonst je Aufbau bis zu 60 Bilder.
+     */
+    private function bildVorhanden(int $id): bool
+    {
+        if ($id <= 0 || !IPS_MediaExists($id)) { return false; }
+        $f = (string) (IPS_GetMedia($id)['MediaFile'] ?? '');
+        if ($f === '') { return false; }
+        if ($f[0] !== '/') { $f = IPS_GetKernelDir() . $f; }
+        return is_file($f) && filesize($f) > 0;
+    }
+
+    private function chronikZeitleiste(array $ring): string
+    {
+        $h = static function ($t): string { return htmlspecialchars((string) $t, ENT_QUOTES, 'UTF-8'); };
+        $heute = date('Ymd');
+
+        $css = '<style>'
+             . ':host,*{box-sizing:border-box}'
+             . '.l{font:400 13px Inter,system-ui,sans-serif;color:var(--text,#e8eaed);padding:2px 4px 6px 0}'
+             . '.now{display:grid;grid-template-columns:48px 1fr;gap:10px;align-items:center;margin:2px 0 6px}'
+             . '.now b{font:600 11px ui-monospace,Menlo,monospace;background:var(--warn,#f2903d);color:#2a1a05;'
+             . 'border-radius:5px;padding:2px 4px;text-align:center}'
+             . '.now i{height:2px;background:var(--warn,#f2903d);display:block}'
+             . '.e{display:grid;grid-template-columns:48px 16px 1fr;gap:0 10px;padding:6px 0;align-items:start}'
+             . '.t{font:500 12.5px ui-monospace,Menlo,monospace;color:var(--accent,#5b9dd9);padding-top:1px}'
+             . '.d{position:relative;display:flex;justify-content:center;align-self:stretch}'
+             . '.d:before{content:"";position:absolute;top:0;bottom:-12px;width:2px;background:var(--line,#2c3138)}'
+             . '.e:last-child .d:before{bottom:50%}'
+             . '.d i{position:relative;width:10px;height:10px;border-radius:50%;background:var(--accent,#5b9dd9);'
+             . 'margin-top:4px;box-shadow:0 0 0 3px var(--surface,#161a1f)}'
+             . '.e.warn .d i{background:var(--warn,#f2903d)}.e.warn .t{color:var(--warn,#f2903d)}'
+             . '.x{font-size:13px;min-width:0}.x b{font-weight:600}'
+             . '.x small{display:block;color:var(--muted,#8b949e);font-size:11.5px;margin-top:1px;'
+             . 'overflow-wrap:anywhere}'
+             . '.tag{font-size:10.5px;color:var(--muted,#8b949e);border:1px solid var(--line,#2c3138);'
+             . 'border-radius:5px;padding:0 5px;margin-left:6px;white-space:nowrap}'
+             // Bild-Lightbox OHNE JavaScript: das HTML-Widget laeuft im Shadow-Modus,
+             // dort laufen keine Skripte. Ein verstecktes Kontrollkaestchen schaltet die
+             // Auflage - so bleibt das Bild IM Ablauf und reisst niemanden auf einen
+             // fremden Tab heraus.
+             . '.lb{position:absolute;opacity:0;width:0;height:0;pointer-events:none}'
+             . '.th{display:inline-block;cursor:zoom-in}'
+             . '.th img{margin-top:5px;height:46px;width:auto;border-radius:5px;display:block;'
+             . 'border:1px solid var(--line,#2c3138)}'
+             . '.ov{display:none}'
+             . '.lb:checked + .th + .ov{display:flex;position:fixed;inset:0;z-index:99;'
+             . 'background:rgba(0,0,0,.82);align-items:center;justify-content:center;'
+             . 'cursor:zoom-out;padding:24px}'
+             . '.ov img{max-width:92vw;max-height:86vh;border-radius:8px;'
+             . 'box-shadow:0 12px 40px rgba(0,0,0,.6)}'
+             . '.leer{color:var(--muted,#8b949e);font-size:12.5px;padding:10px 2px}'
+             . '</style>';
+
+        $out = [];
+        foreach (array_reverse(array_slice($ring, -60)) as $e) {
+            $ts  = (int) ($e['ts'] ?? 0);
+            $was = (string) ($e['was'] ?? '');
+            $d   = (array) ($e['daten'] ?? []);
+
+            [$url, $bildId] = $this->bildQuelle($d);
+            $kamera = (string) ($d['kamera'] ?? '');
+            unset($d['bild'], $d['snap'], $d['kamera']);
+
+            // Auffaellig ist, was schiefging - dieselbe Lesart wie beim Fahrplan.
+            $warn = preg_match('/nicht|ausfall|abgebrochen|panik/i', $was) === 1;
+
+            $zeit = date($heute === date('Ymd', $ts) ? 'H:i' : 'd.m. H:i', $ts);
+            $txt  = [];
+            foreach ($d as $k => $v) {
+                $txt[] = $k . ': ' . (is_scalar($v) ? (string) $v : json_encode($v, JSON_UNESCAPED_UNICODE));
+            }
+
+            $zeile = '<b>' . $h($was) . '</b>';
+            if ($kamera !== '') { $zeile .= '<span class="tag">' . $h($kamera) . '</span>'; }
+            if ($txt !== []) { $zeile .= '<small>' . $h(implode(' · ', $txt)) . '</small>'; }
+            if ($url !== '') {
+                $k   = 'b' . substr(md5($url), 0, 8) . '_' . $ts;   // je Eintrag eindeutig
+                $dm  = $bildId > 0 ? ' data-media="' . $bildId . '"' : '';
+                $zeile .= '<input class="lb" type="checkbox" id="' . $k . '">'
+                        . '<label class="th" for="' . $k . '" title="Bild vergrößern">'
+                        . '<img' . $dm . ' src="' . $url . '" alt=""></label>'
+                        . '<label class="ov" for="' . $k . '" title="Schließen">'
+                        . '<img' . $dm . ' src="' . $url . '" alt=""></label>';
+            }
+
+            $out[] = '<div class="e' . ($warn ? ' warn' : '') . '">'
+                   . '<div class="t">' . $h($zeit) . '</div>'
+                   . '<div class="d"><i></i></div>'
+                   . '<div class="x">' . $zeile . '</div></div>';
+        }
+
+        if ($out === []) { return $css . '<div class="l"><div class="leer">Noch nichts beobachtet.</div></div>'; }
+
+        return $css . '<div class="l">'
+             . '<div class="now"><b>' . date('H:i') . '</b><i></i></div>'
+             . implode('', $out) . '</div>';
     }
 
     private function chronikLesen(int $n): array
