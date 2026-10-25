@@ -83,6 +83,12 @@ class Rental extends IPSModule
         $this->RegisterVariableString('BookingsTable', 'Buchungen (Tabelle)', '', 93);
         $this->RegisterVariableString('FreeTable', 'Noch buchbar (Tabelle)', '', 94);
         // Saison aus der Visualisierung einstellbar: schaltbare Spiegel der Einstellungen.
+        // Vorjahr bis zum selben Tag - Vergleichswerte fuer die Kennzahlen-Karten.
+        $this->RegisterVariableFloat('OccupancyPctPrev', 'Auslastung Vorjahr (bis heute)', 'HSRT.Percent', 31);
+        $this->RegisterVariableInteger('WeeksBookedPrev', 'Belegte Wochen Vorjahr (bis heute)', '', 43);
+        $this->RegisterVariableFloat('RevenueGrossPrev', 'Umsatz brutto Vorjahr (bis heute)', 'HSRT.Euro', 55);
+        $this->RegisterVariableFloat('RevenueAfterCommissionPrev', 'Umsatz nach Provision Vorjahr (bis heute)', 'HSRT.Euro', 56);
+        $this->RegisterVariableFloat('RevenueNetPrev', 'Umsatz netto Vorjahr (bis heute)', 'HSRT.Euro', 57);
         $this->RegisterVariableString('SeasonFrom', 'Saison von', '', 80);
         $this->RegisterVariableString('SeasonTo', 'Saison bis', '', 81);
         $this->EnableAction('SeasonFrom');
@@ -170,6 +176,17 @@ class Rental extends IPSModule
         $this->put('RevenueNet', round($rv['current'] * $comm * $tax, 2));
         $this->put('RevenuePotential', round($rv['potential'], 2));
         $this->put('RevenueMax', round($rv['max'], 2));
+
+        // Vorjahr BIS ZUM SELBEN TAG: mitten in der Saison stuende sonst die halbe Saison gegen
+        // eine ganze. Tage nach heute fehlen dem Vorjahr damit genauso wie dem laufenden Jahr.
+        $pv = array_filter($this->dayValues($year - 1), fn($k) => (int) $k <= $today, ARRAY_FILTER_USE_KEY);
+        $pe = $this->engine($pv, $year - 1, 0);
+        $pst = $pe->stats(); $prv = $pe->revenue();
+        $this->put('OccupancyPctPrev', (float) $pst['occupancy_percent']);
+        $this->put('WeeksBookedPrev', (int) $prv['occupied_weeks']);
+        $this->put('RevenueGrossPrev', round($prv['current'], 2));
+        $this->put('RevenueAfterCommissionPrev', round($prv['current'] * $comm, 2));
+        $this->put('RevenueNetPrev', round($prv['current'] * $comm * $tax, 2));
 
         $days = [];
         for ($i = 0; $i < $eng->dayCount(); $i++) {
