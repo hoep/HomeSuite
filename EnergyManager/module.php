@@ -115,7 +115,7 @@ class EnergyManager extends EntityModule
                 ['ident' => 'GridKwh', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:gridkwh',
                  'label' => 'Zukauf heute', 'varType' => 2, 'profile' => '~Electricity', 'unit' => ' kWh', 'actionable' => false],
                 ['ident' => 'GridCostToday', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:gridcost',
-                 'label' => 'Zukauf heute (Kosten)', 'varType' => 2, 'unit' => ' EUR', 'actionable' => false],
+                 'label' => 'Stromkosten heute', 'varType' => 2, 'unit' => ' EUR', 'actionable' => false],
                 ['ident' => 'SavedToday', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:savedtoday',
                  'label' => 'Verschiebung brachte heute', 'varType' => 2, 'unit' => ' ct', 'actionable' => false],
                 ['ident' => 'SelfRate', 'type' => ControlContract::T_REFLECT, 'role' => 'energy:selfrate',
@@ -476,6 +476,8 @@ class EnergyManager extends EntityModule
      */
     private function preis(): ?float
     {
+        $ip = $this->istPreis();
+        if ($ip !== null) { return $ip['varCt']; }
         $fest = (float) $this->regeln()['fixedPriceCt'];
         if ($fest > 0) { return $fest; }
         return $this->zahlVon((int) $this->ReadPropertyInteger('PriceVarId'));
@@ -485,7 +487,43 @@ class EnergyManager extends EntityModule
     private function marktpreis(): ?float { return $this->zahlVon((int) $this->ReadPropertyInteger('PriceVarId')); }
 
     /** Gilt ein Festtarif? Dann ist Verschieben sinnlos. */
-    private function festtarif(): bool { return (float) $this->regeln()['fixedPriceCt'] > 0; }
+    private function festtarif(): bool { return $this->istPreis() !== null || (float) $this->regeln()['fixedPriceCt'] > 0; }
+
+    /**
+     * Was eine bezogene kWh und ein Tag Anschluss im EIGENEN Tarif kosten, brutto.
+     *
+     * Quelle ist der Ist-Tarif der Simulation (istTarif) samt Entgelten - dieselben Zahlen,
+     * mit denen die Seite "Strompreis" rechnet. Vorher stand hier nur die Regel
+     * fixedPriceCt, eine von Hand eingetragene Zahl; nach dem Wechsel auf Feel Good
+     * (24.09.2026) haette sie still den alten Tarif weitergerechnet.
+     *
+     * Nur fuer Tarife mit festem Arbeitspreis ('ct'). Zonen- und Spottarife haben keinen
+     * einen Preis je kWh - dort bleibt es bei fixedPriceCt bzw. dem Marktpreis.
+     *
+     * varCt     = Arbeitspreis (nach Rabatt und Gratistagen) + Netz, Abgabe, Foerderbeitrag
+     * fixTagEur = Grundpreis, Messentgelt und Pauschale aller Zaehlpunkte, je Tag
+     *
+     * @return array{name:string, arbeitCt:float, varCt:float, fixTagEur:float}|null
+     */
+    private function istPreis(): ?array
+    {
+        $cfg = $this->simCfg();
+        if ($cfg['istTarif'] === '') { return null; }
+        $t = null;
+        foreach ($cfg['tarife'] as $x) { if ((string) ($x['id'] ?? '') === $cfg['istTarif']) { $t = $x; break; } }
+        if ($t === null || !isset($t['ct']) || !is_numeric($t['ct'])) { return null; }
+        $rab  = 1.0 - max(0.0, min(50.0, (float) ($t['rabattPct'] ?? 0))) / 100.0;
+        $rab *= 1.0 - max(0.0, min(365.0, (float) ($t['gratisTage'] ?? 0))) / 365.0;
+        $arbeit = (float) $t['ct'] * $rab;
+        $e   = $cfg['entgelte'];
+        $ust = 1.0 + ((float) $e['ustProzent']) / 100.0;
+        $netzCt = ((float) $e['netzArbeitCt'] + (float) $e['elAbgabeCt'] + (float) $e['oekoBeitragCt']) * $ust;
+        $n = max(1, count($cfg['zaehler']));
+        $fixJahr = ((float) ($t['grundEur'] ?? 0)) * 12.0 * $n
+                 + (((float) $e['netzFixEur']) * 12.0 * $n + ((float) $e['oekoPauschaleEur']) * $n) * $ust;
+        return ['name' => (string) ($t['name'] ?? $cfg['istTarif']), 'arbeitCt' => $arbeit,
+                'varCt' => $arbeit + $netzCt, 'fixTagEur' => $fixJahr / 365.0];
+    }
 
     /**
      * Preisvorhersage als Liste [{start,end,price}], nach Zeit sortiert.
@@ -636,9 +674,18 @@ class EnergyManager extends EntityModule
          * gefaehrlichste Art von Fehler: eine praezise aussehende Zahl, die niemandes
          * Rechnung beschreibt. Ohne hinterlegten Tarif bleibt die Anzeige leer.
          */
-        $fix = (float) $this->regeln()['fixedPriceCt'];
-        $this->setReflect('GridCostToday',
-            ($b['zukaufKwh'] !== null && $fix > 0) ? round($b['zukaufKwh'] * $fix / 100.0, 2) : 0.0);
+        // Mit hinterlegtem Ist-Tarif: alles, was der Tag kostet - Arbeit samt Netz fuer die
+        // bezogenen kWh plus der Tagesanteil von Grundpreis und Pauschalen. Der Fixanteil
+        // steht ab Mitternacht voll drin; er faellt fuer den Tag an, egal wie viel bezogen wird.
+        $ip = $this->istPreis();
+        if ($ip !== null) {
+            $this->setReflect('GridCostToday', $b['zukaufKwh'] !== null
+                ? round($b['zukaufKwh'] * $ip['varCt'] / 100.0 + $ip['fixTagEur'], 2) : 0.0);
+        } else {
+            $fix = (float) $this->regeln()['fixedPriceCt'];
+            $this->setReflect('GridCostToday',
+                ($b['zukaufKwh'] !== null && $fix > 0) ? round($b['zukaufKwh'] * $fix / 100.0, 2) : 0.0);
+        }
         $p = $this->preis();
         if ($p !== null) { $this->setReflect('Price', round($p, 2)); }
         $pr = $this->preisRang();
@@ -722,7 +769,7 @@ class EnergyManager extends EntityModule
 
         $grund = [];
         if ($fest && $rg['surplusW'] <= 0) {
-            $grund[] = 'Festtarif ' . round($rg['fixedPriceCt'], 1) . ' ct/kWh - Verschieben bringt nichts';
+            $grund[] = 'Festtarif ' . round((float) $this->preis(), 1) . ' ct/kWh - Verschieben bringt nichts';
         }
         if ($preisOk)       { $grund[] = 'Preis ' . round((float) $p, 1) . ' ct unter Schwelle ' . round($rg['priceCt'], 1); }
         if ($rangOk)        { $grund[] = 'Preisrang ' . $pr['rang'] . '/' . $pr['anzahl'] . ' (Top ' . $rg['rankTop'] . ')'; }
