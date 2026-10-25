@@ -80,7 +80,7 @@ class Overview extends IPSModule
         $hints = [];
         foreach ([$this->hintsShading($byMod), $this->hintsIrrigation($byMod), $this->hintsClimate($byMod),
                   $this->hintsPresence($byMod), $this->hintsHealth($byMod), $this->hintsBattery($byMod),
-                  $this->hintsWarnings($byMod), $this->hintsAir()] as $part) {
+                  $this->hintsWarnings($byMod), $this->hintsAir(), $this->hintsVpn($byMod)] as $part) {
             $hints = array_merge($hints, $part);
         }
         // weggeklickte Hinweise ausblenden; Eintraege fuer verschwundene Hinweise aufraeumen
@@ -425,6 +425,33 @@ class Overview extends IPSModule
                 (int) IPS_GetVariable($v)['VariableChanged'], [])];
         }
         return [];
+    }
+
+    /**
+     * VPN-Plattform (Modul PrivyCS): getrennte/traege Standorte, Knoten offline, Alarme, Updates.
+     * Das Modul liefert die Hinweise fertig; hier wird nur der Standort zugeordnet - ueber den
+     * Namen der Gegenstelle ("BellaVista@Site2Site" -> Standort BellaVista), sonst dort, wo
+     * die Instanz im Baum haengt.
+     */
+    private function hintsVpn(array $by): array
+    {
+        $out = [];
+        foreach ($by['PrivyCS'] ?? [] as $iid) {
+            $list = $this->jsonVar($iid, 'Hints');
+            if (!is_array($list)) { continue; }
+            foreach ($list as $h) {
+                $site = $this->siteOf($iid);
+                $n = strtolower((string) ($h['standort'] ?? ''));
+                if ($n !== '') {
+                    foreach ($this->siteList() as $sid) {
+                        if (strpos(strtolower(IPS_GetName($sid)), $n) !== false) { $site = $sid; break; }
+                    }
+                }
+                $out[] = $this->hint((string) $h['id'], $site, 'Netzwerk', max(1, min(3, (int) ($h['sev'] ?? 2))),
+                    (string) ($h['title'] ?? 'VPN'), (string) ($h['detail'] ?? ''), (int) ($h['since'] ?? time()), []);
+            }
+        }
+        return $out;
     }
 
     /** Laufende Unwetterwarnungen ab orange brauchen Aufmerksamkeit; gelb steht nur im Fahrplan. */

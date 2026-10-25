@@ -1,0 +1,19 @@
+{
+    "id": "{798D97CB-CE5D-4884-8F34-683C468EA319}",
+    "name": "PrivyCS",
+    "type": 3,
+    "vendor": "Hoep",
+    "aliases": [
+        "Privycs",
+        "Privycs VPN",
+        "VPN",
+        "WireGuard Site-to-Site",
+        "Privycs-Überwachung"
+    ],
+    "url": "https://github.com/hoep/HomeSuite",
+    "prefix": "HSVP",
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "hidden": false
+}
