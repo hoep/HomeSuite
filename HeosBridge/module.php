@@ -54,8 +54,12 @@ class HeosBridge extends IPSModule
             $this->onReady();
         }
         // Parent-Status-Wechsel (Socket offen) -> HEOS-Handshake senden.
-        if ($message === IM_CHANGESTATUS && (int) ($data[0] ?? 0) === IS_ACTIVE) {
-            $this->handshake();
+        if ($message === IM_CHANGESTATUS) {
+            if ((int) ($data[0] ?? 0) === IS_ACTIVE) {
+                $this->handshake();
+            } else {
+                $this->SetTimerInterval('HeosKeepalive', 0);   // ohne Verbindung kein Herzschlag; handshake startet ihn neu
+            }
         }
     }
 
@@ -159,6 +163,13 @@ class HeosBridge extends IPSModule
 
     private function toSocket(string $s): void
     {
+        // Ohne offenen Socket nichts senden. Frueher lief jeder Befehl der Zonen und jeder
+        // Herzschlag trotzdem hinaus und SendDataToParent warnte "Socket ist nicht verbunden" -
+        // am 26.09.2026 Hunderte Zeilen je Minute, weil das Geraet in der Aichholzgasse aus war.
+        // Der Socket verbindet selbst neu; der Handshake danach holt den Stand wieder.
+        if (!$this->HasActiveParent()) {
+            return;
+        }
         // Gegenrichtung zu ReceiveData: Rohbytes als Latin-1 in den UTF-8-Puffer heben.
         $this->SendDataToParent(json_encode(['DataID' => self::IO_TX, 'Buffer' => mb_convert_encoding($s, 'UTF-8', 'ISO-8859-1')]));
     }
